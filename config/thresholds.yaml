@@ -1,0 +1,158 @@
+# =============================================================================
+# ARGUS - Detection Thresholds
+# =============================================================================
+# IMPORTANT: These are CONSERVATIVE initial values for observation mode.
+# After Week 3 analysis, thresholds may be adjusted based on real data.
+#
+# ⚠️ 90-DAY RULE: After bot deployment, DO NOT change these for 90 days!
+# This discipline prevents curve-fitting to noise.
+# =============================================================================
+
+# -----------------------------------------------------------------------------
+# Detector #1: Funding Rate Mean Reversion
+# Strategy: Enter opposite direction when funding rates spike to extremes
+# -----------------------------------------------------------------------------
+funding_rate:
+  enabled: true
+  
+  # Entry Criteria
+  threshold_percent: 0.08    # 8 bps per 8h (annualized: ~35%)
+  z_score_threshold: 2.5     # 2.5 standard deviations above mean
+  lookback_periods: 30       # Compare to last 30 funding periods (10 days)
+  
+  # Filters (only trade liquid markets)
+  min_volume_usd: 50000000   # 50M+ daily volume
+  min_open_interest: 100000000  # 100M+ open interest
+  
+  # Exit Criteria
+  take_profit_threshold: 0.03  # Close when funding normalizes to 3 bps
+  stop_loss_percent: 1.5       # Stop loss at -1.5%
+  max_hold_hours: 48           # Force close after 48h
+  
+  # Position Sizing
+  position_size_percent: 10    # 10% of capital per trade
+  max_leverage: 3
+
+# -----------------------------------------------------------------------------
+# Detector #2: Spot-Perp Basis Arbitrage
+# Strategy: Profit from price divergence between spot and perpetual
+# -----------------------------------------------------------------------------
+basis_arbitrage:
+  enabled: true
+  
+  # Spot-perp price difference
+  threshold_percent: 0.5       # 50 bps difference
+  min_edge_after_fees_bps: 10  # Must have 10+ bps net edge
+  max_hold_hours: 24           # Expected convergence time
+  
+  # Filters
+  min_volume_spot: 10000000    # 10M+ spot volume
+  min_volume_perp: 50000000    # 50M+ perp volume
+
+# -----------------------------------------------------------------------------
+# Detector #3: Cross-Exchange Arbitrage
+# Strategy: Same asset at different prices on different exchanges
+# -----------------------------------------------------------------------------
+cross_exchange:
+  enabled: true
+  
+  # Price discrepancies between exchanges
+  threshold_percent: 0.15      # 15 bps difference
+  min_edge_after_fees_bps: 5   # 5+ bps net edge
+  
+  # Exchanges to compare (US-friendly)
+  exchanges:
+    - "bybit"
+    - "coinbase"
+    - "okx"
+  
+  # Execution constraints
+  max_execution_seconds: 10    # Must complete both legs within 10s
+  min_liquidity_depth_usd: 100000  # 100k liquidity on both sides
+
+# -----------------------------------------------------------------------------
+# Detector #4: Post-Liquidation Snapback
+# Strategy: Fade large liquidation cascades
+# -----------------------------------------------------------------------------
+liquidation:
+  enabled: true
+  
+  # Liquidation cascade detection
+  min_liquidation_usd: 5000000  # 5M+ liquidations
+  time_window_minutes: 5        # Within 5 minutes
+  
+  # Snapback criteria
+  snapback_threshold_percent: 0.3  # Expect 30+ bps bounce
+  entry_delay_seconds: 30          # Wait 30s after cascade peak
+  
+  # Exit
+  take_profit_percent: 0.5   # Take profit at 50 bps
+  stop_loss_percent: 1.0     # Stop at -1%
+  max_hold_minutes: 30       # Quick trade
+
+# -----------------------------------------------------------------------------
+# Detector #5: BTC Options IV Spike (MANUAL TRADING)
+# Strategy: Sell premium when IV spikes during panic
+# NOTE: This detector alerts YOU - it does not auto-trade
+# -----------------------------------------------------------------------------
+options_iv:
+  enabled: true
+  
+  # Implied volatility spike detection
+  threshold_percent: 80        # IV > 80% annualized
+  z_score_threshold: 2.0       # 2+ std devs above mean
+  lookback_days: 30            # Compare to 30-day average
+  
+  # Option selection criteria (for your manual trades)
+  min_days_to_expiry: 3        # At least 3 days to expiry
+  max_days_to_expiry: 14       # Max 2 weeks
+  otm_percent: 10              # 10% out of the money
+  
+  # Position limits (YOUR capital allocation)
+  max_position_size: 600       # Max $600 per trade
+  max_positions: 3             # Max 3 open positions
+
+# -----------------------------------------------------------------------------
+# Detector #6: Volatility Regime Changes
+# Strategy: Detect sudden expansion/compression in volatility
+# NOTE: Provides context for other strategies, not standalone trades
+# -----------------------------------------------------------------------------
+volatility:
+  enabled: true
+  
+  # Realized volatility windows
+  short_window_hours: 1
+  long_window_hours: 24
+  
+  # Thresholds
+  expansion_threshold: 2.0     # 2x normal volatility = expansion
+  compression_threshold: 0.5   # 0.5x normal volatility = compression
+  
+  # Requirements
+  min_observations: 60         # Need 60+ data points
+
+# -----------------------------------------------------------------------------
+# Detector #7: IBIT Options Opportunity (MANUAL TRADING)
+# Strategy: Sell put spreads on IBIT when BTC volatility spikes
+# NOTE: This detector alerts YOU to check Robinhood for opportunities
+# -----------------------------------------------------------------------------
+ibit:
+  enabled: true
+  
+  # Alert triggers
+  btc_iv_threshold: 70         # BTC IV > 70% (from Deribit)
+  ibit_drop_threshold: -3      # IBIT dropped > 3% today
+  combined_score_threshold: 1.5  # Combined condition score
+  
+  # Cooldown to prevent alert spam
+  cooldown_hours: 4            # Min 4h between alerts
+  
+  # Suggested trade parameters (for your Robinhood trades)
+  otm_percent_short: 8         # Short strike 8% OTM
+  otm_percent_long: 15         # Long strike 15% OTM (defines max loss)
+  target_expiry_days: 7        # Weekly options preferred
+  
+  # Position limits
+  max_position_size: 800       # Max $800 per spread
+  max_open_positions: 3        # Max 3 concurrent positions
+

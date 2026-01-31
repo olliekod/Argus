@@ -1,0 +1,198 @@
+"""
+Yahoo Finance Client
+====================
+
+Fetches IBIT ETF price data for options monitoring.
+"""
+
+import asyncio
+from datetime import datetime
+from typing import Any, Callable, Dict, Optional
+import aiohttp
+
+from ..core.logger import get_connector_logger
+
+logger = get_connector_logger('yahoo')
+
+
+class YahooFinanceClient:
+    """
+    Yahoo Finance client for ETF price data.
+    
+    Used to monitor IBIT (BlackRock Bitcoin ETF) for options trading.
+    """
+    
+    BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
+    
+    def __init__(
+        self,
+        symbols: list = None,
+        on_update: Optional[Callable] = None,
+    ):
+        """
+        Initialize Yahoo Finance client.
+        
+        Args:
+            symbols: List of stock/ETF symbols (default: ['IBIT'])
+            on_update: Callback for price updates
+        """
+        self.symbols = symbols or ['IBIT']
+        self.on_update = on_update
+        
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._running = False
+        
+        # Latest data cache
+        self.prices: Dict[str, Dict] = {}
+        
+        logger.info(f"Yahoo Finance client initialized for {self.symbols}")
+    
+    async def _get_session(self) -> aiohttp.ClientSession:
+        """Get or create HTTP session."""
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession()
+        return self._session
+    
+    async def close(self) -> None:
+        """Close HTTP session."""
+        self._running = False
+        if self._session and not self._session.closed:
+            await self._session.close()
+    
+    async def get_quote(self, symbol: str) -> Optional[Dict]:
+        """
+        Get current quote for a symbol.
+        
+        Args:
+            symbol: Stock/ETF symbol (e.g., 'IBIT')
+            
+        Returns:
+            Quote data or None
+        """
+        session = await self._get_session()
+        url = f"{self.BASE_URL}/{symbol}"
+        
+        params = {
+            'interval': '1d',
+            'range': '5d',
+        }
+        
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        }
+        
+        try:
+            async with session.get(url, params=params, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    
+                    result = data.get('chart', {}).get('result', [])
+                    if not result:
+                        return None
+                    
+                    meta = result[0].get('meta', {})
+                    indicators = result[0].get('indicators', {})
+                    quote = indicators.get('quote', [{}])[0]
+                    
+                    # Get latest values
+                    closes = quote.get('close', [])
+                    volumes = quote.get('volume', [])
+                    highs = quote.get('high', [])
+                    lows = quote.get('low', [])
+                    
+                    current_price = meta.get('regularMarketPrice', 0)
+                    prev_close = meta.get('previousClose', 0)
+                    
+                    # Calculate price change
+                    price_change = 0
+                    price_change_pct = 0
+                    if prev_close and prev_close > 0:
+                        price_change = current_price - prev_close
+                        price_change_pct = (price_change / prev_close) * 100
+                    
+                    # Calculate recent volatility (5-day)
+                    if len(closes) >= 2:
+                        valid_closes = [c for c in closes if c is not None]
+                        if len(valid_closes) >= 2:
+                            returns = []
+                            for i in range(1, len(valid_closes)):
+                                ret = (valid_closes[i] - valid_closes[i-1]) / valid_closes[i-1]
+                                returns.append(ret)
+                            
+                            if returns:
+                                import math
+                                mean_ret = sum(returns) / len(returns)
+                                variance = sum((r - mean_ret) ** 2 for r in returns) / len(returns)
+                                daily_vol = math.sqrt(variance)
+                                annualized_vol = daily_vol * math.sqrt(252) * 100
+                            else:
+                                annualized_vol = 0
+                        else:
+                            annualized_vol = 0
+                    else:
+                        annualized_vol = 0
+                    
+                    parsed = {
+                        'symbol': symbol,
+                        'timestamp': datetime.utcnow().isoformat(),
+                        'price': current_price,
+                        'previous_close': prev_close,
+                        'price_change': price_change,
+                        'price_change_pct': price_change_pct,
+                        'day_high': meta.get('regularMarketDayHigh', 0),
+                        'day_low': meta.get('regularMarketDayLow', 0),
+                        'volume': meta.get('regularMarketVolume', 0),
+                        'realized_vol_5d': annualized_vol,
+                        'market_state': meta.get('marketState', 'CLOSED'),
+                    }
+                    
+                    return parsed
+                else:
+                    logger.warning(f"Yahoo API error for {symbol}: {resp.status}")
+                    return None
+                    
+        except Exception as e:
+            logger.error(f"Yahoo request failed: {e}")
+            return None
+    
+    async def poll(self, interval_seconds: int = 60) -> None:
+        """
+        Continuously poll for price updates.
+        
+        Args:
+            interval_seconds: Polling interval (default 60s for stocks)
+        """
+        self._running = True
+        logger.info(f"Starting Yahoo Finance polling ({interval_seconds}s interval)")
+        
+        while self._running:
+            try:
+                for symbol in self.symbols:
+                    data = await self.get_quote(symbol)
+                    if data:
+                        self.prices[symbol] = data
+                        
+                        if self.on_update:
+                            try:
+                                if asyncio.iscoroutinefunction(self.on_update):
+                                    await self.on_update(data)
+                                else:
+                                    self.on_update(data)
+                            except Exception as e:
+                                logger.error(f"Update callback error: {e}")
+                    
+                    await asyncio.sleep(1)
+                    
+            except Exception as e:
+                logger.error(f"Yahoo polling error: {e}")
+            
+            await asyncio.sleep(interval_seconds)
+    
+    def get_price(self, symbol: str) -> Optional[float]:
+        """Get latest price for a symbol."""
+        data = self.prices.get(symbol)
+        return data['price'] if data else None
+    
+    def get_ibit_data(self) -> Optional[Dict]:
+        """Get IBIT data specifically."""
+        return self.prices.get('IBIT')

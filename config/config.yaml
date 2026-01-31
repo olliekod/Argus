@@ -1,0 +1,119 @@
+# =============================================================================
+# ARGUS - Main Configuration
+# =============================================================================
+# Named after Argus Panoptes, the all-seeing giant of Greek mythology
+# who had 100 eyes and never slept - perfect for 24/7 market monitoring
+# =============================================================================
+
+system:
+  name: "Argus"
+  version: "1.0.0"
+  timezone: "UTC"
+  log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+
+# -----------------------------------------------------------------------------
+# Assets to Monitor
+# -----------------------------------------------------------------------------
+assets:
+  perpetuals:
+    - "BTC/USDT:USDT"
+    - "ETH/USDT:USDT"
+    - "SOL/USDT:USDT"
+  
+  options:
+    - "BTC"  # Deribit BTC options
+
+# -----------------------------------------------------------------------------
+# Exchange Configuration
+# -----------------------------------------------------------------------------
+exchanges:
+  bybit:
+    enabled: true
+    testnet: false
+    rate_limit: 10  # requests per second
+    reconnect_delay: 5  # initial delay, will use exponential backoff
+    max_reconnect_delay: 300  # max 5 minutes between reconnects
+  
+  binance:
+    enabled: true
+    testnet: false
+    rate_limit: 10
+  
+  okx:
+    enabled: true
+    testnet: false
+    rate_limit: 5
+  
+  deribit:
+    enabled: true
+    testnet: true  # Start with testnet for safety
+    rate_limit: 5
+
+# -----------------------------------------------------------------------------
+# Alert Configuration
+# -----------------------------------------------------------------------------
+alerts:
+  telegram:
+    enabled: true
+    tier_1_immediate: true   # Options IV >80%, Liquidations >5M
+    tier_2_fyi: true         # Funding extremes, Basis arb
+    tier_3_background: false # Minor events, logged only
+    daily_summary: true
+    daily_summary_time: "20:00"  # 8 PM UTC
+    rate_limit_seconds: 10  # Min seconds between same-type alerts
+  
+  email:
+    enabled: false  # Disabled by default, Telegram recommended
+
+# -----------------------------------------------------------------------------
+# Database Configuration
+# -----------------------------------------------------------------------------
+database:
+  path: "data/argus.db"
+  backup_enabled: true
+  backup_interval_hours: 24
+  retention_days: 90
+  vacuum_on_startup: true
+
+# -----------------------------------------------------------------------------
+# Performance Tracking (Observation Mode)
+# -----------------------------------------------------------------------------
+tracking:
+  simulate_trades: true
+  track_hypothetical_pnl: true
+  
+  # Position sizing (percentage-based for flexibility)
+  position_size_percent: 10  # 10% of capital per trade
+  capital: 800  # Trading capital in USD
+  max_leverage: 3
+  
+  # Cost assumptions (conservative)
+  slippage_bps: 5
+  taker_fee_bps: 5
+
+# -----------------------------------------------------------------------------
+# Circuit Breakers (Auto-pause trading in extreme scenarios)
+# -----------------------------------------------------------------------------
+circuit_breakers:
+  enabled: true
+  max_daily_loss_percent: 5.0  # Pause if daily loss exceeds 5%
+  max_consecutive_losses: 5    # Pause after 5 consecutive losses
+  cooldown_hours: 24           # Resume trading after cooldown
+  alert_on_trigger: true       # Send Telegram alert when triggered
+
+# -----------------------------------------------------------------------------
+# Data Retention
+# -----------------------------------------------------------------------------
+data_retention:
+  price_snapshots_days: 30
+  funding_rates_days: 90
+  detections_days: 180
+  logs_days: 30
+
+# -----------------------------------------------------------------------------
+# Health Monitoring
+# -----------------------------------------------------------------------------
+monitoring:
+  health_check_interval: 60  # seconds
+  restart_on_failure: true
+  max_restarts_per_hour: 10
