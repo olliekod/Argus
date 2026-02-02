@@ -7,7 +7,7 @@ Coordinates all connectors, detectors, and alerts.
 
 import asyncio
 import signal
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -288,12 +288,6 @@ class ArgusOrchestrator:
             on_send=self._send_daily_review,
         )
         
-        # Wire up data sources to daily review
-        self.daily_review.set_data_sources(
-            get_conditions=self.conditions_monitor.get_current_conditions,
-        )
-        self.logger.info("Daily Review initialized")
-        
         # Paper Trader Farm (86K+ parallel traders with full coverage)
         self.paper_trader_farm = PaperTraderFarm(
             db=self.db,
@@ -306,6 +300,15 @@ class ArgusOrchestrator:
             get_conditions=self.conditions_monitor.get_current_conditions,
         )
         self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.trader_configs):,} traders")
+
+        # Wire up data sources to daily review (after farm is ready)
+        self.daily_review.set_data_sources(
+            get_conditions=self.conditions_monitor.get_current_conditions,
+            get_positions=self.paper_trader_farm.get_positions_for_review,
+            get_trade_stats=self.paper_trader_farm.get_trade_activity_summary,
+            get_gap_risk=self.gap_risk_tracker.get_status if self.gap_risk_tracker else None,
+        )
+        self.logger.info("Daily Review initialized")
         
     def _wire_telegram_callbacks(self) -> None:
         """Wire up Telegram two-way callbacks once dependencies are ready."""
@@ -370,9 +373,23 @@ class ArgusOrchestrator:
         if self.bybit_ws:
             ticker = self.bybit_ws.get_ticker('BTCUSDT')
             if ticker:
+                change_5d_pct = 0.0
+                if self.db:
+                    cutoff = (datetime.now(timezone.utc) - timedelta(days=5)).isoformat()
+                    past = await self.db.get_price_at_or_before(
+                        exchange='bybit',
+                        asset='BTCUSDT',
+                        price_type='spot',
+                        cutoff_timestamp=cutoff,
+                    )
+                    past_price = past.get('price') if past else None
+                    current_price = ticker.get('last_price', 0)
+                    if past_price and current_price:
+                        change_5d_pct = ((current_price - past_price) / past_price) * 100
                 return {
                     'price': ticker.get('last_price', 0),
                     'change_24h_pct': ticker.get('price_24h_pcnt', 0) * 100,
+                    'change_5d_pct': change_5d_pct,
                 }
         return None
     
@@ -656,6 +673,7 @@ class ArgusOrchestrator:
                 conditions_score = int(conditions.get('score', 5))
                 conditions_label = conditions.get('warmth_label', 'neutral')
                 btc_change = float(conditions.get('btc_change', 0))
+                btc_change_5d = float(conditions.get('btc_change_5d', 0))
                 timestamp = datetime.now(timezone.utc).isoformat()
 
                 total_entered = 0
@@ -667,6 +685,7 @@ class ArgusOrchestrator:
                         conditions_score=conditions_score,
                         conditions_label=conditions_label,
                         btc_change_24h_pct=btc_change,
+                        btc_change_5d_pct=btc_change_5d,
                         timestamp=timestamp,
                     )
                     if not signal:

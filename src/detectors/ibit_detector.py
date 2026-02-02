@@ -160,6 +160,7 @@ class IBITDetector(BaseDetector):
         conditions_score: int,
         conditions_label: str,
         btc_change_24h_pct: float,
+        btc_change_5d_pct: float,
         timestamp: str,
     ) -> Optional[Dict[str, Any]]:
         """Build a research-mode signal without gating thresholds."""
@@ -179,9 +180,9 @@ class IBITDetector(BaseDetector):
             return None
 
         direction = 'neutral'
-        if btc_change_24h_pct > 0.2:
+        if btc_change_24h_pct > 0.2 or btc_change_5d_pct > 4.0:
             direction = 'bullish'
-        elif btc_change_24h_pct < -0.2:
+        elif btc_change_24h_pct < -0.2 or btc_change_5d_pct < -4.0:
             direction = 'bearish'
 
         return {
@@ -199,6 +200,7 @@ class IBITDetector(BaseDetector):
             'iv_rank': recommendation.iv_rank,
             'conditions_label': conditions_label,
             'btc_change_pct': btc_change_24h_pct,
+            'btc_change_5d_pct': btc_change_5d_pct,
             'ibit_change_pct': ibit_change_pct,
             'timestamp': timestamp,
         }
