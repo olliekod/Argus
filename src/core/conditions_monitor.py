@@ -40,6 +40,7 @@ class ConditionsSnapshot:
     funding_zscore: float  # How extreme is funding
     btc_price: float
     btc_change_24h: float
+    btc_change_5d: float
     
     # Market status
     market_open: bool
@@ -223,12 +224,14 @@ class ConditionsMonitor:
         
         btc_price = 95000.0  # Default
         btc_change = 0.0
+        btc_change_5d = 0.0
         if self._get_btc_price:
             try:
                 price_data = await self._get_btc_price()
                 if price_data:
                     btc_price = price_data.get('price', 95000)
                     btc_change = price_data.get('change_24h_pct', 0)
+                    btc_change_5d = price_data.get('change_5d_pct', 0)
             except Exception as e:
                 logger.warning(f"Failed to get BTC price: {e}")
         
@@ -272,6 +275,7 @@ class ConditionsMonitor:
             funding_zscore=funding_zscore,
             btc_price=btc_price,
             btc_change_24h=btc_change,
+            btc_change_5d=btc_change_5d,
             market_open=market_open,
             iv_signal=iv_signal,
             funding_signal=funding_signal,
@@ -331,6 +335,7 @@ class ConditionsMonitor:
             'implication': s.implication,
             'btc_price': s.btc_price,
             'btc_change': s.btc_change_24h,
+            'btc_change_5d': s.btc_change_5d,
             'market_time_et': market_time,
             'last_updated': s.timestamp.isoformat(),
             'last_updated_et': updated_et.strftime("%Y-%m-%d %H:%M:%S %Z"),

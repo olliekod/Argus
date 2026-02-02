@@ -613,6 +613,25 @@ class Database:
             results[table] = row["latest"] if row and row["latest"] else None
         return results
 
+    async def get_price_at_or_before(
+        self,
+        exchange: str,
+        asset: str,
+        price_type: str,
+        cutoff_timestamp: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Fetch the most recent price at or before a cutoff timestamp."""
+        cursor = await self._connection.execute("""
+            SELECT price, timestamp
+            FROM price_snapshots
+            WHERE exchange = ? AND asset = ? AND price_type = ?
+              AND timestamp <= ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (exchange, asset, price_type, cutoff_timestamp))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
     async def get_trader_performance(self, days: int = 60) -> List[Dict[str, Any]]:
         """Get aggregated trader performance over a window."""
         cursor = await self._connection.execute("""

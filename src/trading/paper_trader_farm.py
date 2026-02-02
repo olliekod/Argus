@@ -10,7 +10,8 @@ Checks economic calendar for blackout periods before entries.
 
 import asyncio
 import logging
-from datetime import datetime, date, timedelta, timezone
+from datetime import datetime, date, timedelta, time, timezone
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Any, Callable, Set
 from pathlib import Path
 import json
@@ -37,6 +38,7 @@ class PaperTraderFarm:
         total_traders: int = 400000,
         full_coverage: bool = True,
         config_file: Optional[str] = None,
+        starting_balance: float = 5000.0,
     ):
         """
         Initialize the paper trader farm.
@@ -50,6 +52,7 @@ class PaperTraderFarm:
         self.db = db
         self.total_traders = total_traders
         self.full_coverage = full_coverage
+        self.starting_balance = starting_balance
         
         # New: Tensors for GPU evaluation
         self.trader_tensors: Optional['torch.Tensor'] = None
@@ -680,27 +683,135 @@ class PaperTraderFarm:
         
         # Limit to top 10 to avoid Telegram message limits
         return result[:10]
+
+    async def get_positions_for_review(self) -> List[Dict]:
+        """Get detailed open positions for daily review."""
+        return self.get_aggregate_positions()
     
+    def _et_day_bounds(self, target_date: date) -> tuple[datetime, datetime]:
+        """Return UTC start/end for a given ET date."""
+        eastern = ZoneInfo("America/New_York")
+        start_et = datetime.combine(target_date, time.min, tzinfo=eastern)
+        end_et = start_et + timedelta(days=1)
+        return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
+
+    async def _fetch_realized_stats(self, start: datetime, end: datetime) -> Dict[str, Any]:
+        """Fetch realized trade stats between start/end timestamps."""
+        if not self.db:
+            return {'closed_trades': 0, 'winners': 0, 'realized_pnl': 0.0}
+        row = await self.db.fetch_one(
+            """
+            SELECT
+                COUNT(*) as closed_trades,
+                SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as winners,
+                SUM(realized_pnl) as realized_pnl
+            FROM paper_trades
+            WHERE status != 'open'
+              AND close_timestamp >= ?
+              AND close_timestamp < ?
+            """,
+            (start.isoformat(), end.isoformat()),
+        )
+        if not row:
+            return {'closed_trades': 0, 'winners': 0, 'realized_pnl': 0.0}
+        return {
+            'closed_trades': row['closed_trades'] or 0,
+            'winners': row['winners'] or 0,
+            'realized_pnl': row['realized_pnl'] or 0.0,
+        }
+
+    async def _fetch_opened_count(self, start: datetime, end: datetime) -> int:
+        """Fetch count of trades opened between start/end timestamps."""
+        if not self.db:
+            return 0
+        row = await self.db.fetch_one(
+            """
+            SELECT COUNT(*) as opened_trades
+            FROM paper_trades
+            WHERE timestamp >= ?
+              AND timestamp < ?
+            """,
+            (start.isoformat(), end.isoformat()),
+        )
+        return row['opened_trades'] if row else 0
+
+    async def _fetch_open_positions_count(self) -> int:
+        """Fetch count of open positions."""
+        if not self.db:
+            return len(self.get_aggregate_positions())
+        row = await self.db.fetch_one(
+            """
+            SELECT COUNT(*) as open_trades
+            FROM paper_trades
+            WHERE status = 'open'
+            """
+        )
+        return row['open_trades'] if row else 0
+
+    async def get_trade_activity_summary(self) -> Dict[str, Any]:
+        """Return realized P&L and activity stats for daily review and Telegram."""
+        today_et = datetime.now(ZoneInfo("America/New_York")).date()
+        month_start = today_et.replace(day=1)
+        year_start = date(today_et.year, 1, 1)
+
+        today_start, today_end = self._et_day_bounds(today_et)
+        month_start_utc, _ = self._et_day_bounds(month_start)
+        year_start_utc, _ = self._et_day_bounds(year_start)
+
+        today_stats = await self._fetch_realized_stats(today_start, today_end)
+        mtd_stats = await self._fetch_realized_stats(month_start_utc, today_end)
+        ytd_stats = await self._fetch_realized_stats(year_start_utc, today_end)
+
+        opened_today = await self._fetch_opened_count(today_start, today_end)
+        open_positions = await self._fetch_open_positions_count()
+
+        win_rate_mtd = (
+            (mtd_stats['winners'] / mtd_stats['closed_trades'] * 100)
+            if mtd_stats['closed_trades'] > 0 else 0
+        )
+        win_rate_ytd = (
+            (ytd_stats['winners'] / ytd_stats['closed_trades'] * 100)
+            if ytd_stats['closed_trades'] > 0 else 0
+        )
+
+        return {
+            'today_pnl': today_stats['realized_pnl'],
+            'month_pnl': mtd_stats['realized_pnl'],
+            'year_pnl': ytd_stats['realized_pnl'],
+            'trades_today': today_stats['closed_trades'],
+            'trades_mtd': mtd_stats['closed_trades'],
+            'trades_ytd': ytd_stats['closed_trades'],
+            'opened_today': opened_today,
+            'open_positions': open_positions,
+            'win_rate_mtd': win_rate_mtd,
+            'win_rate_ytd': win_rate_ytd,
+            'account_value': self.starting_balance + ytd_stats['realized_pnl'],
+        }
+
     async def get_pnl_for_telegram(self) -> Dict:
         """
         Get P&L formatted for /pnl command.
         
         Returns aggregate stats, NOT individual trader P&L.
         """
-        aggregate = self.get_aggregate_pnl()
-        breakdown = self.get_strategy_breakdown()
-        
-        # Find best strategy
-        best_strat = max(breakdown.items(), key=lambda x: x[1]['realized_pnl'])
-        
+        activity = await self.get_trade_activity_summary()
+        today_pct = (activity['today_pnl'] / self.starting_balance * 100) if self.starting_balance else 0
+        month_pct = (activity['month_pnl'] / self.starting_balance * 100) if self.starting_balance else 0
+        year_pct = (activity['year_pnl'] / self.starting_balance * 100) if self.starting_balance else 0
+
         return {
-            'total_traders': aggregate['total_traders'],
-            'total_trades': aggregate['total_trades'],
-            'win_rate': aggregate['win_rate'],
-            'realized_pnl': aggregate['realized_pnl'],
-            'open_positions': aggregate['open_positions'],
-            'best_strategy': best_strat[0],
-            'best_strategy_pnl': best_strat[1]['realized_pnl'],
+            'today_pnl': activity['today_pnl'],
+            'today_pct': today_pct,
+            'month_pnl': activity['month_pnl'],
+            'month_pct': month_pct,
+            'year_pnl': activity['year_pnl'],
+            'year_pct': year_pct,
+            'trades_today': activity['trades_today'],
+            'trades_mtd': activity['trades_mtd'],
+            'win_rate_mtd': activity['win_rate_mtd'],
+            'opened_today': activity['opened_today'],
+            'open_positions': activity['open_positions'],
+            'account_value': activity['account_value'],
         }
 
 

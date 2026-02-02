@@ -293,14 +293,20 @@ Reply <code>no</code> — Confirm you skipped the trade
                 today_emoji = "🟢" if today_pnl >= 0 else "🔴"
                 month_emoji = "🟢" if month_pnl >= 0 else "🔴"
                 
+                year_pnl = pnl.get('year_pnl', 0)
+                year_emoji = "🟢" if year_pnl >= 0 else "🔴"
                 lines = [
                     "<b>💰 P&L Summary</b>",
                     "",
                     f"{today_emoji} Today: ${today_pnl:+.2f} ({pnl.get('today_pct', 0):+.1f}%)",
                     f"{month_emoji} Month-to-Date: ${month_pnl:+.2f} ({pnl.get('month_pct', 0):+.1f}%)",
+                    f"{year_emoji} Year-to-Date: ${year_pnl:+.2f} ({pnl.get('year_pct', 0):+.1f}%)",
                     "",
-                    f"Trades today: {pnl.get('trades_today', 0)}",
-                    f"Win rate (MTD): {pnl.get('win_rate', 0):.0f}%",
+                    f"Opened today: {pnl.get('opened_today', 0)}",
+                    f"Closed today: {pnl.get('trades_today', 0)}",
+                    f"MTD closed trades: {pnl.get('trades_mtd', 0)}",
+                    f"Win rate (MTD): {pnl.get('win_rate_mtd', 0):.0f}%",
+                    f"Open positions: {pnl.get('open_positions', 0)}",
                     "",
                     f"<i>Paper account: ${pnl.get('account_value', 5000):.2f}</i>",
                 ]
@@ -345,7 +351,7 @@ Reply <code>no</code> — Confirm you skipped the trade
                 f"Active traders: {status.get('active_traders', 0):,}",
                 f"Last evaluation: {last_eval or 'N/A'}",
                 f"Last symbol: {status.get('last_evaluation_symbol') or 'N/A'}",
-                f"Traders entered: {status.get('last_evaluation_entered', 0):,}",
+                f"Traders entered (last evaluation): {status.get('last_evaluation_entered', 0):,}",
             ]
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         except Exception as e:

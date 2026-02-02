@@ -54,15 +54,24 @@ class DailyReviewData:
     
     # Paper trading
     trades_today: int
+    trades_opened_today: int
+    trades_closed_today: int
     pnl_today: float
     pnl_today_pct: float
     open_positions: List[Dict]
+    open_positions_count: int
     
     # Month-to-date
     trades_mtd: int
     pnl_mtd: float
     pnl_mtd_pct: float
     win_rate_mtd: float
+
+    # Year-to-date
+    trades_ytd: int
+    pnl_ytd: float
+    pnl_ytd_pct: float
+    win_rate_ytd: float
     
     # Account
     account_value: float
@@ -122,6 +131,7 @@ class DailyReview:
         self._get_positions: Optional[Callable] = None
         self._get_conditions: Optional[Callable] = None
         self._get_gap_risk: Optional[Callable] = None
+        self._get_trade_stats: Optional[Callable] = None
         self._get_top_performers: Optional[Callable] = None  # NEW
         self._get_iv_history: Optional[Callable] = None  # NEW
         
@@ -139,6 +149,7 @@ class DailyReview:
         get_positions: Optional[Callable] = None,
         get_conditions: Optional[Callable] = None,
         get_gap_risk: Optional[Callable] = None,
+        get_trade_stats: Optional[Callable] = None,
         get_top_performers: Optional[Callable] = None,
         get_iv_history: Optional[Callable] = None,
     ):
@@ -147,6 +158,7 @@ class DailyReview:
         self._get_positions = get_positions
         self._get_conditions = get_conditions
         self._get_gap_risk = get_gap_risk
+        self._get_trade_stats = get_trade_stats
         self._get_top_performers = get_top_performers
         self._get_iv_history = get_iv_history
     
@@ -236,40 +248,88 @@ class DailyReview:
         # Get trades
         trades_today = []
         trades_mtd = []
+        trades_ytd = []
+        trades_opened_today = 0
+        trades_closed_today = 0
+        win_rate_ytd = 0.0
+        pnl_ytd = 0.0
+        stats: Dict[str, Any] = {}
         
-        if self._get_trades:
+        if self._get_trade_stats:
+            try:
+                stats = await self._get_trade_stats()
+                trades_today = [None] * int(stats.get('trades_today', 0))
+                trades_mtd = [None] * int(stats.get('trades_mtd', 0))
+                trades_ytd = [None] * int(stats.get('trades_ytd', 0))
+                trades_opened_today = int(stats.get('opened_today', 0))
+                trades_closed_today = int(stats.get('trades_today', 0))
+                pnl_today = float(stats.get('today_pnl', 0))
+                pnl_mtd = float(stats.get('month_pnl', 0))
+                pnl_ytd = float(stats.get('year_pnl', 0))
+                win_rate_mtd = float(stats.get('win_rate_mtd', 0))
+                win_rate_ytd = float(stats.get('win_rate_ytd', 0))
+            except Exception as e:
+                logger.warning(f"Failed to get trade stats: {e}")
+                pnl_today = 0.0
+                pnl_mtd = 0.0
+                win_rate_mtd = 0.0
+                win_rate_ytd = 0.0
+        elif self._get_trades:
             try:
                 all_trades = await self._get_trades()
-                trades_today = [t for t in all_trades if t.get('date') == today]
-                trades_mtd = [t for t in all_trades if t.get('date') >= month_start]
+                normalized = []
+                for t in all_trades:
+                    trade_date = t.get('date')
+                    if isinstance(trade_date, str):
+                        try:
+                            trade_date = date.fromisoformat(trade_date)
+                        except ValueError:
+                            trade_date = None
+                    if trade_date:
+                        normalized.append({**t, 'date': trade_date})
+                trades_today = [t for t in normalized if t.get('date') == today]
+                trades_mtd = [t for t in normalized if t.get('date') >= month_start]
+                trades_ytd = [t for t in normalized if t.get('date') >= date(today.year, 1, 1)]
             except Exception as e:
                 logger.warning(f"Failed to get trades: {e}")
         
         # Calculate P&L
-        pnl_today = sum(t.get('realized_pnl', 0) for t in trades_today)
-        pnl_mtd = sum(t.get('realized_pnl', 0) for t in trades_mtd)
+        if not self._get_trade_stats:
+            pnl_today = sum(t.get('realized_pnl', 0) for t in trades_today)
+            pnl_mtd = sum(t.get('realized_pnl', 0) for t in trades_mtd)
+            pnl_ytd = sum(t.get('realized_pnl', 0) for t in trades_ytd)
         
         # Win rate
-        wins_mtd = sum(1 for t in trades_mtd if t.get('realized_pnl', 0) > 0)
-        win_rate_mtd = (wins_mtd / len(trades_mtd) * 100) if trades_mtd else 0
+        if not self._get_trade_stats:
+            wins_mtd = sum(1 for t in trades_mtd if t.get('realized_pnl', 0) > 0)
+            win_rate_mtd = (wins_mtd / len(trades_mtd) * 100) if trades_mtd else 0
+            wins_ytd = sum(1 for t in trades_ytd if t.get('realized_pnl', 0) > 0)
+            win_rate_ytd = (wins_ytd / len(trades_ytd) * 100) if trades_ytd else 0
         
         # Account value (starting + MTD P&L + unrealized)
-        account_value = self.starting_balance + pnl_mtd
+        account_value = self.starting_balance + pnl_ytd
         
         # Get open positions
         positions = []
+        open_positions_count = 0
         if self._get_positions:
             try:
                 positions = await self._get_positions() or []
+                open_positions_count = len(positions)
                 # Add unrealized P&L to account value
                 unrealized = sum(p.get('unrealized_pnl', 0) for p in positions)
                 account_value += unrealized
             except Exception as e:
                 logger.warning(f"Failed to get positions: {e}")
+        if self._get_trade_stats and stats:
+            open_positions_count = int(stats.get('open_positions', open_positions_count))
+            trades_opened_today = int(stats.get('opened_today', trades_opened_today))
+            trades_closed_today = int(stats.get('trades_today', trades_closed_today))
         
         # P&L percentages
         pnl_today_pct = (pnl_today / self.starting_balance * 100) if self.starting_balance else 0
         pnl_mtd_pct = (pnl_mtd / self.starting_balance * 100) if self.starting_balance else 0
+        pnl_ytd_pct = (pnl_ytd / self.starting_balance * 100) if self.starting_balance else 0
         
         # Get conditions
         conditions_score = 5
@@ -334,13 +394,20 @@ class DailyReview:
         return DailyReviewData(
             date=today,
             trades_today=len(trades_today),
+            trades_opened_today=trades_opened_today,
+            trades_closed_today=trades_closed_today or len(trades_today),
             pnl_today=pnl_today,
             pnl_today_pct=pnl_today_pct,
             open_positions=positions,
+            open_positions_count=open_positions_count,
             trades_mtd=len(trades_mtd),
             pnl_mtd=pnl_mtd,
             pnl_mtd_pct=pnl_mtd_pct,
             win_rate_mtd=win_rate_mtd,
+            trades_ytd=len(trades_ytd),
+            pnl_ytd=pnl_ytd,
+            pnl_ytd_pct=pnl_ytd_pct,
+            win_rate_ytd=win_rate_ytd,
             account_value=account_value,
             starting_balance=self.starting_balance,
             conditions_score=conditions_score,
@@ -363,17 +430,19 @@ class DailyReview:
             "",
             "<b>PAPER TRADING:</b>",
             f"{today_emoji} Today: ${data.pnl_today:+.2f} ({data.pnl_today_pct:+.1f}%)",
-            f"   Trades: {data.trades_today}",
+            f"   Opened: {data.trades_opened_today} | Closed: {data.trades_closed_today}",
             f"{mtd_emoji} Month-to-Date: ${data.pnl_mtd:+.2f} ({data.pnl_mtd_pct:+.1f}%)",
             f"   Trades: {data.trades_mtd} | Win rate: {data.win_rate_mtd:.0f}%",
+            f"{mtd_emoji} Year-to-Date: ${data.pnl_ytd:+.2f} ({data.pnl_ytd_pct:+.1f}%)",
+            f"   Trades: {data.trades_ytd} | Win rate: {data.win_rate_ytd:.0f}%",
             "",
             f"💰 Account value: ${data.account_value:,.2f}",
         ]
         
         # Open positions
-        if data.open_positions:
+        if data.open_positions_count:
             lines.append("")
-            lines.append(f"<b>OPEN POSITIONS:</b> {len(data.open_positions)}")
+            lines.append(f"<b>OPEN POSITIONS:</b> {data.open_positions_count}")
             for pos in data.open_positions[:3]:  # Show max 3
                 pnl = pos.get('unrealized_pnl', 0)
                 pnl_emoji = "🟢" if pnl >= 0 else "🔴"
@@ -480,8 +549,13 @@ async def get_pnl_summary(daily_review: DailyReview) -> Dict[str, Any]:
         'today_pct': data.pnl_today_pct,
         'month_pnl': data.pnl_mtd,
         'month_pct': data.pnl_mtd_pct,
+        'year_pnl': data.pnl_ytd,
+        'year_pct': data.pnl_ytd_pct,
         'trades_today': data.trades_today,
-        'win_rate': data.win_rate_mtd,
+        'trades_mtd': data.trades_mtd,
+        'win_rate_mtd': data.win_rate_mtd,
+        'opened_today': data.trades_opened_today,
+        'open_positions': data.open_positions_count,
         'account_value': data.account_value,
     }
 
