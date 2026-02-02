@@ -8,6 +8,7 @@ Supports commands: /help, /status, /positions, /pnl
 
 import asyncio
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, List, Optional
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -183,6 +184,9 @@ Reply <code>no</code> — Confirm you skipped the trade
                 conditions = await self._get_conditions()
                 score = conditions.get('score', 0)
                 warmth = conditions.get('warmth_label', 'unknown')
+                market_time = conditions.get('market_time_et', 'N/A')
+                updated = conditions.get('last_updated_et') or "N/A"
+                data_status = conditions.get('data_status', {})
                 
                 lines = [
                     f"🌡️ <b>CONDITIONS: {score}/10 ({warmth.upper()})</b>",
@@ -190,9 +194,26 @@ Reply <code>no</code> — Confirm you skipped the trade
                     f"• BTC IV: {conditions.get('btc_iv', 'N/A')}%",
                     f"• Funding: {conditions.get('funding', 'N/A')}",
                     f"• Market: {'🟢 OPEN' if conditions.get('market_open') else '🔴 CLOSED'}",
+                    f"• Market Time: {market_time}",
+                    f"• Updated: {updated}",
                     "",
-                    f"<i>Updated: {datetime.utcnow().strftime('%H:%M:%S')} UTC</i>",
                 ]
+                if data_status:
+                    lines.append("<b>🧭 Data Freshness</b>")
+                    for label, info in data_status.items():
+                        state = info.get('status')
+                        if state == "ok":
+                            emoji = "✅"
+                        elif state == "pending":
+                            emoji = "⏳"
+                        elif state == "disabled":
+                            emoji = "🚫"
+                        else:
+                            emoji = "⚠️"
+                        last_seen = info.get('last_seen_et', 'N/A')
+                        age = info.get('age_human')
+                        age_suffix = f" ({age})" if age else ""
+                        lines.append(f"{emoji} {label}: {last_seen}{age_suffix}")
                 await update.message.reply_text("\n".join(lines), parse_mode="HTML")
             else:
                 await update.message.reply_text(
@@ -456,7 +477,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         
         # Add timestamp
         lines.append("")
-        lines.append(f"<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>")
+        lines.append(f"<i>{self._now_et().strftime('%Y-%m-%d %H:%M:%S %Z')}</i>")
         
         text = "\n".join(lines)
         
@@ -464,6 +485,11 @@ Reply <code>no</code> — Confirm you skipped the trade
         silent = tier > 1
         
         return await self.send_message(text, disable_notification=silent)
+
+    @staticmethod
+    def _now_et() -> datetime:
+        """Return current time in US/Eastern."""
+        return datetime.now(ZoneInfo("America/New_York"))
     
     async def send_conditions_alert(
         self,
@@ -493,7 +519,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         lines.append("")
         lines.append(f"💡 <b>Implication:</b> {implication}")
         lines.append("")
-        lines.append(f"<i>{datetime.utcnow().strftime('%H:%M:%S')} UTC</i>")
+        lines.append(f"<i>{self._now_et().strftime('%H:%M:%S %Z')}</i>")
         
         return await self.send_message("\n".join(lines))
     
@@ -573,7 +599,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         """Send daily summary report."""
         lines = [
             f"📈 <b>Daily Market Monitor Summary</b>",
-            f"<i>{datetime.utcnow().strftime('%Y-%m-%d')}</i>",
+            f"<i>{self._now_et().strftime('%Y-%m-%d')}</i>",
             "",
             "<b>Detections Today:</b>",
         ]
