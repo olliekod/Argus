@@ -117,14 +117,17 @@ class ArgusOrchestrator:
         # Initialize connectors
         await self._setup_connectors()
         
+        # Initialize Telegram
+        await self._setup_telegram()
+        
         # Initialize off-hours monitoring (Gap Risk, Conditions, Farm, Review)
         await self._setup_off_hours_monitoring()
         
+        # Wire up Telegram callbacks after both are initialized
+        self._wire_telegram_callbacks()
+        
         # Initialize detectors
         await self._setup_detectors()
-        
-        # Initialize Telegram
-        await self._setup_telegram()
         
         # Send Startup Notification
         if self.telegram:
@@ -263,7 +266,6 @@ class ArgusOrchestrator:
             # Test connection
             if await self.telegram.test_connection():
                 self.logger.info("Telegram bot connected successfully")
-                await self.telegram.send_system_status('online', 'Argus started - monitoring 7 opportunity types')
             else:
                 self.logger.error("Telegram connection failed")
                 self.telegram = None
@@ -338,13 +340,17 @@ class ArgusOrchestrator:
         )
         self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.trader_configs):,} traders")
         
-        # Wire up Telegram two-way callbacks
-        if self.telegram:
-            self.telegram.set_callbacks(
-                get_conditions=self.conditions_monitor.get_current_conditions,
-                get_pnl=self._get_pnl_summary,
-                get_positions=self._get_positions_summary,
-            )
+    def _wire_telegram_callbacks(self) -> None:
+        """Wire up Telegram two-way callbacks once dependencies are ready."""
+        if not self.telegram:
+            return
+        if not self.conditions_monitor:
+            return
+        self.telegram.set_callbacks(
+            get_conditions=self.conditions_monitor.get_current_conditions,
+            get_pnl=self._get_pnl_summary,
+            get_positions=self._get_positions_summary,
+        )
     
     async def _on_conditions_alert(self, snapshot) -> None:
         """Handle conditions threshold crossing alert."""
@@ -579,7 +585,18 @@ class ArgusOrchestrator:
             }
             
             self.logger.info(f"Health check: {status}")
-            await self.db.insert_system_health(status)
+            await self.db.insert_health_check(
+                component="bybit_ws",
+                status="connected" if status['bybit_connected'] else "disconnected",
+            )
+            await self.db.insert_health_check(
+                component="coinbase_client",
+                status="connected" if status['coinbase_connected'] else "disconnected",
+            )
+            await self.db.insert_health_check(
+                component="detectors",
+                status=f"active_{status['detectors_active']}",
+            )
     
     async def run(self) -> None:
         """Start all components and run main loop."""

@@ -20,6 +20,7 @@ Output:
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
 
@@ -126,23 +127,18 @@ class ConditionsMonitor:
     
     def _is_market_open(self) -> bool:
         """Check if US stock market is currently open."""
-        now = datetime.utcnow()
-        
-        # Convert to ET (UTC-5, ignoring DST for simplicity)
-        et_hour = (now.hour - 5) % 24
-        
-        # Market hours: 9:30 AM - 4:00 PM ET
-        # Weekdays only
-        weekday = now.weekday()
-        if weekday >= 5:  # Saturday or Sunday
+        eastern = ZoneInfo("America/New_York")
+        now = datetime.now(eastern)
+
+        # Market hours: 9:30 AM - 4:00 PM ET (weekdays only)
+        if now.weekday() >= 5:  # Saturday or Sunday
             return False
-        
-        # Check time
-        if et_hour < 9 or et_hour >= 16:
+
+        if now.hour < 9 or now.hour >= 16:
             return False
-        if et_hour == 9 and now.minute < 30:
+        if now.hour == 9 and now.minute < 30:
             return False
-        
+
         return True
     
     def _calculate_iv_signal(self, iv: float) -> Tuple[str, int]:
@@ -352,6 +348,8 @@ class ConditionsMonitor:
             await self.calculate_conditions()
         
         s = self._last_snapshot
+        eastern = ZoneInfo("America/New_York")
+        market_time = datetime.now(eastern).strftime("%H:%M:%S %Z")
         return {
             'score': s.score,
             'warmth_label': s.label,
@@ -361,6 +359,8 @@ class ConditionsMonitor:
             'implication': s.implication,
             'btc_price': s.btc_price,
             'btc_change': s.btc_change_24h,
+            'market_time_et': market_time,
+            'last_updated': s.timestamp.isoformat(),
         }
     
     async def start_monitoring(self) -> None:
