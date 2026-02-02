@@ -6,7 +6,7 @@ Abstract base class for all opportunity detectors.
 """
 
 from abc import ABC, abstractmethod
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import logging
 
@@ -133,7 +133,7 @@ class BaseDetector(ABC):
         Returns:
             Database ID of inserted record
         """
-        detection['timestamp'] = datetime.utcnow().isoformat()
+        detection['timestamp'] = datetime.now(timezone.utc).isoformat()
         detection_id = await self.db.insert_detection(detection)
         self.logger.info(
             f"Detection logged: {detection.get('opportunity_type')} - "

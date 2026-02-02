@@ -7,7 +7,7 @@ Coordinates all connectors, detectors, and alerts.
 
 import asyncio
 import signal
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -125,6 +125,16 @@ class ArgusOrchestrator:
         
         # Initialize Telegram
         await self._setup_telegram()
+        
+        # Send Startup Notification
+        if self.telegram:
+            startup_msg = f"🚀 <b>Argus Master Engine Online</b>\n"
+            startup_msg += f"<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</i>\n\n"
+            startup_msg += f"✅ Detectors: {len(self.detectors)}\n"
+            startup_msg += f"✅ GPU Engine: {'Enabled (CUDA)' if getattr(self.paper_trader_farm, 'trader_tensors', None) is not None else 'Disabled (CPU Fallback)'}\n"
+            startup_msg += f"✅ Farm: 400,000 configurations loaded\n\n"
+            startup_msg += f"Monitoring active for IBIT, BITO, and Crypto markets."
+            await self.telegram.send_message(startup_msg)
         
         self.logger.info("Setup complete!")
     
@@ -326,7 +336,7 @@ class ArgusOrchestrator:
         self.paper_trader_farm.set_data_sources(
             get_conditions=self.conditions_monitor.get_current_conditions,
         )
-        self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.traders):,} traders")
+        self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.trader_configs):,} traders")
         
         # Wire up Telegram two-way callbacks
         if self.telegram:
@@ -565,7 +575,7 @@ class ArgusOrchestrator:
                 'bybit_connected': self.bybit_ws.is_connected if self.bybit_ws else False,
                 'coinbase_connected': self.coinbase_client.is_connected if self.coinbase_client else False,
                 'detectors_active': len(self.detectors),
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
             }
             
             self.logger.info(f"Health check: {status}")

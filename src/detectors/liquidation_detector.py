@@ -5,7 +5,7 @@ Liquidation Cascade Detector
 Detects large liquidation events for snapback trading.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, Optional
 
 from .base_detector import BaseDetector
@@ -73,7 +73,7 @@ class LiquidationDetector(BaseDetector):
         if cascade_key in self._recent_cascades:
             last_cascade = self._recent_cascades[cascade_key]
             elapsed = (
-                datetime.utcnow() - 
+                datetime.now(timezone.utc) - 
                 datetime.fromisoformat(last_cascade['timestamp'])
             ).seconds
             
@@ -82,7 +82,7 @@ class LiquidationDetector(BaseDetector):
         
         # Record cascade
         self._recent_cascades[cascade_key] = {
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'total_usd': total_liq,
         }
         

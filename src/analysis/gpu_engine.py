@@ -21,6 +21,8 @@ try:
     TORCH_AVAILABLE = True
 except ImportError:
     TORCH_AVAILABLE = False
+    logger.warning("❌ PyTorch not found. GPU Engine will fall back to CPU.")
+    logger.warning("💡 To enable RTX 4080 Super acceleration, run: pip install torch --index-url https://download.pytorch.org/whl/cu121")
 
 try:
     from scipy.stats import norm

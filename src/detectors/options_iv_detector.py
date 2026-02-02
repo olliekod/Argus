@@ -11,7 +11,7 @@ the IBITDetector which has its own alerts.
 This detector feeds IV data to the IBIT detector.
 """
 
-from datetime import datetime, timedelta
+from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
 
 from .base_detector import BaseDetector
@@ -66,7 +66,7 @@ class OptionsIVDetector(BaseDetector):
         if currency not in self._last_alert_time:
             return False  # No cooldown
         
-        elapsed = datetime.utcnow() - self._last_alert_time[currency]
+        elapsed = datetime.now(timezone.utc) - self._last_alert_time[currency]
         cooldown_delta = timedelta(hours=self.cooldown_hours)
         
         return elapsed < cooldown_delta
@@ -152,7 +152,7 @@ class OptionsIVDetector(BaseDetector):
         )
         
         # Update cooldown
-        self._last_alert_time[currency] = datetime.utcnow()
+        self._last_alert_time[currency] = datetime.now(timezone.utc)
         
         await self.log_detection(detection)
         
@@ -202,7 +202,7 @@ class OptionsIVDetector(BaseDetector):
     def get_cooldown_status(self) -> Dict[str, str]:
         """Get cooldown status for each currency."""
         status = {}
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         
         for currency, last_time in self._last_alert_time.items():
             elapsed = now - last_time

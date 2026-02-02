@@ -6,7 +6,7 @@ Detects opportunities to sell put spreads on crypto ETFs (IBIT, BITO, etc.).
 Integrates with TradeCalculator for precise recommendations.
 """
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import logging
 
@@ -147,7 +147,7 @@ class IBITDetector(BaseDetector):
         
         # Check cooldown
         if self._last_alert_time:
-            elapsed = (datetime.utcnow() - self._last_alert_time).total_seconds() / 3600
+            elapsed = (datetime.now(timezone.utc) - self._last_alert_time).total_seconds() / 3600
             if elapsed < self.cooldown_hours:
                 return None
         
@@ -290,7 +290,7 @@ class IBITDetector(BaseDetector):
                   f"Credit: ${recommendation.net_credit:.2f}, PoP: {recommendation.probability_of_profit:.0f}%"
         )
         
-        self._last_alert_time = datetime.utcnow()
+        self._last_alert_time = datetime.now(timezone.utc)
         await self.log_detection(detection)
         
         # === AUTO-LOG PAPER TRADE ===

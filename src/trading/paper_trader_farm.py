@@ -10,7 +10,7 @@ Checks economic calendar for blackout periods before entries.
 
 import asyncio
 import logging
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Dict, List, Optional, Any, Callable
 from pathlib import Path
 import json
@@ -290,7 +290,7 @@ class PaperTraderFarm:
             
             # Check session filter (this is the only part not yet in the tensor mask)
             # We could add it to the tensor for 100% speed, but it's only for the matches
-            dt = current_time or datetime.utcnow()
+            dt = current_time or datetime.now(timezone.utc)
             hour = dt.hour + (dt.minute / 60)
             session = config.session_filter
             if session != 'any':
@@ -320,7 +320,7 @@ class PaperTraderFarm:
                     'iv': signal_data.get('iv'),
                     'warmth': signal_data.get('warmth'),
                     'direction': signal_data.get('direction'),
-                    'timestamp': datetime.utcnow().isoformat(),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
                 },
             )
             

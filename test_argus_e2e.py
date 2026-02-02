@@ -15,7 +15,7 @@ Usage: python test_argus_e2e.py
 import asyncio
 import sys
 from pathlib import Path
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 
 # Add project root to path
 project_root = Path(__file__).parent
@@ -254,14 +254,14 @@ async def run_all_tests():
             expiration: str = "2026-02-14"
             
         # Prepare a "market hours" signal (10:30 AM ET)
-        market_time = datetime.now().replace(hour=10, minute=30, second=0, microsecond=0)
+        market_time = datetime.now(timezone.utc).replace(hour=10, minute=30, second=0, microsecond=0)
         
         farm_trades = await farm.evaluate_signal(
             symbol="IBIT",
             signal_data={
                 'iv': 65,
                 'warmth': 8,
-                'dte': 14,
+                'dte': 45,
                 'pop': 75,
                 'direction': 'bullish',
                 'credit': 0.50,

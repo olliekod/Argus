@@ -194,7 +194,7 @@ class PaperTrader:
         # 1. Check session filter (time-of-day)
         session = self.config.session_filter
         if session != 'any':
-            dt = current_time or datetime.utcnow()
+            dt = current_time or datetime.now(timezone.utc)
             # Convert to Eastern Time for session checks
             # In production this would use the timezone-fixed value
             # For simplicity here, we assume the provided time reflects market hours
@@ -337,7 +337,7 @@ class PaperTrader:
             List of trades that were closed
         """
         closed = []
-        now = current_date or datetime.utcnow()
+        now = current_date or datetime.now(timezone.utc)
         
         for trade in self.open_positions[:]:  # Copy to allow modification
             if trade.id not in current_prices:
