@@ -254,11 +254,11 @@ class IBITDetector(BaseDetector):
         ibit_price = self._current_ibit_data.get('price', 0)
         
         iv_elevated = btc_iv >= self.btc_iv_threshold
-        ibit_dropped = ibit_change <= self.ibit_drop_threshold
+        ibit_dropped = ibit_change <= self.drop_threshold
         
         # Combined score
         iv_score = btc_iv / self.btc_iv_threshold if self.btc_iv_threshold > 0 else 0
-        drop_score = abs(ibit_change) / abs(self.ibit_drop_threshold) if ibit_change < 0 else 0
+        drop_score = abs(ibit_change) / abs(self.drop_threshold) if ibit_change < 0 else 0
         combined_score = (iv_score + drop_score) / 2
         
         if combined_score < self.combined_score_threshold:
