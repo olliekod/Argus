@@ -1,0 +1,27 @@
+{
+  "live": {},
+  "paper": {
+    "iv_threshold": 0.25,
+    "price_drop_trigger": -0.005,
+    "target_delta": 0.15,
+    "profit_target": 0.7,
+    "spread_width_pct": 0.08,
+    "time_exit_dte": 5,
+    "entry_dte": 14,
+    "updated_at": "2026-01-30T23:06:50.674029",
+    "source": "optimization"
+  },
+  "history": [
+    {
+      "params": {
+        "iv_threshold": 0.25,
+        "price_drop_trigger": -0.005,
+        "target_delta": 0.15,
+        "profit_target": 0.7,
+        "spread_width_pct": 0.08
+      },
+      "target": "paper",
+      "timestamp": "2026-01-30T23:06:50.674037"
+    }
+  ]
+}

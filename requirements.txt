@@ -16,6 +16,9 @@ pandas>=2.1.0
 numpy>=1.26.0
 scipy>=1.11.0
 
+# Yahoo Finance for IBIT options
+yfinance>=0.2.36
+
 # Configuration
 pyyaml>=6.0.1
 python-dotenv>=1.0.0
@@ -55,3 +58,5 @@ typing-extensions>=4.9.0
 pystray>=0.19.5
 pillow>=10.0.0
 
+# Reddit API (for sentiment monitoring)
+praw>=7.7.0

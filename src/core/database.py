@@ -55,6 +55,21 @@ class Database:
             self._connection = None
             logger.info("Database connection closed")
     
+    async def execute(self, sql: str, params: tuple = ()) -> None:
+        """Execute a SQL statement (for external use)."""
+        await self._connection.execute(sql, params)
+        await self._connection.commit()
+    
+    async def fetch_one(self, sql: str, params: tuple = ()) -> Optional[tuple]:
+        """Fetch one row from a query."""
+        cursor = await self._connection.execute(sql, params)
+        return await cursor.fetchone()
+    
+    async def fetch_all(self, sql: str, params: tuple = ()) -> List[tuple]:
+        """Fetch all rows from a query."""
+        cursor = await self._connection.execute(sql, params)
+        return await cursor.fetchall()
+    
     async def _create_tables(self) -> None:
         """Create all database tables if they don't exist."""
         

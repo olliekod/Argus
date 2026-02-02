@@ -14,6 +14,9 @@ from typing import Any, Dict, List, Optional
 from .core.config import load_all_config, validate_secrets, get_secret
 from .core.database import Database
 from .core.logger import setup_logger, get_logger
+from .core.gap_risk_tracker import GapRiskTracker
+from .core.reddit_monitor import RedditMonitor
+from .core.conditions_monitor import ConditionsMonitor
 from .connectors.bybit_ws import BybitWebSocket
 from .connectors.coinbase_client import CoinbaseClient
 from .connectors.okx_client import OKXClient
@@ -28,6 +31,9 @@ from .detectors.options_iv_detector import OptionsIVDetector
 from .detectors.volatility_detector import VolatilityDetector
 from .detectors.ibit_detector import IBITDetector
 from .alerts.telegram_bot import TelegramBot
+from .analysis.daily_review import DailyReview
+from .trading.paper_trader_farm import PaperTraderFarm
+
 
 
 class ArgusOrchestrator:
@@ -83,6 +89,17 @@ class ArgusOrchestrator:
         self.yahoo_client: Optional[YahooFinanceClient] = None
         self.telegram: Optional[TelegramBot] = None
         
+        # Off-hours monitoring
+        self.gap_risk_tracker: Optional[GapRiskTracker] = None
+        self.reddit_monitor: Optional[RedditMonitor] = None
+        
+        # Conditions synthesis and daily review
+        self.conditions_monitor: Optional[ConditionsMonitor] = None
+        self.daily_review: Optional[DailyReview] = None
+        
+        # Paper trader farm (752 parallel traders)
+        self.paper_trader_farm: Optional[PaperTraderFarm] = None
+        
         self.detectors: Dict[str, Any] = {}
         
         self._running = False
@@ -99,6 +116,9 @@ class ArgusOrchestrator:
         
         # Initialize connectors
         await self._setup_connectors()
+        
+        # Initialize off-hours monitoring (Gap Risk, Conditions, Farm, Review)
+        await self._setup_off_hours_monitoring()
         
         # Initialize detectors
         await self._setup_detectors()
@@ -189,13 +209,33 @@ class ArgusOrchestrator:
         # IBIT options detector (actionable for Robinhood)
         ibit_config = thresholds.get('ibit', {
             'enabled': True,
-            'btc_iv_threshold': 70,
-            'ibit_drop_threshold': -3,
-            'combined_score_threshold': 1.5,
-            'cooldown_hours': 4,
+            'btc_iv_threshold': 25,
+            'ibit_drop_threshold': -0.5,
+            'combined_score_threshold': 1.0,
+            'cooldown_hours': 2,
         })
         if ibit_config.get('enabled', True):
-            self.detectors['ibit'] = IBITDetector(ibit_config, self.db)
+            self.detectors['ibit'] = IBITDetector(ibit_config, self.db, symbol='IBIT')
+            # Wire up Telegram for paper trade notifications
+            self.detectors['ibit'].set_telegram_callback(self._send_paper_notification)
+            # Wire up farm if available
+            if self.paper_trader_farm:
+                self.detectors['ibit'].set_paper_trader_farm(self.paper_trader_farm)
+        
+        # BITO options detector (same strategy, more opportunities)
+        bito_config = thresholds.get('bito', {
+            'enabled': True,
+            'btc_iv_threshold': 25,
+            'drop_threshold': -0.5,
+            'combined_score_threshold': 1.0,
+            'cooldown_hours': 2,
+        })
+        if bito_config.get('enabled', True):
+            self.detectors['bito'] = IBITDetector(bito_config, self.db, symbol='BITO')
+            self.detectors['bito'].set_telegram_callback(self._send_paper_notification)
+            # Wire up farm if available
+            if self.paper_trader_farm:
+                self.detectors['bito'].set_paper_trader_farm(self.paper_trader_farm)
         
         self.logger.info(f"Initialized {len(self.detectors)} detectors")
     
@@ -219,6 +259,150 @@ class ArgusOrchestrator:
                 self.telegram = None
         else:
             self.logger.warning("Telegram not configured - alerts disabled")
+    
+    async def _setup_off_hours_monitoring(self) -> None:
+        """Initialize gap risk tracker, conditions monitor, and daily review."""
+        thresholds = self.config.get('thresholds', {})
+        
+        # Gap Risk Tracker
+        gap_config = thresholds.get('gap_risk', {})
+        if gap_config.get('enabled', True):
+            self.gap_risk_tracker = GapRiskTracker(self.db, gap_config)
+            await self.gap_risk_tracker.initialize()
+            self.logger.info("Gap Risk Tracker initialized")
+        
+        # Reddit Monitor (only if API keys configured)
+        reddit_secrets = self.secrets.get('reddit', {})
+        reddit_config = thresholds.get('reddit_sentiment', {})
+        
+        client_id = reddit_secrets.get('client_id', '')
+        client_secret = reddit_secrets.get('client_secret', '')
+        
+        if client_id and client_secret and reddit_config.get('enabled', True):
+            self.reddit_monitor = RedditMonitor(
+                client_id=client_id,
+                client_secret=client_secret,
+                user_agent=reddit_secrets.get('user_agent', 'Argus/1.0'),
+            )
+            self.logger.info("Reddit Monitor initialized")
+        else:
+            self.logger.info("Reddit Monitor not configured - sentiment tracking disabled")
+        
+        # Conditions Monitor (synthesis layer)
+        conditions_config = thresholds.get('conditions_monitor', {})
+        self.conditions_monitor = ConditionsMonitor(
+            config=conditions_config,
+            on_alert=self._on_conditions_alert,
+        )
+        
+        # Wire up data sources to conditions monitor
+        self.conditions_monitor.set_data_sources(
+            get_btc_iv=self._get_btc_iv,
+            get_funding=self._get_btc_funding,
+            get_btc_price=self._get_btc_price,
+        )
+        self.logger.info("Conditions Monitor initialized")
+        
+        # Daily Review (4 PM summary)
+        self.daily_review = DailyReview(
+            starting_balance=5000.0,
+            on_send=self._send_daily_review,
+        )
+        
+        # Wire up data sources to daily review
+        self.daily_review.set_data_sources(
+            get_conditions=self.conditions_monitor.get_current_conditions,
+        )
+        self.logger.info("Daily Review initialized")
+        
+        # Paper Trader Farm (86K+ parallel traders with full coverage)
+        self.paper_trader_farm = PaperTraderFarm(
+            db=self.db,
+            full_coverage=True,  # Generate ALL unique parameter combinations
+        )
+        await self.paper_trader_farm.initialize()
+        
+        # Wire up data sources to paper trader farm
+        self.paper_trader_farm.set_data_sources(
+            get_conditions=self.conditions_monitor.get_current_conditions,
+        )
+        self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.traders):,} traders")
+        
+        # Wire up Telegram two-way callbacks
+        if self.telegram:
+            self.telegram.set_callbacks(
+                get_conditions=self.conditions_monitor.get_current_conditions,
+                get_pnl=self._get_pnl_summary,
+                get_positions=self._get_positions_summary,
+            )
+    
+    async def _on_conditions_alert(self, snapshot) -> None:
+        """Handle conditions threshold crossing alert."""
+        if not self.telegram:
+            return
+        
+        details = {
+            'BTC IV': f"{snapshot.btc_iv:.0f}% ({snapshot.iv_signal})",
+            'Funding': f"{snapshot.funding_rate:+.3f}% ({snapshot.funding_signal})",
+            'BTC': f"{snapshot.btc_change_24h:+.1f}% ({snapshot.momentum_signal})",
+            'Market': "🟢 OPEN" if snapshot.market_open else "🔴 CLOSED",
+        }
+        
+        await self.telegram.send_conditions_alert(
+            score=snapshot.score,
+            label=snapshot.label,
+            details=details,
+            implication=snapshot.implication,
+        )
+    
+    async def _send_daily_review(self, message: str) -> None:
+        """Send daily review via Telegram."""
+        if self.telegram:
+            await self.telegram.send_message(message)
+    
+    async def _get_btc_iv(self) -> Optional[Dict]:
+        """Get current BTC IV from Deribit."""
+        if self.deribit_client:
+            try:
+                return await self.deribit_client.get_atm_iv('BTC')
+            except Exception:
+                pass
+        return None
+    
+    async def _get_btc_funding(self) -> Optional[Dict]:
+        """Get current BTC funding rate from Bybit."""
+        if self.bybit_ws:
+            rate = self.bybit_ws.get_funding_rate('BTCUSDT')
+            if rate is not None:
+                return {'rate': rate}
+        return None
+    
+    async def _get_btc_price(self) -> Optional[Dict]:
+        """Get current BTC price."""
+        if self.bybit_ws:
+            ticker = self.bybit_ws.get_ticker('BTCUSDT')
+            if ticker:
+                return {
+                    'price': ticker.get('last_price', 0),
+                    'change_24h_pct': ticker.get('price_24h_pcnt', 0) * 100,
+                }
+        return None
+    
+    async def _get_pnl_summary(self) -> Dict:
+        """Get P&L summary for Telegram /pnl command."""
+        # Prefer paper trader farm if available
+        if self.paper_trader_farm:
+            return await self.paper_trader_farm.get_pnl_for_telegram()
+        if self.daily_review:
+            from .analysis.daily_review import get_pnl_summary
+            return await get_pnl_summary(self.daily_review)
+        return {}
+    
+    async def _get_positions_summary(self) -> List[Dict]:
+        """Get positions summary for Telegram /positions command."""
+        if self.paper_trader_farm:
+            return await self.paper_trader_farm.get_positions_for_telegram()
+        return []
     
     async def _on_bybit_ticker(self, data: Dict) -> None:
         """Handle Bybit ticker update."""
@@ -286,6 +470,14 @@ class ArgusOrchestrator:
             await self.telegram.send_basis_alert(detection)
         elif op_type == 'ibit_options':
             await self._send_ibit_alert(detection)
+    
+    async def _send_paper_notification(self, message: str) -> None:
+        """Send paper trade notification via Telegram."""
+        if self.telegram:
+            try:
+                await self.telegram.send_message(message, parse_mode="Markdown")
+            except Exception as e:
+                self.logger.warning(f"Failed to send paper notification: {e}")
     
     async def _send_ibit_alert(self, detection: Dict) -> None:
         """Send IBIT options opportunity alert."""
@@ -399,6 +591,18 @@ class ArgusOrchestrator:
         self._tasks.append(asyncio.create_task(self._poll_coinglass()))
         self._tasks.append(asyncio.create_task(self._health_check()))
         
+        # Start conditions monitoring (synthesis layer)
+        if self.conditions_monitor:
+            self._tasks.append(asyncio.create_task(self.conditions_monitor.start_monitoring()))
+        
+        # Start daily review monitoring (4 PM summary)
+        if self.daily_review:
+            self._tasks.append(asyncio.create_task(self.daily_review.start_monitoring()))
+        
+        # Start Telegram two-way polling
+        if self.telegram:
+            await self.telegram.start_polling()
+        
         self.logger.info("Argus is running! Press Ctrl+C to stop.")
         
         # Wait for all tasks
@@ -411,6 +615,16 @@ class ArgusOrchestrator:
         """Stop all components gracefully."""
         self.logger.info("Stopping Argus...")
         self._running = False
+        
+        # Stop monitoring loops
+        if self.conditions_monitor:
+            self.conditions_monitor.stop_monitoring()
+        if self.daily_review:
+            self.daily_review.stop_monitoring()
+        
+        # Stop Telegram polling
+        if self.telegram:
+            await self.telegram.stop_polling()
         
         # Cancel all tasks
         for task in self._tasks:

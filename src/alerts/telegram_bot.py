@@ -1,14 +1,16 @@
 """
-Telegram Bot for Alerts
-=======================
+Telegram Bot for Alerts (Two-Way)
+=================================
 
-3-tier alert system via Telegram.
+3-tier alert system via Telegram with two-way communication.
+Supports commands: /help, /status, /positions, /pnl
 """
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any, Dict, Optional
-from telegram import Bot
+from typing import Any, Callable, Dict, List, Optional
+from telegram import Bot, Update
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 from telegram.error import TelegramError
 
 from ..core.logger import get_alert_logger
@@ -18,12 +20,18 @@ logger = get_alert_logger()
 
 class TelegramBot:
     """
-    Telegram notification bot with 3-tier priority system.
+    Telegram notification bot with 3-tier priority system and two-way communication.
     
     Tiers:
     - Tier 1: Immediate (Options IV >80%, Large liquidations)
     - Tier 2: FYI (Funding extremes, Basis arb opportunities)
     - Tier 3: Background (Logged only, not sent)
+    
+    Commands:
+    - /help: List all available commands
+    - /status: Current system status and conditions
+    - /positions: Open paper trades
+    - /pnl: Today's P&L summary
     """
     
     # Emojis for different alert types
@@ -41,7 +49,27 @@ class TelegramBot:
         'success': "✅",
         'warning': "⚠️",
         'error': "❌",
+        'warmth': "🌡️",
     }
+    
+    HELP_TEXT = """
+<b>📋 Argus Commands</b>
+
+<b>Status Commands:</b>
+/help — Show this help message
+/status — Current conditions score and system status
+/positions — View open paper trading positions
+/pnl — Today's P&L summary
+
+<b>Trade Confirmation:</b>
+Reply <code>yes</code> — Confirm you took the trade
+Reply <code>no</code> — Confirm you skipped the trade
+
+<b>Alert Tiers:</b>
+🚨 Tier 1 — Immediate action needed
+📊 Tier 2 — FYI, no action required
+📝 Tier 3 — Logged only (not sent)
+"""
     
     def __init__(
         self,
@@ -63,6 +91,7 @@ class TelegramBot:
             tier_3_enabled: Send tier 3 alerts (usually disabled)
             rate_limit_seconds: Minimum seconds between same-type alerts
         """
+        self.bot_token = bot_token
         self.bot = Bot(token=bot_token)
         self.chat_id = chat_id
         
@@ -73,7 +102,243 @@ class TelegramBot:
         self.rate_limit_seconds = rate_limit_seconds
         self._last_alert_time: Dict[str, datetime] = {}
         
-        logger.info("Telegram bot initialized")
+        # Callbacks for data access (set by orchestrator)
+        self._get_conditions: Optional[Callable] = None
+        self._get_positions: Optional[Callable] = None
+        self._get_pnl: Optional[Callable] = None
+        self._on_trade_confirmation: Optional[Callable] = None
+        
+        # Track last signal for yes/no confirmation
+        self._last_signal_id: Optional[str] = None
+        self._last_signal_time: Optional[datetime] = None
+        
+        # Application for two-way communication
+        self._app: Optional[Application] = None
+        self._polling_task: Optional[asyncio.Task] = None
+        
+        logger.info("Telegram bot initialized (two-way enabled)")
+    
+    def set_callbacks(
+        self,
+        get_conditions: Optional[Callable] = None,
+        get_positions: Optional[Callable] = None,
+        get_pnl: Optional[Callable] = None,
+        on_trade_confirmation: Optional[Callable] = None,
+    ):
+        """Set callback functions for data access."""
+        self._get_conditions = get_conditions
+        self._get_positions = get_positions
+        self._get_pnl = get_pnl
+        self._on_trade_confirmation = on_trade_confirmation
+    
+    async def start_polling(self) -> None:
+        """Start listening for incoming messages."""
+        try:
+            self._app = Application.builder().token(self.bot_token).build()
+            
+            # Add command handlers
+            self._app.add_handler(CommandHandler("help", self._cmd_help))
+            self._app.add_handler(CommandHandler("status", self._cmd_status))
+            self._app.add_handler(CommandHandler("positions", self._cmd_positions))
+            self._app.add_handler(CommandHandler("pnl", self._cmd_pnl))
+            
+            # Add message handler for yes/no responses
+            self._app.add_handler(MessageHandler(
+                filters.TEXT & ~filters.COMMAND,
+                self._handle_message
+            ))
+            
+            # Initialize and start polling
+            await self._app.initialize()
+            await self._app.start()
+            await self._app.updater.start_polling(drop_pending_updates=True)
+            
+            logger.info("Telegram bot polling started")
+        except Exception as e:
+            logger.error(f"Failed to start Telegram polling: {e}")
+    
+    async def stop_polling(self) -> None:
+        """Stop listening for incoming messages."""
+        if self._app:
+            try:
+                await self._app.updater.stop()
+                await self._app.stop()
+                await self._app.shutdown()
+                logger.info("Telegram bot polling stopped")
+            except Exception as e:
+                logger.error(f"Error stopping Telegram polling: {e}")
+    
+    # -------------------------------------------------------------------------
+    # COMMAND HANDLERS
+    # -------------------------------------------------------------------------
+    
+    async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /help command."""
+        await update.message.reply_text(self.HELP_TEXT, parse_mode="HTML")
+    
+    async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /status command."""
+        try:
+            if self._get_conditions:
+                conditions = await self._get_conditions()
+                score = conditions.get('score', 0)
+                warmth = conditions.get('warmth_label', 'unknown')
+                
+                lines = [
+                    f"🌡️ <b>CONDITIONS: {score}/10 ({warmth.upper()})</b>",
+                    "",
+                    f"• BTC IV: {conditions.get('btc_iv', 'N/A')}%",
+                    f"• Funding: {conditions.get('funding', 'N/A')}",
+                    f"• Market: {'🟢 OPEN' if conditions.get('market_open') else '🔴 CLOSED'}",
+                    "",
+                    f"<i>Updated: {datetime.utcnow().strftime('%H:%M:%S')} UTC</i>",
+                ]
+                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            else:
+                await update.message.reply_text(
+                    "⚠️ Status not available. Conditions monitor not connected.",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            logger.error(f"Error in /status: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+    
+    async def _cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /positions command."""
+        try:
+            if self._get_positions:
+                positions = await self._get_positions()
+                
+                if not positions:
+                    await update.message.reply_text("📭 No open paper positions.")
+                    return
+                
+                lines = ["<b>📊 Open Paper Positions</b>", ""]
+                
+                for pos in positions:
+                    # Handle both individual position and grouped formats
+                    if 'count' in pos:
+                        # Grouped format from farm
+                        lines.append(
+                            f"🔸 <b>{pos.get('symbol')}</b> {pos.get('sample_strikes', '')}\n"
+                            f"   Positions: {pos.get('count')} across {pos.get('traders_entered', 0)} traders"
+                        )
+                    else:
+                        # Individual position format
+                        pnl = pos.get('unrealized_pnl', 0)
+                        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
+                        lines.append(
+                            f"{pnl_emoji} {pos.get('symbol')} {pos.get('strikes', '')}\n"
+                            f"   Entry: ${pos.get('entry_credit', 0):.2f} | "
+                            f"P&L: ${pnl:+.2f}"
+                        )
+                    lines.append("")
+                
+                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            else:
+                await update.message.reply_text(
+                    "⚠️ Positions not available. Paper trader not connected.",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            logger.error(f"Error in /positions: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+    
+    async def _cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /pnl command."""
+        try:
+            if self._get_pnl:
+                pnl = await self._get_pnl()
+                
+                today_pnl = pnl.get('today_pnl', 0)
+                month_pnl = pnl.get('month_pnl', 0)
+                today_emoji = "🟢" if today_pnl >= 0 else "🔴"
+                month_emoji = "🟢" if month_pnl >= 0 else "🔴"
+                
+                lines = [
+                    "<b>💰 P&L Summary</b>",
+                    "",
+                    f"{today_emoji} Today: ${today_pnl:+.2f} ({pnl.get('today_pct', 0):+.1f}%)",
+                    f"{month_emoji} Month-to-Date: ${month_pnl:+.2f} ({pnl.get('month_pct', 0):+.1f}%)",
+                    "",
+                    f"Trades today: {pnl.get('trades_today', 0)}",
+                    f"Win rate (MTD): {pnl.get('win_rate', 0):.0f}%",
+                    "",
+                    f"<i>Paper account: ${pnl.get('account_value', 5000):.2f}</i>",
+                ]
+                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+            else:
+                await update.message.reply_text(
+                    "⚠️ P&L not available. Paper trader not connected.",
+                    parse_mode="HTML"
+                )
+        except Exception as e:
+            logger.error(f"Error in /pnl: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+    
+    async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle non-command messages (yes/no trade confirmations)."""
+        if not update.message or not update.message.text:
+            return
+        
+        text = update.message.text.strip().lower()
+        
+        # Check for yes/no response
+        if text.startswith("yes") or text.startswith("no"):
+            await self._handle_trade_confirmation(update, text)
+        else:
+            # Unknown message, provide help
+            await update.message.reply_text(
+                "❓ Unknown command. Type /help for available commands."
+            )
+    
+    async def _handle_trade_confirmation(self, update: Update, text: str) -> None:
+        """Handle yes/no trade confirmation."""
+        # Check if there's a recent signal to confirm
+        if not self._last_signal_id or not self._last_signal_time:
+            await update.message.reply_text(
+                "⚠️ No recent trade signal to confirm. Wait for an alert first."
+            )
+            return
+        
+        # Check if signal is still valid (within 2 hours)
+        if datetime.utcnow() - self._last_signal_time > timedelta(hours=2):
+            await update.message.reply_text(
+                "⚠️ Last signal expired (>2 hours ago). Wait for a new alert."
+            )
+            return
+        
+        confirmed = text.startswith("yes")
+        
+        # Log the confirmation
+        if self._on_trade_confirmation:
+            try:
+                await self._on_trade_confirmation(
+                    signal_id=self._last_signal_id,
+                    confirmed=confirmed,
+                    response_text=text,
+                )
+            except Exception as e:
+                logger.error(f"Error processing trade confirmation: {e}")
+        
+        # Acknowledge
+        if confirmed:
+            await update.message.reply_text("✅ Trade confirmed! Good luck!")
+        else:
+            await update.message.reply_text("📝 Trade skipped. Noted.")
+        
+        # Clear the signal
+        self._last_signal_id = None
+        self._last_signal_time = None
+    
+    def set_last_signal(self, signal_id: str) -> None:
+        """Set the last signal ID for yes/no confirmation."""
+        self._last_signal_id = signal_id
+        self._last_signal_time = datetime.utcnow()
+    
+    # -------------------------------------------------------------------------
+    # EXISTING SENDING METHODS
+    # -------------------------------------------------------------------------
     
     def _should_send(self, tier: int, alert_type: str) -> bool:
         """Check if alert should be sent based on tier and rate limiting."""
@@ -85,17 +350,21 @@ class TelegramBot:
         if tier == 3 and not self.tier_3_enabled:
             return False
         
-        # Tier 1 always sends (no rate limiting)
-        if tier == 1:
-            return True
-        
-        # Rate limiting for tier 2+
+        # Rate limiting for ALL tiers (including Tier 1)
+        # Tier 1: 30 minute minimum cooldown per alert type
+        # Tier 2+: Uses configured rate_limit_seconds
         key = f"{tier}_{alert_type}"
         now = datetime.utcnow()
         
+        # Tier 1 gets longer cooldown to prevent spam
+        if tier == 1:
+            cooldown_seconds = 30 * 60  # 30 minutes for Tier 1
+        else:
+            cooldown_seconds = self.rate_limit_seconds
+        
         if key in self._last_alert_time:
             elapsed = (now - self._last_alert_time[key]).seconds
-            if elapsed < self.rate_limit_seconds:
+            if elapsed < cooldown_seconds:
                 return False
         
         self._last_alert_time[key] = now
@@ -137,7 +406,8 @@ class TelegramBot:
         alert_type: str,
         title: str,
         details: Dict[str, Any],
-        action: Optional[str] = None
+        action: Optional[str] = None,
+        signal_id: Optional[str] = None,
     ) -> bool:
         """
         Send a formatted alert message.
@@ -148,6 +418,7 @@ class TelegramBot:
             title: Alert title
             details: Details to include
             action: Suggested action (optional)
+            signal_id: If provided, sets for yes/no confirmation
             
         Returns:
             True if sent
@@ -175,6 +446,14 @@ class TelegramBot:
             lines.append("")
             lines.append(f"💡 <b>Action:</b> {action}")
         
+        # Add confirmation prompt for Tier 1
+        if tier == 1 and signal_id:
+            lines.append("")
+            lines.append("━━━━━━━━━━━━━━━━━━━━━")
+            lines.append("Reply <b>yes</b> if you took this trade")
+            lines.append("Reply <b>no</b> if you skipped")
+            self.set_last_signal(signal_id)
+        
         # Add timestamp
         lines.append("")
         lines.append(f"<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>")
@@ -185,6 +464,38 @@ class TelegramBot:
         silent = tier > 1
         
         return await self.send_message(text, disable_notification=silent)
+    
+    async def send_conditions_alert(
+        self,
+        score: int,
+        label: str,
+        details: Dict[str, Any],
+        implication: str,
+    ) -> bool:
+        """Send a conditions warming/cooling alert."""
+        emoji_map = {
+            'cooling': "❄️",
+            'neutral': "➖",
+            'warming': "🔥",
+            'prime': "🎯",
+        }
+        
+        emoji = emoji_map.get(label.lower(), "🌡️")
+        
+        lines = [
+            f"{emoji} <b>CONDITIONS: {score}/10 ({label.upper()})</b>",
+            "",
+        ]
+        
+        for key, value in details.items():
+            lines.append(f"• {key}: {value}")
+        
+        lines.append("")
+        lines.append(f"💡 <b>Implication:</b> {implication}")
+        lines.append("")
+        lines.append(f"<i>{datetime.utcnow().strftime('%H:%M:%S')} UTC</i>")
+        
+        return await self.send_message("\n".join(lines))
     
     async def send_funding_alert(self, detection: Dict) -> bool:
         """Send funding rate opportunity alert."""

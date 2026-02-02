@@ -135,24 +135,113 @@ volatility:
 # Detector #7: IBIT Options Opportunity (MANUAL TRADING)
 # Strategy: Sell put spreads on IBIT when BTC volatility spikes
 # NOTE: This detector alerts YOU to check Robinhood for opportunities
+# 
+# OPTIMIZED 2026-01-30 via scripts/optimize.py
 # -----------------------------------------------------------------------------
 ibit:
   enabled: true
   
-  # Alert triggers
-  btc_iv_threshold: 70         # BTC IV > 70% (from Deribit)
-  ibit_drop_threshold: -3      # IBIT dropped > 3% today
-  combined_score_threshold: 1.5  # Combined condition score
+  # Alert triggers (OPTIMIZED VALUES)
+  btc_iv_threshold: 25           # BTC IV > 25% (from Deribit) - LOWERED for more signals
+  ibit_drop_threshold: -0.5      # IBIT dropped > 0.5% today - LOWERED for more signals
+  iv_rank_threshold: 25          # IV Rank > 25%
+  combined_score_threshold: 1.0  # Combined condition score
   
   # Cooldown to prevent alert spam
-  cooldown_hours: 4            # Min 4h between alerts
+  cooldown_hours: 2              # Min 2h between alerts (was 4)
   
   # Suggested trade parameters (for your Robinhood trades)
-  otm_percent_short: 8         # Short strike 8% OTM
-  otm_percent_long: 15         # Long strike 15% OTM (defines max loss)
-  target_expiry_days: 7        # Weekly options preferred
+  otm_percent_short: 8           # Short strike 8% OTM
+  otm_percent_long: 16           # Long strike 16% OTM (8% spread width)
+  target_expiry_days: 14         # 2-week options preferred
+  profit_target: 0.70            # Close at 70% profit (was 50%)
+  time_exit_dte: 5               # Exit at 5 DTE
   
   # Position limits
-  max_position_size: 800       # Max $800 per spread
-  max_open_positions: 3        # Max 3 concurrent positions
+  max_position_size: 1000        # Max $1000 per spread
+  max_open_positions: 3          # Max 3 concurrent positions
+  
+  # Paper trading
+  paper_trading: true            # Log paper trades
+  account_size: 3000             # For position sizing
 
+# -----------------------------------------------------------------------------
+# Detector #8: BITO Options Opportunity (MANUAL TRADING)
+# Strategy: Same as IBIT - sell put spreads on crypto volatility
+# BITO = ProShares Bitcoin Strategy ETF (tracks BTC futures)
+# Adding this DOUBLES your trade opportunities
+# -----------------------------------------------------------------------------
+bito:
+  enabled: true
+  
+  # Alert triggers (same as IBIT)
+  btc_iv_threshold: 25
+  drop_threshold: -0.5
+  iv_rank_threshold: 25
+  combined_score_threshold: 1.0
+  
+  # Cooldown
+  cooldown_hours: 2
+  
+  # Trade parameters
+  otm_percent_short: 8
+  otm_percent_long: 16
+  target_expiry_days: 14
+  profit_target: 0.70
+  time_exit_dte: 5
+  
+  # Position limits (shared with IBIT)
+  max_position_size: 1000
+  max_open_positions: 3          # 3 BITO + 3 IBIT = 6 total max
+  
+  # Paper trading
+  paper_trading: true
+  account_size: 3000
+
+# -----------------------------------------------------------------------------
+# GAP RISK TRACKER
+# Monitors BTC price gaps during market-closed hours (nights, weekends)
+# Alerts when significant moves could impact IBIT/BITO at market open
+# -----------------------------------------------------------------------------
+gap_risk:
+  enabled: true
+  
+  # Thresholds (adjusted for higher risk tolerance)
+  info_threshold_pct: 5          # Log only, no alert
+  elevated_threshold_pct: 8      # Telegram FYI
+  high_threshold_pct: 12         # Immediate alert, suggest reduced size
+  extreme_threshold_pct: 15      # Circuit breaker suggested
+  
+  # Alert schedule (EST timezone)
+  sunday_alert_hour: 20          # 8 PM ET
+  monday_alert_hour: 8           # 8 AM ET
+  
+  # Position adjustment recommendations
+  reduce_size_above_pct: 12      # Suggest 50% position size
+  skip_trades_above_pct: 15      # Suggest no new trades
+
+# -----------------------------------------------------------------------------
+# REDDIT SENTIMENT
+# Scrapes crypto subreddits for retail sentiment
+# Uses STRICT bot filtering: 90+ days old, 500+ karma
+# -----------------------------------------------------------------------------
+reddit_sentiment:
+  enabled: true
+  
+  # Subreddits to monitor
+  subreddits:
+    - Bitcoin
+    - CryptoCurrency
+    - wallstreetbets
+  
+  # Bot filtering (STRICT)
+  min_account_age_days: 90       # Account must be older than 90 days
+  min_karma: 500                  # Must have 500+ total karma
+  
+  # Update frequency
+  poll_interval_minutes: 15      # How often to fetch new data
+  cache_ttl_minutes: 15          # How long to cache results
+  
+  # Thresholds for alerts
+  extreme_fear_threshold: -50    # Contrarian bullish below this
+  extreme_greed_threshold: 70    # Crowded trade warning above this
