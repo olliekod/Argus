@@ -8,6 +8,7 @@ Coordinates all connectors, detectors, and alerts.
 import asyncio
 import signal
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -104,6 +105,18 @@ class ArgusOrchestrator:
         
         self._running = False
         self._tasks: List[asyncio.Task] = []
+        self._start_time = datetime.now(timezone.utc)
+        self._last_price_snapshot: Dict[str, datetime] = {}
+        self._last_coinglass_check: Optional[datetime] = None
+        self._last_health_check: Optional[datetime] = None
+        self._research_last_run: Optional[datetime] = None
+        self._research_last_symbol: Optional[str] = None
+        self._research_last_entered: int = 0
+        self._research_promoted: bool = False
+        self.research_config: Dict[str, Any] = self.config.get('research', {})
+        self.research_enabled = self.research_config.get('enabled', False)
+        self.research_alerts_enabled = self.research_config.get('alerts_enabled', False)
+        self.research_daily_review_enabled = self.research_config.get('daily_review_enabled', False)
         
         self.logger.info("Argus Orchestrator initialized")
     
@@ -117,19 +130,24 @@ class ArgusOrchestrator:
         # Initialize connectors
         await self._setup_connectors()
         
+        # Initialize Telegram
+        await self._setup_telegram()
+        
         # Initialize off-hours monitoring (Gap Risk, Conditions, Farm, Review)
         await self._setup_off_hours_monitoring()
+        
+        # Wire up Telegram callbacks after both are initialized
+        self._wire_telegram_callbacks()
         
         # Initialize detectors
         await self._setup_detectors()
         
-        # Initialize Telegram
-        await self._setup_telegram()
-        
         # Send Startup Notification
         if self.telegram:
+            eastern = ZoneInfo("America/New_York")
+            now_et = datetime.now(eastern).strftime('%H:%M:%S %Z')
             startup_msg = f"🚀 <b>Argus Master Engine Online</b>\n"
-            startup_msg += f"<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</i>\n\n"
+            startup_msg += f"<i>Time: {now_et}</i>\n\n"
             startup_msg += f"✅ Detectors: {len(self.detectors)}\n"
             startup_msg += f"✅ GPU Engine: {'Enabled (CUDA)' if getattr(self.paper_trader_farm, 'trader_tensors', None) is not None else 'Disabled (CPU Fallback)'}\n"
             startup_msg += f"✅ Farm: 400,000 configurations loaded\n\n"
@@ -231,6 +249,8 @@ class ArgusOrchestrator:
             # Wire up farm if available
             if self.paper_trader_farm:
                 self.detectors['ibit'].set_paper_trader_farm(self.paper_trader_farm)
+            if self.research_enabled:
+                self.detectors['ibit'].paper_trading_enabled = False
         
         # BITO options detector (same strategy, more opportunities)
         bito_config = thresholds.get('bito', {
@@ -246,6 +266,8 @@ class ArgusOrchestrator:
             # Wire up farm if available
             if self.paper_trader_farm:
                 self.detectors['bito'].set_paper_trader_farm(self.paper_trader_farm)
+            if self.research_enabled:
+                self.detectors['bito'].paper_trading_enabled = False
         
         self.logger.info(f"Initialized {len(self.detectors)} detectors")
     
@@ -263,7 +285,6 @@ class ArgusOrchestrator:
             # Test connection
             if await self.telegram.test_connection():
                 self.logger.info("Telegram bot connected successfully")
-                await self.telegram.send_system_status('online', 'Argus started - monitoring 7 opportunity types')
             else:
                 self.logger.error("Telegram connection failed")
                 self.telegram = None
@@ -338,17 +359,26 @@ class ArgusOrchestrator:
         )
         self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.trader_configs):,} traders")
         
-        # Wire up Telegram two-way callbacks
-        if self.telegram:
-            self.telegram.set_callbacks(
-                get_conditions=self.conditions_monitor.get_current_conditions,
-                get_pnl=self._get_pnl_summary,
-                get_positions=self._get_positions_summary,
-            )
+    def _wire_telegram_callbacks(self) -> None:
+        """Wire up Telegram two-way callbacks once dependencies are ready."""
+        if not self.telegram:
+            return
+        if not self.conditions_monitor:
+            return
+        self.telegram.set_callbacks(
+            get_conditions=self._get_status_summary,
+            get_pnl=self._get_pnl_summary,
+            get_positions=self._get_positions_summary,
+            get_farm_status=self._get_farm_status,
+            get_signal_status=self._get_signal_status,
+            get_research_status=self._get_research_status,
+        )
     
     async def _on_conditions_alert(self, snapshot) -> None:
         """Handle conditions threshold crossing alert."""
         if not self.telegram:
+            return
+        if self.research_enabled and not self.research_alerts_enabled:
             return
         
         details = {
@@ -367,7 +397,7 @@ class ArgusOrchestrator:
     
     async def _send_daily_review(self, message: str) -> None:
         """Send daily review via Telegram."""
-        if self.telegram:
+        if self.telegram and (not self.research_enabled or self.research_daily_review_enabled):
             await self.telegram.send_message(message)
     
     async def _get_btc_iv(self) -> Optional[Dict]:
@@ -413,10 +443,171 @@ class ArgusOrchestrator:
         if self.paper_trader_farm:
             return await self.paper_trader_farm.get_positions_for_telegram()
         return []
+
+    async def _get_status_summary(self) -> Dict[str, Any]:
+        """Get conditions plus data freshness for Telegram /status command."""
+        conditions = {}
+        if self.conditions_monitor:
+            conditions = await self.conditions_monitor.get_current_conditions()
+        data_status = await self._get_data_status()
+        conditions['data_status'] = data_status
+        return conditions
+
+    async def _get_farm_status(self) -> Dict[str, Any]:
+        """Get paper trader farm status summary for Telegram."""
+        if not self.paper_trader_farm:
+            return {}
+        return self.paper_trader_farm.get_status_summary()
+
+    async def _get_signal_status(self) -> Dict[str, Any]:
+        """Get IBIT/BITO signal checklist for Telegram."""
+        status: Dict[str, Any] = {}
+        ibit_detector = self.detectors.get('ibit')
+        if ibit_detector:
+            status['IBIT'] = ibit_detector.get_signal_checklist()
+        bito_detector = self.detectors.get('bito')
+        if bito_detector:
+            status['BITO'] = bito_detector.get_signal_checklist()
+        return status
+
+    async def _get_research_status(self) -> Dict[str, Any]:
+        """Get research mode telemetry for Telegram."""
+        if not self.paper_trader_farm:
+            return {}
+        aggregate = self.paper_trader_farm.get_aggregate_pnl()
+        status = self.paper_trader_farm.get_status_summary()
+        return {
+            'research_enabled': self.research_enabled,
+            'evaluation_interval_seconds': self.research_config.get('evaluation_interval_seconds', 60),
+            'last_run': self._research_last_run.isoformat() if self._research_last_run else None,
+            'last_symbol': self._research_last_symbol,
+            'last_entered': self._research_last_entered,
+            'aggregate': aggregate,
+            'status': status,
+        }
+
+    async def _get_data_status(self) -> Dict[str, Dict[str, Optional[str]]]:
+        """Collect data freshness signals for key tables."""
+        tables = {
+            "Detections": ("detections", 24 * 60 * 60),
+            "Funding": ("funding_rates", 2 * 60 * 60),
+            "Options IV": ("options_iv", 2 * 60 * 60),
+            "Liquidations": ("liquidations", 2 * 60 * 60),
+            "Coinglass": ("coinglass_health", 10 * 60),
+            "Prices": ("price_snapshots", 10 * 60),
+            "Health": ("system_health", 10 * 60),
+        }
+        latest = await self.db.get_latest_timestamps(
+            [t[0] for t in tables.values() if t[0] != "coinglass_health"]
+        )
+        now = datetime.now(timezone.utc)
+        eastern = ZoneInfo("America/New_York")
+        age_since_start = int((now - self._start_time).total_seconds())
+        status: Dict[str, Dict[str, Optional[str]]] = {}
+        for label, (table, threshold) in tables.items():
+            if label == "Liquidations" and not self.coinglass_client:
+                status[label] = {
+                    "status": "disabled",
+                    "last_seen_et": "N/A",
+                    "age_human": None,
+                }
+                continue
+            if label == "Coinglass":
+                if not self.coinglass_client:
+                    status[label] = {
+                        "status": "disabled",
+                        "last_seen_et": "N/A",
+                        "age_human": None,
+                    }
+                    continue
+                status[label] = self._format_freshness(
+                    self._last_coinglass_check,
+                    threshold,
+                    eastern,
+                    age_since_start,
+                )
+                continue
+            ts = latest.get(table)
+            if not ts:
+                if age_since_start < threshold:
+                    status[label] = {
+                        "status": "pending",
+                        "last_seen_et": "N/A",
+                        "age_human": None,
+                    }
+                    continue
+                status[label] = {
+                    "status": "missing",
+                    "last_seen_et": "N/A",
+                    "age_human": None,
+                }
+                continue
+            try:
+                parsed = datetime.fromisoformat(ts)
+            except ValueError:
+                status[label] = {
+                    "status": "missing",
+                    "last_seen_et": "N/A",
+                    "age_human": None,
+                }
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age_seconds = max(0, int((now - parsed).total_seconds()))
+            status[label] = {
+                "status": "ok" if age_seconds <= threshold else "stale",
+                "last_seen_et": parsed.astimezone(eastern).strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "age_human": self._format_age(age_seconds),
+            }
+        return status
+
+    def _format_freshness(
+        self,
+        last_seen: Optional[datetime],
+        threshold: int,
+        eastern: ZoneInfo,
+        age_since_start: int,
+    ) -> Dict[str, Optional[str]]:
+        """Format freshness for in-memory timestamps."""
+        if not last_seen:
+            if age_since_start < threshold:
+                return {
+                    "status": "pending",
+                    "last_seen_et": "N/A",
+                    "age_human": None,
+                }
+            return {
+                "status": "missing",
+                "last_seen_et": "N/A",
+                "age_human": None,
+            }
+        age_seconds = int((datetime.now(timezone.utc) - last_seen).total_seconds())
+        return {
+            "status": "ok" if age_seconds <= threshold else "stale",
+            "last_seen_et": last_seen.astimezone(eastern).strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "age_human": self._format_age(age_seconds),
+        }
+
+    @staticmethod
+    def _format_age(age_seconds: int) -> str:
+        """Format age in human-friendly units."""
+        if age_seconds < 60:
+            return f"{age_seconds}s ago"
+        if age_seconds < 3600:
+            return f"{age_seconds // 60}m ago"
+        if age_seconds < 86400:
+            return f"{age_seconds // 3600}h ago"
+        return f"{age_seconds // 86400}d ago"
     
     async def _on_bybit_ticker(self, data: Dict) -> None:
         """Handle Bybit ticker update."""
         data['exchange'] = 'bybit'
+        await self._maybe_log_price_snapshot(
+            exchange='bybit',
+            symbol=data.get('symbol'),
+            price=data.get('last_price'),
+            volume=data.get('volume_24h'),
+        )
         
         # Run through all applicable detectors
         if 'funding' in self.detectors:
@@ -435,6 +626,12 @@ class ArgusOrchestrator:
     
     async def _on_coinbase_ticker(self, data: Dict) -> None:
         """Handle Coinbase ticker update (replaces Binance)."""
+        await self._maybe_log_price_snapshot(
+            exchange='coinbase',
+            symbol=data.get('symbol'),
+            price=data.get('last_price'),
+            volume=data.get('volume_24h'),
+        )
         if 'cross_exchange' in self.detectors:
             self.detectors['cross_exchange'].update_price('coinbase', data['symbol'], data['last_price'])
         
@@ -452,6 +649,31 @@ class ArgusOrchestrator:
             detection = await self.detectors['ibit'].analyze(data)
             if detection:
                 await self._send_alert(detection)
+
+    async def _maybe_log_price_snapshot(
+        self,
+        exchange: str,
+        symbol: Optional[str],
+        price: Optional[float],
+        volume: Optional[float],
+        min_interval_seconds: int = 60,
+    ) -> None:
+        """Record price snapshots at a controlled cadence."""
+        if not symbol or price is None:
+            return
+        now = datetime.now(timezone.utc)
+        key = f"{exchange}:{symbol}"
+        last_logged = self._last_price_snapshot.get(key)
+        if last_logged and (now - last_logged).total_seconds() < min_interval_seconds:
+            return
+        await self.db.insert_price_snapshot(
+            exchange=exchange,
+            asset=symbol,
+            price_type='spot',
+            price=float(price),
+            volume=volume,
+        )
+        self._last_price_snapshot[key] = now
     
     async def _on_funding_update(self, data: Dict) -> None:
         """Handle funding rate update from Bybit."""
@@ -460,6 +682,8 @@ class ArgusOrchestrator:
     async def _send_alert(self, detection: Dict) -> None:
         """Send alert for a detection."""
         if not self.telegram:
+            return
+        if self.research_enabled and not self.research_alerts_enabled:
             return
         
         op_type = detection.get('opportunity_type')
@@ -483,7 +707,7 @@ class ArgusOrchestrator:
     
     async def _send_paper_notification(self, message: str) -> None:
         """Send paper trade notification via Telegram."""
-        if self.telegram:
+        if self.telegram and (not self.research_enabled or self.research_alerts_enabled):
             try:
                 await self.telegram.send_message(message, parse_mode="Markdown")
             except Exception as e:
@@ -556,20 +780,113 @@ class ArgusOrchestrator:
                         detection = await self.detectors['liquidation'].analyze(cascade)
                         if detection:
                             await self._send_alert(detection)
+                self._last_coinglass_check = datetime.now(timezone.utc)
+                await self.db.insert_health_check(
+                    component="coinglass",
+                    status="ok",
+                )
             except Exception as e:
                 # Don't spam logs for known API limit issues
                 if 'Upgrade plan' not in str(e):
                     self.logger.error(f"Coinglass polling error: {e}")
+                self._last_coinglass_check = datetime.now(timezone.utc)
+                await self.db.insert_health_check(
+                    component="coinglass",
+                    status="error",
+                    error_message=str(e),
+                )
             
             await asyncio.sleep(interval)
+
+    async def _run_research_farm(self) -> None:
+        """Continuously evaluate farm signals for research."""
+        if not self.paper_trader_farm:
+            return
+        interval = int(self.research_config.get('evaluation_interval_seconds', 60))
+        interval = max(10, interval)
+        while self._running and self.research_enabled:
+            try:
+                conditions = {}
+                if self.conditions_monitor:
+                    conditions = await self.conditions_monitor.get_current_conditions()
+                conditions_score = int(conditions.get('score', 5))
+                conditions_label = conditions.get('warmth_label', 'neutral')
+                btc_change = float(conditions.get('btc_change', 0))
+                timestamp = datetime.now(timezone.utc).isoformat()
+
+                total_entered = 0
+                for key in ('ibit', 'bito'):
+                    detector = self.detectors.get(key)
+                    if not detector:
+                        continue
+                    signal = detector.get_research_signal(
+                        conditions_score=conditions_score,
+                        conditions_label=conditions_label,
+                        btc_change_24h_pct=btc_change,
+                        timestamp=timestamp,
+                    )
+                    if not signal:
+                        continue
+                    trades = await self.paper_trader_farm.evaluate_signal(
+                        symbol=signal['symbol'],
+                        signal_data=signal,
+                    )
+                    total_entered += len(trades)
+                    self._research_last_symbol = signal['symbol']
+
+                self._research_last_run = datetime.now(timezone.utc)
+                self._research_last_entered = total_entered
+                await self._maybe_promote_configs()
+            except Exception as e:
+                self.logger.error(f"Research farm loop error: {e}")
+            await asyncio.sleep(interval)
+
+    async def _maybe_promote_configs(self) -> None:
+        """Promote top-performing configs after research window."""
+        if self._research_promoted:
+            return
+        if not self.research_config.get('auto_promote_enabled', False):
+            return
+        promote_after_days = int(self.research_config.get('promote_after_days', 60))
+        days_since_start = (datetime.now(timezone.utc) - self._start_time).days
+        if days_since_start < promote_after_days:
+            return
+
+        window_days = int(self.research_config.get('promotion_window_days', promote_after_days))
+        min_trades = int(self.research_config.get('promotion_min_trades', 30))
+        min_total_pnl = float(self.research_config.get('promotion_min_total_pnl', 250.0))
+        min_avg_pnl = float(self.research_config.get('promotion_min_avg_pnl', 5.0))
+        min_win_rate = float(self.research_config.get('promotion_min_win_rate', 55.0))
+        top_n = int(self.research_config.get('promotion_top_n', 5))
+
+        performance = await self.db.get_trader_performance(days=window_days)
+        eligible = [
+            p for p in performance
+            if p.get('total_trades', 0) >= min_trades
+            and p.get('total_pnl', 0) >= min_total_pnl
+            and p.get('avg_pnl', 0) >= min_avg_pnl
+            and p.get('win_rate', 0) >= min_win_rate
+        ]
+        if not eligible:
+            return
+        eligible.sort(key=lambda x: x.get('total_pnl', 0), reverse=True)
+        promoted_ids = [p['trader_id'] for p in eligible[:top_n]]
+        if self.paper_trader_farm:
+            self.paper_trader_farm.set_promoted_traders(promoted_ids)
+        self._research_promoted = True
+
+        if self.research_config.get('live_mode_after_promotion', False):
+            self.research_enabled = False
+            for key in ('ibit', 'bito'):
+                detector = self.detectors.get(key)
+                if detector:
+                    detector.paper_trading_enabled = True
     
     async def _health_check(self) -> None:
         """Periodic health check and status logging."""
         interval = 300  # 5 minutes
         
         while self._running:
-            await asyncio.sleep(interval)
-            
             # Log health status
             status = {
                 'bybit_connected': self.bybit_ws.is_connected if self.bybit_ws else False,
@@ -579,7 +896,21 @@ class ArgusOrchestrator:
             }
             
             self.logger.info(f"Health check: {status}")
-            await self.db.insert_system_health(status)
+            self._last_health_check = datetime.now(timezone.utc)
+            await self.db.insert_health_check(
+                component="bybit_ws",
+                status="connected" if status['bybit_connected'] else "disconnected",
+            )
+            await self.db.insert_health_check(
+                component="coinbase_client",
+                status="connected" if status['coinbase_connected'] else "disconnected",
+            )
+            await self.db.insert_health_check(
+                component="detectors",
+                status=f"active_{status['detectors_active']}",
+            )
+            
+            await asyncio.sleep(interval)
     
     async def run(self) -> None:
         """Start all components and run main loop."""
@@ -600,6 +931,8 @@ class ArgusOrchestrator:
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._poll_coinglass()))
         self._tasks.append(asyncio.create_task(self._health_check()))
+        if self.research_enabled:
+            self._tasks.append(asyncio.create_task(self._run_research_farm()))
         
         # Start conditions monitoring (synthesis layer)
         if self.conditions_monitor:

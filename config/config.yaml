@@ -117,3 +117,21 @@ monitoring:
   health_check_interval: 60  # seconds
   restart_on_failure: true
   max_restarts_per_hour: 10
+
+# -----------------------------------------------------------------------------
+# Research Mode (Strategy Discovery)
+# -----------------------------------------------------------------------------
+research:
+  enabled: true
+  evaluation_interval_seconds: 60  # Run farm evaluations frequently
+  alerts_enabled: false  # Disable live trade alerts during research
+  daily_review_enabled: false  # Disable daily review notifications in research
+  auto_promote_enabled: true
+  promote_after_days: 60
+  promotion_window_days: 60
+  promotion_min_trades: 30
+  promotion_min_total_pnl: 250.0
+  promotion_min_avg_pnl: 5.0
+  promotion_min_win_rate: 55.0
+  promotion_top_n: 5
+  live_mode_after_promotion: true
