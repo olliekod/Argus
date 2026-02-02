@@ -19,7 +19,7 @@ Output:
 
 import asyncio
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import logging
@@ -350,6 +350,7 @@ class ConditionsMonitor:
         s = self._last_snapshot
         eastern = ZoneInfo("America/New_York")
         market_time = datetime.now(eastern).strftime("%H:%M:%S %Z")
+        updated_et = s.timestamp.replace(tzinfo=timezone.utc).astimezone(eastern)
         return {
             'score': s.score,
             'warmth_label': s.label,
@@ -361,6 +362,7 @@ class ConditionsMonitor:
             'btc_change': s.btc_change_24h,
             'market_time_et': market_time,
             'last_updated': s.timestamp.isoformat(),
+            'last_updated_et': updated_et.strftime("%Y-%m-%d %H:%M:%S %Z"),
         }
     
     async def start_monitoring(self) -> None:

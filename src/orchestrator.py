@@ -8,6 +8,7 @@ Coordinates all connectors, detectors, and alerts.
 import asyncio
 import signal
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
@@ -131,8 +132,10 @@ class ArgusOrchestrator:
         
         # Send Startup Notification
         if self.telegram:
+            eastern = ZoneInfo("America/New_York")
+            now_et = datetime.now(eastern).strftime('%H:%M:%S %Z')
             startup_msg = f"🚀 <b>Argus Master Engine Online</b>\n"
-            startup_msg += f"<i>Time: {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC</i>\n\n"
+            startup_msg += f"<i>Time: {now_et}</i>\n\n"
             startup_msg += f"✅ Detectors: {len(self.detectors)}\n"
             startup_msg += f"✅ GPU Engine: {'Enabled (CUDA)' if getattr(self.paper_trader_farm, 'trader_tensors', None) is not None else 'Disabled (CPU Fallback)'}\n"
             startup_msg += f"✅ Farm: 400,000 configurations loaded\n\n"
@@ -347,7 +350,7 @@ class ArgusOrchestrator:
         if not self.conditions_monitor:
             return
         self.telegram.set_callbacks(
-            get_conditions=self.conditions_monitor.get_current_conditions,
+            get_conditions=self._get_status_summary,
             get_pnl=self._get_pnl_summary,
             get_positions=self._get_positions_summary,
         )
@@ -419,6 +422,68 @@ class ArgusOrchestrator:
         if self.paper_trader_farm:
             return await self.paper_trader_farm.get_positions_for_telegram()
         return []
+
+    async def _get_status_summary(self) -> Dict[str, Any]:
+        """Get conditions plus data freshness for Telegram /status command."""
+        conditions = {}
+        if self.conditions_monitor:
+            conditions = await self.conditions_monitor.get_current_conditions()
+        data_status = await self._get_data_status()
+        conditions['data_status'] = data_status
+        return conditions
+
+    async def _get_data_status(self) -> Dict[str, Dict[str, Optional[str]]]:
+        """Collect data freshness signals for key tables."""
+        tables = {
+            "Detections": ("detections", 24 * 60 * 60),
+            "Funding": ("funding_rates", 2 * 60 * 60),
+            "Options IV": ("options_iv", 2 * 60 * 60),
+            "Liquidations": ("liquidations", 2 * 60 * 60),
+            "Prices": ("price_snapshots", 10 * 60),
+            "Health": ("system_health", 10 * 60),
+        }
+        latest = await self.db.get_latest_timestamps([t[0] for t in tables.values()])
+        now = datetime.now(timezone.utc)
+        eastern = ZoneInfo("America/New_York")
+        status: Dict[str, Dict[str, Optional[str]]] = {}
+        for label, (table, threshold) in tables.items():
+            ts = latest.get(table)
+            if not ts:
+                status[label] = {
+                    "status": "missing",
+                    "last_seen_et": "N/A",
+                    "age_human": None,
+                }
+                continue
+            try:
+                parsed = datetime.fromisoformat(ts)
+            except ValueError:
+                status[label] = {
+                    "status": "missing",
+                    "last_seen_et": "N/A",
+                    "age_human": None,
+                }
+                continue
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            age_seconds = max(0, int((now - parsed).total_seconds()))
+            status[label] = {
+                "status": "ok" if age_seconds <= threshold else "stale",
+                "last_seen_et": parsed.astimezone(eastern).strftime("%Y-%m-%d %H:%M:%S %Z"),
+                "age_human": self._format_age(age_seconds),
+            }
+        return status
+
+    @staticmethod
+    def _format_age(age_seconds: int) -> str:
+        """Format age in human-friendly units."""
+        if age_seconds < 60:
+            return f"{age_seconds}s ago"
+        if age_seconds < 3600:
+            return f"{age_seconds // 60}m ago"
+        if age_seconds < 86400:
+            return f"{age_seconds // 3600}h ago"
+        return f"{age_seconds // 86400}d ago"
     
     async def _on_bybit_ticker(self, data: Dict) -> None:
         """Handle Bybit ticker update."""
