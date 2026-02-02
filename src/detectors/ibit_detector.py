@@ -14,6 +14,7 @@ from .base_detector import BaseDetector
 from ..core.utils import calculate_z_score, calculate_mean
 from ..core.economic_calendar import EconomicCalendar
 from ..analysis.trade_calculator import TradeCalculator, TradeRecommendation
+from ..analysis.greeks_engine import GreeksEngine
 from ..analysis.paper_trader import PaperTrader
 from ..connectors.ibit_options_client import IBITOptionsClient
 

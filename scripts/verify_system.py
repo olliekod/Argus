@@ -97,14 +97,6 @@ async def verify_system():
         results["failed"] += 1
     
     try:
-        from src.connectors.coinbase_client import CoinbaseClient
-        ok("Coinbase Client")
-        results["passed"] += 1
-    except Exception as e:
-        fail("Coinbase Client", str(e))
-        results["failed"] += 1
-    
-    try:
         from src.connectors.deribit_client import DeribitClient
         ok("Deribit Client")
         results["passed"] += 1
@@ -140,14 +132,6 @@ async def verify_system():
         results["passed"] += 1
     except Exception as e:
         fail("ETF Options Detector", str(e))
-        results["failed"] += 1
-    
-    try:
-        from src.detectors.funding_detector import FundingDetector
-        ok("Funding Detector")
-        results["passed"] += 1
-    except Exception as e:
-        fail("Funding Detector", str(e))
         results["failed"] += 1
     
     print()

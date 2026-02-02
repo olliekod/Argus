@@ -2,19 +2,14 @@
 
 > *Named after Argus Panoptes, the all-seeing giant of Greek mythology who had 100 eyes and never slept*
 
-**Argus** is a 24/7 crypto market monitoring system that detects trading opportunities across 6 different strategy types. It runs in observation mode to gather real market data, then the best opportunity is selected for automation.
+**Argus** is a 24/7 crypto market monitoring system that powers manual trading recommendations. It runs in observation mode to gather real market data, then paper trades a wide range of parameter combinations to identify the best-performing strategy to follow manually.
 
-## 🎯 Strategy Types
+## 🎯 Strategy Types (Manual Recommendations)
 
-### Bot-Tradeable (Automated Candidates)
-1. **Funding Rate Mean Reversion** - Perpetual funding rates spike, then revert to mean
-2. **Spot-Perp Basis Arbitrage** - Price gaps between spot and perpetual contracts
-3. **Cross-Exchange Latency Arb** - Same asset at different prices on different exchanges
-4. **Post-Liquidation Snapback** - Price spikes during liquidation cascades, then bounces
-
-### Human-Tradeable (Manual)
-5. **BTC Options IV Spike** - Implied volatility spikes >80% during panic (sell premium)
-6. **Volatility Regime Shifts** - Sudden volatility expansion/compression events
+1. **BTC Options IV Spike** - Implied volatility spikes during panic (sell premium)
+2. **Volatility Regime Shifts** - Sudden volatility expansion/compression events
+3. **IBIT Options Put Spreads** - BTC IV + ETF drawdown triggers for Robinhood trades
+4. **BITO Options Put Spreads** - Same framework, more opportunity coverage
 
 ## 📊 Architecture
 
@@ -23,18 +18,18 @@ Market Data Sources (WebSocket/REST)
     ↓
 Data Normalization Layer
     ↓
-6 Opportunity Detectors (Independent Modules)
+Manual Opportunity Detectors (Independent Modules)
     ↓
 SQLite Database (Logging Everything)
     ↓
-Alert System (Telegram) + Analysis Engine
+Alert System (Telegram) + Paper Trader Analysis Engine
 ```
 
 ## 🛠️ Setup
 
 ### Prerequisites
 - Python 3.10+
-- API keys for: Bybit, Binance, OKX, Deribit, Coinglass
+- API keys for: Bybit, Deribit (optional for IV data)
 - Telegram bot token
 
 ### Installation
@@ -61,7 +56,7 @@ copy config\secrets.example.yaml config\secrets.yaml
 python scripts\init_database.py
 
 # Run Argus
-python run.py
+python main.py
 ```
 
 ## 📁 Project Structure
@@ -75,7 +70,7 @@ argus/
 ├── src/
 │   ├── core/                # Database, logging, utilities
 │   ├── connectors/          # Exchange WebSocket/REST clients
-│   ├── detectors/           # 6 opportunity detectors
+│   ├── detectors/           # Manual opportunity detectors
 │   ├── alerts/              # Telegram notifications
 │   └── analysis/            # Performance tracking
 ├── data/
@@ -91,13 +86,13 @@ argus/
 | Week | Phase |
 |------|-------|
 | 1-2 | Build and run detector (observation only) |
-| 3 | Analyze data and select best strategy |
-| 4-5 | Build trading bot for winning strategy |
-| 6+ | Deploy and monitor |
+| 3 | Analyze data and select best paper trader |
+| 4-5 | Follow the top paper trader manually (no automation) |
+| 6+ | Continue monitoring and performance reviews |
 
 ## ⚠️ Important Rules
 
-1. **90-Day Rule**: After bot deployment, NO parameter changes for 90 days
+1. **90-Day Rule**: After adopting a strategy, NO parameter changes for 90 days
 2. **Circuit Breakers**: Auto-pause on 5% daily loss or 5 consecutive losses
 3. **Observation First**: Always observe before trading
 
@@ -105,8 +100,8 @@ argus/
 
 | Tier | Type | Example |
 |------|------|---------|
-| 🚨 1 | Immediate | Options IV >80%, Liquidations >$5M |
-| 📊 2 | FYI | Funding extremes, Basis arb |
+| 🚨 1 | Immediate | IBIT/BITO put spread signal |
+| 📊 2 | FYI | IV spike confirmations |
 | 📝 3 | Background | Minor events (logged only) |
 
 ## 📜 License
