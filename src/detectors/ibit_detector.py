@@ -59,6 +59,8 @@ class IBITDetector(BaseDetector):
         self._price_history: List[Dict] = []
         self._current_btc_iv: float = 0
         self._current_data: Optional[Dict] = None
+        self._current_ibit_data: Optional[Dict] = None
+        self._ibit_price_history: List[Dict] = []
         
         # Initialize components
         self.account_size = config.get('account_size', 3000)
