@@ -59,6 +59,8 @@ class IBITDetector(BaseDetector):
         self._price_history: List[Dict] = []
         self._current_btc_iv: float = 0
         self._current_data: Optional[Dict] = None
+        self._current_ibit_data: Optional[Dict] = None
+        self._ibit_price_history: List[Dict] = []
         
         # Initialize components
         self.account_size = config.get('account_size', 3000)
@@ -104,6 +106,101 @@ class IBITDetector(BaseDetector):
         })
         if len(self._ibit_price_history) > 720:
             self._ibit_price_history = self._ibit_price_history[-720:]
+
+    def get_signal_checklist(self) -> Dict[str, Any]:
+        """Return a checklist of conditions for an IBIT/BITO signal."""
+        btc_iv = self._current_btc_iv or 0
+        ibit_change = 0.0
+        ibit_price = 0.0
+        if self._current_ibit_data:
+            ibit_change = self._current_ibit_data.get('price_change_pct', 0)
+            ibit_price = self._current_ibit_data.get('price', 0)
+
+        iv_elevated = btc_iv >= self.btc_iv_threshold
+        ibit_dropped = ibit_change <= self.drop_threshold
+        iv_score = btc_iv / self.btc_iv_threshold if self.btc_iv_threshold > 0 else 0
+        drop_score = abs(ibit_change) / abs(self.drop_threshold) if ibit_change < 0 else 0
+        combined_score = (iv_score + drop_score) / 2 if (self.btc_iv_threshold and self.drop_threshold) else 0
+
+        cooldown_remaining = None
+        if self._last_alert_time:
+            elapsed = (datetime.now(timezone.utc) - self._last_alert_time).total_seconds() / 3600
+            cooldown_remaining = max(0.0, self.cooldown_hours - elapsed)
+
+        iv_rank = None
+        try:
+            status = self.options_client.get_market_status()
+            iv_rank = status.get('iv_rank')
+        except Exception:
+            iv_rank = None
+
+        return {
+            'symbol': self.symbol,
+            'btc_iv': btc_iv,
+            'btc_iv_threshold': self.btc_iv_threshold,
+            'btc_iv_ok': iv_elevated,
+            'ibit_price': ibit_price,
+            'ibit_change_pct': ibit_change,
+            'ibit_drop_threshold': self.drop_threshold,
+            'ibit_drop_ok': ibit_dropped,
+            'combined_score': combined_score,
+            'combined_score_threshold': self.combined_score_threshold,
+            'combined_score_ok': combined_score >= self.combined_score_threshold,
+            'iv_rank': iv_rank,
+            'iv_rank_threshold': self.iv_rank_threshold,
+            'iv_rank_ok': iv_rank is not None and iv_rank >= self.iv_rank_threshold,
+            'cooldown_remaining_hours': cooldown_remaining,
+            'has_btc_iv': bool(self._current_btc_iv),
+            'has_ibit_data': bool(self._current_ibit_data),
+        }
+
+    def get_research_signal(
+        self,
+        conditions_score: int,
+        conditions_label: str,
+        btc_change_24h_pct: float,
+        timestamp: str,
+    ) -> Optional[Dict[str, Any]]:
+        """Build a research-mode signal without gating thresholds."""
+        if not self._current_btc_iv or not self._current_ibit_data:
+            return None
+
+        btc_change_decimal = (btc_change_24h_pct or 0) / 100
+        ibit_change_pct = self._current_ibit_data.get('price_change_pct', 0)
+        ibit_change_decimal = ibit_change_pct / 100
+
+        recommendation = self.trade_calculator.generate_recommendation(
+            btc_change_24h=btc_change_decimal,
+            ibit_change_24h=ibit_change_decimal,
+            force=True,
+        )
+        if not recommendation:
+            return None
+
+        direction = 'neutral'
+        if btc_change_24h_pct > 0.2:
+            direction = 'bullish'
+        elif btc_change_24h_pct < -0.2:
+            direction = 'bearish'
+
+        return {
+            'symbol': self.symbol,
+            'iv': self._current_btc_iv,
+            'warmth': conditions_score,
+            'dte': recommendation.dte,
+            'pop': recommendation.probability_of_profit,
+            'pot': recommendation.probability_of_touch_stop,
+            'gap_risk': 0,
+            'direction': direction,
+            'strikes': f"{recommendation.short_strike}/{recommendation.long_strike}",
+            'expiry': recommendation.expiration,
+            'credit': recommendation.net_credit,
+            'iv_rank': recommendation.iv_rank,
+            'conditions_label': conditions_label,
+            'btc_change_pct': btc_change_24h_pct,
+            'ibit_change_pct': ibit_change_pct,
+            'timestamp': timestamp,
+        }
     
     def _check_market_hours(self) -> bool:
         """Check if US stock market is open (9:30 AM - 4:00 PM EST)."""
