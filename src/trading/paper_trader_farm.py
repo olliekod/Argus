@@ -11,7 +11,7 @@ Checks economic calendar for blackout periods before entries.
 import asyncio
 import logging
 from datetime import datetime, date, timedelta, timezone
-from typing import Dict, List, Optional, Any, Callable
+from typing import Dict, List, Optional, Any, Callable, Set
 from pathlib import Path
 import json
 
@@ -59,6 +59,11 @@ class PaperTraderFarm:
         self.active_traders: Dict[str, PaperTrader] = {} 
         
         self._running = False
+        self.last_evaluation_time: Optional[datetime] = None
+        self.last_evaluation_symbol: Optional[str] = None
+        self.last_evaluation_entered: int = 0
+        self._promoted_trader_ids: Optional[Set[str]] = None
+        self._promoted_indices: Optional[Set[int]] = None
         
         # Callbacks for market data (set by orchestrator)
         self._get_conditions: Optional[Callable] = None
@@ -245,6 +250,9 @@ class PaperTraderFarm:
                 return []
         
         entered_trades = []
+        self.last_evaluation_time = datetime.now(timezone.utc)
+        self.last_evaluation_symbol = symbol
+        self.last_evaluation_entered = 0
         
         # Get current time for session filters
         current_time = signal_data.get('timestamp')
@@ -285,6 +293,9 @@ class PaperTraderFarm:
         # Get indices of traders that should enter
         entry_indices = torch.where(mask)[0].cpu().tolist()
         
+        if self._promoted_indices is not None:
+            entry_indices = [i for i in entry_indices if i in self._promoted_indices]
+        
         for idx in entry_indices:
             config = self.trader_configs[idx]
             
@@ -320,6 +331,14 @@ class PaperTraderFarm:
                     'iv': signal_data.get('iv'),
                     'warmth': signal_data.get('warmth'),
                     'direction': signal_data.get('direction'),
+                    'pop': signal_data.get('pop'),
+                    'pot': signal_data.get('pot'),
+                    'iv_rank': signal_data.get('iv_rank'),
+                    'dte': signal_data.get('dte'),
+                    'credit': signal_data.get('credit'),
+                    'conditions_label': signal_data.get('conditions_label'),
+                    'btc_change_pct': signal_data.get('btc_change_pct'),
+                    'ibit_change_pct': signal_data.get('ibit_change_pct'),
                     'timestamp': datetime.now(timezone.utc).isoformat(),
                 },
             )
@@ -344,8 +363,29 @@ class PaperTraderFarm:
                 f"Signal evaluated: {len(entered_trades)}/{len(self.trader_configs)} "
                 f"traders entered {symbol}"
             )
-        
+        self.last_evaluation_entered = len(entered_trades)
         return entered_trades
+
+    def get_status_summary(self) -> Dict[str, Any]:
+        """Return last evaluation status for the farm."""
+        return {
+            "last_evaluation_time": self.last_evaluation_time.isoformat() if self.last_evaluation_time else None,
+            "last_evaluation_symbol": self.last_evaluation_symbol,
+            "last_evaluation_entered": self.last_evaluation_entered,
+            "active_traders": len(self.active_traders),
+            "total_configs": len(self.trader_configs),
+            "promoted_traders": len(self._promoted_trader_ids) if self._promoted_trader_ids else 0,
+        }
+
+    def set_promoted_traders(self, trader_ids: List[str]) -> None:
+        """Restrict evaluations to promoted trader IDs."""
+        promoted = set(trader_ids)
+        indices = {
+            idx for idx, config in enumerate(self.trader_configs)
+            if config.trader_id in promoted
+        }
+        self._promoted_trader_ids = promoted
+        self._promoted_indices = indices
     
     async def _save_trade(self, trade: PaperTrade) -> None:
         """Save a trade to the database."""
