@@ -109,6 +109,14 @@ class ArgusOrchestrator:
         self._last_price_snapshot: Dict[str, datetime] = {}
         self._last_coinglass_check: Optional[datetime] = None
         self._last_health_check: Optional[datetime] = None
+        self._research_last_run: Optional[datetime] = None
+        self._research_last_symbol: Optional[str] = None
+        self._research_last_entered: int = 0
+        self._research_promoted: bool = False
+        self.research_config: Dict[str, Any] = self.config.get('research', {})
+        self.research_enabled = self.research_config.get('enabled', False)
+        self.research_alerts_enabled = self.research_config.get('alerts_enabled', False)
+        self.research_daily_review_enabled = self.research_config.get('daily_review_enabled', False)
         
         self.logger.info("Argus Orchestrator initialized")
     
@@ -241,6 +249,8 @@ class ArgusOrchestrator:
             # Wire up farm if available
             if self.paper_trader_farm:
                 self.detectors['ibit'].set_paper_trader_farm(self.paper_trader_farm)
+            if self.research_enabled:
+                self.detectors['ibit'].paper_trading_enabled = False
         
         # BITO options detector (same strategy, more opportunities)
         bito_config = thresholds.get('bito', {
@@ -256,6 +266,8 @@ class ArgusOrchestrator:
             # Wire up farm if available
             if self.paper_trader_farm:
                 self.detectors['bito'].set_paper_trader_farm(self.paper_trader_farm)
+            if self.research_enabled:
+                self.detectors['bito'].paper_trading_enabled = False
         
         self.logger.info(f"Initialized {len(self.detectors)} detectors")
     
@@ -358,11 +370,15 @@ class ArgusOrchestrator:
             get_pnl=self._get_pnl_summary,
             get_positions=self._get_positions_summary,
             get_farm_status=self._get_farm_status,
+            get_signal_status=self._get_signal_status,
+            get_research_status=self._get_research_status,
         )
     
     async def _on_conditions_alert(self, snapshot) -> None:
         """Handle conditions threshold crossing alert."""
         if not self.telegram:
+            return
+        if self.research_enabled and not self.research_alerts_enabled:
             return
         
         details = {
@@ -381,7 +397,7 @@ class ArgusOrchestrator:
     
     async def _send_daily_review(self, message: str) -> None:
         """Send daily review via Telegram."""
-        if self.telegram:
+        if self.telegram and (not self.research_enabled or self.research_daily_review_enabled):
             await self.telegram.send_message(message)
     
     async def _get_btc_iv(self) -> Optional[Dict]:
@@ -442,6 +458,33 @@ class ArgusOrchestrator:
         if not self.paper_trader_farm:
             return {}
         return self.paper_trader_farm.get_status_summary()
+
+    async def _get_signal_status(self) -> Dict[str, Any]:
+        """Get IBIT/BITO signal checklist for Telegram."""
+        status: Dict[str, Any] = {}
+        ibit_detector = self.detectors.get('ibit')
+        if ibit_detector:
+            status['IBIT'] = ibit_detector.get_signal_checklist()
+        bito_detector = self.detectors.get('bito')
+        if bito_detector:
+            status['BITO'] = bito_detector.get_signal_checklist()
+        return status
+
+    async def _get_research_status(self) -> Dict[str, Any]:
+        """Get research mode telemetry for Telegram."""
+        if not self.paper_trader_farm:
+            return {}
+        aggregate = self.paper_trader_farm.get_aggregate_pnl()
+        status = self.paper_trader_farm.get_status_summary()
+        return {
+            'research_enabled': self.research_enabled,
+            'evaluation_interval_seconds': self.research_config.get('evaluation_interval_seconds', 60),
+            'last_run': self._research_last_run.isoformat() if self._research_last_run else None,
+            'last_symbol': self._research_last_symbol,
+            'last_entered': self._research_last_entered,
+            'aggregate': aggregate,
+            'status': status,
+        }
 
     async def _get_data_status(self) -> Dict[str, Dict[str, Optional[str]]]:
         """Collect data freshness signals for key tables."""
@@ -640,6 +683,8 @@ class ArgusOrchestrator:
         """Send alert for a detection."""
         if not self.telegram:
             return
+        if self.research_enabled and not self.research_alerts_enabled:
+            return
         
         op_type = detection.get('opportunity_type')
         tier = detection.get('alert_tier', 2)
@@ -662,7 +707,7 @@ class ArgusOrchestrator:
     
     async def _send_paper_notification(self, message: str) -> None:
         """Send paper trade notification via Telegram."""
-        if self.telegram:
+        if self.telegram and (not self.research_enabled or self.research_alerts_enabled):
             try:
                 await self.telegram.send_message(message, parse_mode="Markdown")
             except Exception as e:
@@ -752,6 +797,90 @@ class ArgusOrchestrator:
                 )
             
             await asyncio.sleep(interval)
+
+    async def _run_research_farm(self) -> None:
+        """Continuously evaluate farm signals for research."""
+        if not self.paper_trader_farm:
+            return
+        interval = int(self.research_config.get('evaluation_interval_seconds', 60))
+        interval = max(10, interval)
+        while self._running and self.research_enabled:
+            try:
+                conditions = {}
+                if self.conditions_monitor:
+                    conditions = await self.conditions_monitor.get_current_conditions()
+                conditions_score = int(conditions.get('score', 5))
+                conditions_label = conditions.get('warmth_label', 'neutral')
+                btc_change = float(conditions.get('btc_change', 0))
+                timestamp = datetime.now(timezone.utc).isoformat()
+
+                total_entered = 0
+                for key in ('ibit', 'bito'):
+                    detector = self.detectors.get(key)
+                    if not detector:
+                        continue
+                    signal = detector.get_research_signal(
+                        conditions_score=conditions_score,
+                        conditions_label=conditions_label,
+                        btc_change_24h_pct=btc_change,
+                        timestamp=timestamp,
+                    )
+                    if not signal:
+                        continue
+                    trades = await self.paper_trader_farm.evaluate_signal(
+                        symbol=signal['symbol'],
+                        signal_data=signal,
+                    )
+                    total_entered += len(trades)
+                    self._research_last_symbol = signal['symbol']
+
+                self._research_last_run = datetime.now(timezone.utc)
+                self._research_last_entered = total_entered
+                await self._maybe_promote_configs()
+            except Exception as e:
+                self.logger.error(f"Research farm loop error: {e}")
+            await asyncio.sleep(interval)
+
+    async def _maybe_promote_configs(self) -> None:
+        """Promote top-performing configs after research window."""
+        if self._research_promoted:
+            return
+        if not self.research_config.get('auto_promote_enabled', False):
+            return
+        promote_after_days = int(self.research_config.get('promote_after_days', 60))
+        days_since_start = (datetime.now(timezone.utc) - self._start_time).days
+        if days_since_start < promote_after_days:
+            return
+
+        window_days = int(self.research_config.get('promotion_window_days', promote_after_days))
+        min_trades = int(self.research_config.get('promotion_min_trades', 30))
+        min_total_pnl = float(self.research_config.get('promotion_min_total_pnl', 250.0))
+        min_avg_pnl = float(self.research_config.get('promotion_min_avg_pnl', 5.0))
+        min_win_rate = float(self.research_config.get('promotion_min_win_rate', 55.0))
+        top_n = int(self.research_config.get('promotion_top_n', 5))
+
+        performance = await self.db.get_trader_performance(days=window_days)
+        eligible = [
+            p for p in performance
+            if p.get('total_trades', 0) >= min_trades
+            and p.get('total_pnl', 0) >= min_total_pnl
+            and p.get('avg_pnl', 0) >= min_avg_pnl
+            and p.get('win_rate', 0) >= min_win_rate
+        ]
+        if not eligible:
+            return
+        eligible.sort(key=lambda x: x.get('total_pnl', 0), reverse=True)
+        promoted_ids = [p['trader_id'] for p in eligible[:top_n]]
+        if self.paper_trader_farm:
+            self.paper_trader_farm.set_promoted_traders(promoted_ids)
+        self._research_promoted = True
+
+        if self.research_config.get('live_mode_after_promotion', False):
+            self.research_enabled = False
+            for key in ('ibit', 'bito'):
+                detector = self.detectors.get(key)
+                if detector:
+                    detector.paper_trading_enabled = True
     
     async def _health_check(self) -> None:
         """Periodic health check and status logging."""
@@ -802,6 +931,8 @@ class ArgusOrchestrator:
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._poll_coinglass()))
         self._tasks.append(asyncio.create_task(self._health_check()))
+        if self.research_enabled:
+            self._tasks.append(asyncio.create_task(self._run_research_farm()))
         
         # Start conditions monitoring (synthesis layer)
         if self.conditions_monitor:

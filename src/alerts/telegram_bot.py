@@ -62,6 +62,8 @@ class TelegramBot:
 /positions — View open paper trading positions
 /pnl — Today's P&L summary
 /farm_status — Paper trader farm status
+/signal_status — IBIT/BITO signal checklist
+/research_status — Research mode status
 
 <b>Trade Confirmation:</b>
 Reply <code>yes</code> — Confirm you took the trade
@@ -109,6 +111,8 @@ Reply <code>no</code> — Confirm you skipped the trade
         self._get_positions: Optional[Callable] = None
         self._get_pnl: Optional[Callable] = None
         self._get_farm_status: Optional[Callable] = None
+        self._get_signal_status: Optional[Callable] = None
+        self._get_research_status: Optional[Callable] = None
         self._on_trade_confirmation: Optional[Callable] = None
         
         # Track last signal for yes/no confirmation
@@ -127,6 +131,8 @@ Reply <code>no</code> — Confirm you skipped the trade
         get_positions: Optional[Callable] = None,
         get_pnl: Optional[Callable] = None,
         get_farm_status: Optional[Callable] = None,
+        get_signal_status: Optional[Callable] = None,
+        get_research_status: Optional[Callable] = None,
         on_trade_confirmation: Optional[Callable] = None,
     ):
         """Set callback functions for data access."""
@@ -134,6 +140,8 @@ Reply <code>no</code> — Confirm you skipped the trade
         self._get_positions = get_positions
         self._get_pnl = get_pnl
         self._get_farm_status = get_farm_status
+        self._get_signal_status = get_signal_status
+        self._get_research_status = get_research_status
         self._on_trade_confirmation = on_trade_confirmation
     
     async def start_polling(self) -> None:
@@ -147,6 +155,8 @@ Reply <code>no</code> — Confirm you skipped the trade
             self._app.add_handler(CommandHandler("positions", self._cmd_positions))
             self._app.add_handler(CommandHandler("pnl", self._cmd_pnl))
             self._app.add_handler(CommandHandler("farm_status", self._cmd_farm_status))
+            self._app.add_handler(CommandHandler("signal_status", self._cmd_signal_status))
+            self._app.add_handler(CommandHandler("research_status", self._cmd_research_status))
             
             # Add message handler for yes/no responses
             self._app.add_handler(MessageHandler(
@@ -338,6 +348,102 @@ Reply <code>no</code> — Confirm you skipped the trade
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         except Exception as e:
             logger.error(f"Error in /farm_status: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+
+    async def _cmd_signal_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /signal_status command."""
+        try:
+            if not self._get_signal_status:
+                await update.message.reply_text(
+                    "⚠️ Signal status not available. Detectors not connected.",
+                    parse_mode="HTML"
+                )
+                return
+            status = await self._get_signal_status()
+            if not status:
+                await update.message.reply_text(
+                    "⚠️ Signal status not available. Detectors not connected.",
+                    parse_mode="HTML"
+                )
+                return
+            lines = ["<b>🧪 IBIT/BITO Signal Checklist</b>", ""]
+            for symbol, checklist in status.items():
+                lines.append(f"<b>{symbol}</b>")
+                lines.append(f"• BTC IV: {checklist.get('btc_iv', 0):.1f}% "
+                             f"(≥ {checklist.get('btc_iv_threshold', 0)}% → "
+                             f"{'✅' if checklist.get('btc_iv_ok') else '❌'})")
+                lines.append(f"• {symbol} Change: {checklist.get('ibit_change_pct', 0):+.2f}% "
+                             f"(≤ {checklist.get('ibit_drop_threshold', 0)}% → "
+                             f"{'✅' if checklist.get('ibit_drop_ok') else '❌'})")
+                lines.append(f"• Combined Score: {checklist.get('combined_score', 0):.2f} "
+                             f"(≥ {checklist.get('combined_score_threshold', 0)} → "
+                             f"{'✅' if checklist.get('combined_score_ok') else '❌'})")
+                iv_rank = checklist.get('iv_rank')
+                iv_rank_str = f"{iv_rank:.1f}%" if isinstance(iv_rank, (int, float)) else "N/A"
+                lines.append(f"• IV Rank: {iv_rank_str} "
+                             f"(≥ {checklist.get('iv_rank_threshold', 0)} → "
+                             f"{'✅' if checklist.get('iv_rank_ok') else '❌'})")
+                cooldown = checklist.get('cooldown_remaining_hours')
+                if cooldown is None:
+                    lines.append("• Cooldown: ✅ none")
+                else:
+                    lines.append(f"• Cooldown: {cooldown:.2f}h remaining")
+                data_ready = "✅" if checklist.get('has_btc_iv') and checklist.get('has_ibit_data') else "❌"
+                lines.append(f"• Data Ready: {data_ready}")
+                lines.append("")
+            await update.message.reply_text("\n".join(lines).strip(), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error in /signal_status: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+
+    async def _cmd_research_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /research_status command."""
+        try:
+            if not self._get_research_status:
+                await update.message.reply_text(
+                    "⚠️ Research status not available.",
+                    parse_mode="HTML"
+                )
+                return
+            status = await self._get_research_status()
+            if not status:
+                await update.message.reply_text(
+                    "⚠️ Research status not available.",
+                    parse_mode="HTML"
+                )
+                return
+            last_run = status.get("last_run")
+            if last_run:
+                try:
+                    dt = datetime.fromisoformat(last_run)
+                except ValueError:
+                    dt = None
+                if dt:
+                    last_run = dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
+            aggregate = status.get("aggregate", {})
+            farm_status = status.get("status", {})
+            lines = [
+                "<b>🧪 Research Mode Status</b>",
+                "",
+                f"Enabled: {'✅' if status.get('research_enabled') else '❌'}",
+                f"Interval: {status.get('evaluation_interval_seconds', 0)}s",
+                f"Last run: {last_run or 'N/A'}",
+                f"Last symbol: {status.get('last_symbol') or 'N/A'}",
+                f"Entered last run: {status.get('last_entered', 0):,}",
+                "",
+                "<b>📊 Aggregate</b>",
+                f"Total trades: {aggregate.get('total_trades', 0):,}",
+                f"Win rate: {aggregate.get('win_rate', 0):.1f}%",
+                f"Realized P&L: ${aggregate.get('realized_pnl', 0):+.2f}",
+                f"Open positions: {aggregate.get('open_positions', 0)}",
+                "",
+                "<b>👥 Farm</b>",
+                f"Active traders: {farm_status.get('active_traders', 0):,}",
+                f"Promoted traders: {farm_status.get('promoted_traders', 0):,}",
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error in /research_status: {e}")
             await update.message.reply_text(f"❌ Error: {e}")
     
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

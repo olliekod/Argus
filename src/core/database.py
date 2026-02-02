@@ -612,6 +612,23 @@ class Database:
             row = await cursor.fetchone()
             results[table] = row["latest"] if row and row["latest"] else None
         return results
+
+    async def get_trader_performance(self, days: int = 60) -> List[Dict[str, Any]]:
+        """Get aggregated trader performance over a window."""
+        cursor = await self._connection.execute("""
+            SELECT 
+                trader_id,
+                strategy_type,
+                COUNT(*) as total_trades,
+                SUM(realized_pnl) as total_pnl,
+                AVG(realized_pnl) as avg_pnl,
+                SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) * 100.0 / COUNT(*) as win_rate
+            FROM paper_trades
+            WHERE timestamp >= datetime('now', ?)
+            GROUP BY trader_id, strategy_type
+        """, (f"-{days} days",))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
     
     # =========================================================================
     # Statistics Operations
