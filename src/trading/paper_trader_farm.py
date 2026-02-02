@@ -59,6 +59,9 @@ class PaperTraderFarm:
         self.active_traders: Dict[str, PaperTrader] = {} 
         
         self._running = False
+        self.last_evaluation_time: Optional[datetime] = None
+        self.last_evaluation_symbol: Optional[str] = None
+        self.last_evaluation_entered: int = 0
         
         # Callbacks for market data (set by orchestrator)
         self._get_conditions: Optional[Callable] = None
@@ -245,6 +248,9 @@ class PaperTraderFarm:
                 return []
         
         entered_trades = []
+        self.last_evaluation_time = datetime.now(timezone.utc)
+        self.last_evaluation_symbol = symbol
+        self.last_evaluation_entered = 0
         
         # Get current time for session filters
         current_time = signal_data.get('timestamp')
@@ -344,8 +350,18 @@ class PaperTraderFarm:
                 f"Signal evaluated: {len(entered_trades)}/{len(self.trader_configs)} "
                 f"traders entered {symbol}"
             )
-        
+        self.last_evaluation_entered = len(entered_trades)
         return entered_trades
+
+    def get_status_summary(self) -> Dict[str, Any]:
+        """Return last evaluation status for the farm."""
+        return {
+            "last_evaluation_time": self.last_evaluation_time.isoformat() if self.last_evaluation_time else None,
+            "last_evaluation_symbol": self.last_evaluation_symbol,
+            "last_evaluation_entered": self.last_evaluation_entered,
+            "active_traders": len(self.active_traders),
+            "total_configs": len(self.trader_configs),
+        }
     
     async def _save_trade(self, trade: PaperTrade) -> None:
         """Save a trade to the database."""

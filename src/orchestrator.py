@@ -107,6 +107,8 @@ class ArgusOrchestrator:
         self._tasks: List[asyncio.Task] = []
         self._start_time = datetime.now(timezone.utc)
         self._last_price_snapshot: Dict[str, datetime] = {}
+        self._last_coinglass_check: Optional[datetime] = None
+        self._last_health_check: Optional[datetime] = None
         
         self.logger.info("Argus Orchestrator initialized")
     
@@ -355,6 +357,7 @@ class ArgusOrchestrator:
             get_conditions=self._get_status_summary,
             get_pnl=self._get_pnl_summary,
             get_positions=self._get_positions_summary,
+            get_farm_status=self._get_farm_status,
         )
     
     async def _on_conditions_alert(self, snapshot) -> None:
@@ -434,6 +437,12 @@ class ArgusOrchestrator:
         conditions['data_status'] = data_status
         return conditions
 
+    async def _get_farm_status(self) -> Dict[str, Any]:
+        """Get paper trader farm status summary for Telegram."""
+        if not self.paper_trader_farm:
+            return {}
+        return self.paper_trader_farm.get_status_summary()
+
     async def _get_data_status(self) -> Dict[str, Dict[str, Optional[str]]]:
         """Collect data freshness signals for key tables."""
         tables = {
@@ -441,10 +450,13 @@ class ArgusOrchestrator:
             "Funding": ("funding_rates", 2 * 60 * 60),
             "Options IV": ("options_iv", 2 * 60 * 60),
             "Liquidations": ("liquidations", 2 * 60 * 60),
+            "Coinglass": ("coinglass_health", 10 * 60),
             "Prices": ("price_snapshots", 10 * 60),
             "Health": ("system_health", 10 * 60),
         }
-        latest = await self.db.get_latest_timestamps([t[0] for t in tables.values()])
+        latest = await self.db.get_latest_timestamps(
+            [t[0] for t in tables.values() if t[0] != "coinglass_health"]
+        )
         now = datetime.now(timezone.utc)
         eastern = ZoneInfo("America/New_York")
         age_since_start = int((now - self._start_time).total_seconds())
@@ -456,6 +468,21 @@ class ArgusOrchestrator:
                     "last_seen_et": "N/A",
                     "age_human": None,
                 }
+                continue
+            if label == "Coinglass":
+                if not self.coinglass_client:
+                    status[label] = {
+                        "status": "disabled",
+                        "last_seen_et": "N/A",
+                        "age_human": None,
+                    }
+                    continue
+                status[label] = self._format_freshness(
+                    self._last_coinglass_check,
+                    threshold,
+                    eastern,
+                    age_since_start,
+                )
                 continue
             ts = latest.get(table)
             if not ts:
@@ -490,6 +517,33 @@ class ArgusOrchestrator:
                 "age_human": self._format_age(age_seconds),
             }
         return status
+
+    def _format_freshness(
+        self,
+        last_seen: Optional[datetime],
+        threshold: int,
+        eastern: ZoneInfo,
+        age_since_start: int,
+    ) -> Dict[str, Optional[str]]:
+        """Format freshness for in-memory timestamps."""
+        if not last_seen:
+            if age_since_start < threshold:
+                return {
+                    "status": "pending",
+                    "last_seen_et": "N/A",
+                    "age_human": None,
+                }
+            return {
+                "status": "missing",
+                "last_seen_et": "N/A",
+                "age_human": None,
+            }
+        age_seconds = int((datetime.now(timezone.utc) - last_seen).total_seconds())
+        return {
+            "status": "ok" if age_seconds <= threshold else "stale",
+            "last_seen_et": last_seen.astimezone(eastern).strftime("%Y-%m-%d %H:%M:%S %Z"),
+            "age_human": self._format_age(age_seconds),
+        }
 
     @staticmethod
     def _format_age(age_seconds: int) -> str:
@@ -681,10 +735,21 @@ class ArgusOrchestrator:
                         detection = await self.detectors['liquidation'].analyze(cascade)
                         if detection:
                             await self._send_alert(detection)
+                self._last_coinglass_check = datetime.now(timezone.utc)
+                await self.db.insert_health_check(
+                    component="coinglass",
+                    status="ok",
+                )
             except Exception as e:
                 # Don't spam logs for known API limit issues
                 if 'Upgrade plan' not in str(e):
                     self.logger.error(f"Coinglass polling error: {e}")
+                self._last_coinglass_check = datetime.now(timezone.utc)
+                await self.db.insert_health_check(
+                    component="coinglass",
+                    status="error",
+                    error_message=str(e),
+                )
             
             await asyncio.sleep(interval)
     
@@ -693,8 +758,6 @@ class ArgusOrchestrator:
         interval = 300  # 5 minutes
         
         while self._running:
-            await asyncio.sleep(interval)
-            
             # Log health status
             status = {
                 'bybit_connected': self.bybit_ws.is_connected if self.bybit_ws else False,
@@ -704,6 +767,7 @@ class ArgusOrchestrator:
             }
             
             self.logger.info(f"Health check: {status}")
+            self._last_health_check = datetime.now(timezone.utc)
             await self.db.insert_health_check(
                 component="bybit_ws",
                 status="connected" if status['bybit_connected'] else "disconnected",
@@ -716,6 +780,8 @@ class ArgusOrchestrator:
                 component="detectors",
                 status=f"active_{status['detectors_active']}",
             )
+            
+            await asyncio.sleep(interval)
     
     async def run(self) -> None:
         """Start all components and run main loop."""
