@@ -92,6 +92,28 @@ class GapRiskTracker:
         """Create database table and load last snapshot."""
         await self._create_table()
         await self._load_last_snapshot()
+
+    async def get_status(self) -> Dict:
+        """Get current gap risk status for reporting."""
+        current_price = await self._get_latest_btc_price()
+        if current_price is None:
+            return {
+                'level': 'unknown',
+                'message': 'BTC price unavailable',
+            }
+        status = self.calculate_gap(current_price)
+        if not status:
+            return {
+                'level': 'low',
+                'message': 'No market close snapshot available',
+            }
+        return {
+            'level': status.risk_level,
+            'gap_percent': status.gap_percent,
+            'gap_direction': status.gap_direction,
+            'hours_since_close': status.hours_since_close,
+            'message': status.message,
+        }
     
     async def _create_table(self) -> None:
         """Create market_close_snapshots table if not exists."""
@@ -112,6 +134,17 @@ class GapRiskTracker:
             CREATE INDEX IF NOT EXISTS idx_close_snapshots_date 
             ON market_close_snapshots(market_date DESC)
         """)
+
+    async def _get_latest_btc_price(self) -> Optional[float]:
+        """Fetch the latest BTC price snapshot from the database."""
+        row = await self.db.fetch_one("""
+            SELECT price
+            FROM price_snapshots
+            WHERE exchange = 'bybit' AND asset = 'BTCUSDT' AND price_type = 'spot'
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """)
+        return row[0] if row else None
     
     async def _load_last_snapshot(self) -> None:
         """Load most recent market close snapshot from database."""

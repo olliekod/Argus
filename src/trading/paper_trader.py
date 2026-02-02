@@ -44,7 +44,7 @@ class TraderConfig:
     
     # Risk params
     gap_tolerance_pct: float = 12.0    # Max gap risk to accept
-    max_position_size: int = 2          # Max contracts
+    max_position_size: int = 4          # Max open positions
     
     # Exit strategies - basic
     profit_target_pct: float = 50.0    # Take profit at 50% of credit
