@@ -100,13 +100,24 @@ class YahooFinanceClient:
                     highs = quote.get('high', [])
                     lows = quote.get('low', [])
                     
-                    current_price = meta.get('regularMarketPrice', 0)
-                    prev_close = meta.get('previousClose', 0)
+                    current_price = meta.get('regularMarketPrice') or 0
+                    prev_close = (
+                        meta.get('regularMarketPreviousClose')
+                        or meta.get('previousClose')
+                        or meta.get('chartPreviousClose')
+                        or 0
+                    )
                     
+                    # Fallback to latest close if live price missing
+                    if not current_price:
+                        valid_closes = [c for c in closes if c is not None]
+                        if valid_closes:
+                            current_price = valid_closes[-1]
+
                     # Calculate price change
                     price_change = 0
                     price_change_pct = 0
-                    if prev_close and prev_close > 0:
+                    if prev_close and prev_close > 0 and current_price:
                         price_change = current_price - prev_close
                         price_change_pct = (price_change / prev_close) * 100
                     
