@@ -202,7 +202,14 @@ Reply <code>no</code> — Confirm you skipped the trade
                     lines.append("<b>🧭 Data Freshness</b>")
                     for label, info in data_status.items():
                         state = info.get('status')
-                        emoji = "✅" if state == "ok" else "⚠️"
+                        if state == "ok":
+                            emoji = "✅"
+                        elif state == "pending":
+                            emoji = "⏳"
+                        elif state == "disabled":
+                            emoji = "🚫"
+                        else:
+                            emoji = "⚠️"
                         last_seen = info.get('last_seen_et', 'N/A')
                         age = info.get('age_human')
                         age_suffix = f" ({age})" if age else ""

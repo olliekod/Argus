@@ -105,6 +105,8 @@ class ArgusOrchestrator:
         
         self._running = False
         self._tasks: List[asyncio.Task] = []
+        self._start_time = datetime.now(timezone.utc)
+        self._last_price_snapshot: Dict[str, datetime] = {}
         
         self.logger.info("Argus Orchestrator initialized")
     
@@ -445,10 +447,25 @@ class ArgusOrchestrator:
         latest = await self.db.get_latest_timestamps([t[0] for t in tables.values()])
         now = datetime.now(timezone.utc)
         eastern = ZoneInfo("America/New_York")
+        age_since_start = int((now - self._start_time).total_seconds())
         status: Dict[str, Dict[str, Optional[str]]] = {}
         for label, (table, threshold) in tables.items():
+            if label == "Liquidations" and not self.coinglass_client:
+                status[label] = {
+                    "status": "disabled",
+                    "last_seen_et": "N/A",
+                    "age_human": None,
+                }
+                continue
             ts = latest.get(table)
             if not ts:
+                if age_since_start < threshold:
+                    status[label] = {
+                        "status": "pending",
+                        "last_seen_et": "N/A",
+                        "age_human": None,
+                    }
+                    continue
                 status[label] = {
                     "status": "missing",
                     "last_seen_et": "N/A",
@@ -488,6 +505,12 @@ class ArgusOrchestrator:
     async def _on_bybit_ticker(self, data: Dict) -> None:
         """Handle Bybit ticker update."""
         data['exchange'] = 'bybit'
+        await self._maybe_log_price_snapshot(
+            exchange='bybit',
+            symbol=data.get('symbol'),
+            price=data.get('last_price'),
+            volume=data.get('volume_24h'),
+        )
         
         # Run through all applicable detectors
         if 'funding' in self.detectors:
@@ -506,6 +529,12 @@ class ArgusOrchestrator:
     
     async def _on_coinbase_ticker(self, data: Dict) -> None:
         """Handle Coinbase ticker update (replaces Binance)."""
+        await self._maybe_log_price_snapshot(
+            exchange='coinbase',
+            symbol=data.get('symbol'),
+            price=data.get('last_price'),
+            volume=data.get('volume_24h'),
+        )
         if 'cross_exchange' in self.detectors:
             self.detectors['cross_exchange'].update_price('coinbase', data['symbol'], data['last_price'])
         
@@ -523,6 +552,31 @@ class ArgusOrchestrator:
             detection = await self.detectors['ibit'].analyze(data)
             if detection:
                 await self._send_alert(detection)
+
+    async def _maybe_log_price_snapshot(
+        self,
+        exchange: str,
+        symbol: Optional[str],
+        price: Optional[float],
+        volume: Optional[float],
+        min_interval_seconds: int = 60,
+    ) -> None:
+        """Record price snapshots at a controlled cadence."""
+        if not symbol or price is None:
+            return
+        now = datetime.now(timezone.utc)
+        key = f"{exchange}:{symbol}"
+        last_logged = self._last_price_snapshot.get(key)
+        if last_logged and (now - last_logged).total_seconds() < min_interval_seconds:
+            return
+        await self.db.insert_price_snapshot(
+            exchange=exchange,
+            asset=symbol,
+            price_type='spot',
+            price=float(price),
+            volume=volume,
+        )
+        self._last_price_snapshot[key] = now
     
     async def _on_funding_update(self, data: Dict) -> None:
         """Handle funding rate update from Bybit."""
