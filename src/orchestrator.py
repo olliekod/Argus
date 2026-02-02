@@ -189,7 +189,7 @@ class ArgusOrchestrator:
         # Yahoo Finance for IBIT ETF
         self.yahoo_client = YahooFinanceClient(
             symbols=['IBIT', 'BITO'],
-            on_update=self._on_ibit_update,
+            on_update=self._on_yahoo_update,
         )
         self.logger.info("Yahoo Finance client configured for IBIT/BITO")
         
@@ -651,12 +651,18 @@ class ArgusOrchestrator:
             if detection:
                 await self._send_alert(detection)
     
-    async def _on_ibit_update(self, data: Dict) -> None:
-        """Handle IBIT price update from Yahoo Finance."""
-        if data.get('symbol') == 'IBIT' and 'ibit' in self.detectors:
-            # Add source marker
-            data['source'] = 'yahoo'
+    async def _on_yahoo_update(self, data: Dict) -> None:
+        """Handle IBIT/BITO price update from Yahoo Finance."""
+        symbol = data.get('symbol')
+        if not symbol:
+            return
+        data['source'] = 'yahoo'
+        if symbol == 'IBIT' and 'ibit' in self.detectors:
             detection = await self.detectors['ibit'].analyze(data)
+            if detection:
+                await self._send_alert(detection)
+        elif symbol == 'BITO' and 'bito' in self.detectors:
+            detection = await self.detectors['bito'].analyze(data)
             if detection:
                 await self._send_alert(detection)
 
@@ -761,13 +767,11 @@ class ArgusOrchestrator:
                                 await self._send_alert(detection)
                         
                         # Feed BTC IV to IBIT detector
-                        if currency == 'BTC' and 'ibit' in self.detectors:
-                            ibit_data = {
-                                'source': 'deribit',
-                                'atm_iv': data.get('atm_iv', 0),
-                            }
-                            # Update IBIT detector with BTC IV
-                            self.detectors['ibit'].update_btc_iv(data.get('atm_iv', 0))
+                        if currency == 'BTC':
+                            for key in ('ibit', 'bito'):
+                                detector = self.detectors.get(key)
+                                if detector:
+                                    detector.update_btc_iv(data.get('atm_iv', 0))
                             
             except Exception as e:
                 self.logger.error(f"Deribit polling error: {e}")

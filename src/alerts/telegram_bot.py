@@ -255,9 +255,11 @@ Reply <code>no</code> — Confirm you skipped the trade
                     # Handle both individual position and grouped formats
                     if 'count' in pos:
                         # Grouped format from farm
+                        strategy = pos.get('strategy', 'unknown')
                         lines.append(
                             f"🔸 <b>{pos.get('symbol')}</b> {pos.get('sample_strikes', '')}\n"
-                            f"   Positions: {pos.get('count')} across {pos.get('traders_entered', 0)} traders"
+                            f"   Strategy: {strategy} | Positions: {pos.get('count')} "
+                            f"across {pos.get('traders_entered', 0)} traders"
                         )
                     else:
                         # Individual position format
