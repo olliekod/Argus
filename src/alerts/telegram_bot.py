@@ -675,24 +675,6 @@ Reply <code>no</code> — Confirm you skipped the trade
         
         return await self.send_message("\n".join(lines))
     
-    async def send_funding_alert(self, detection: Dict) -> bool:
-        """Send funding rate opportunity alert."""
-        data = detection.get('detection_data', {})
-        
-        return await self.send_alert(
-            tier=2,
-            alert_type='funding',
-            title=f"Funding Rate Alert: {detection.get('asset', 'Unknown')}",
-            details={
-                'Exchange': detection.get('exchange', 'Unknown'),
-                'Current Rate': f"{data.get('current_funding', 0):.4%}",
-                'Z-Score': f"{data.get('z_score', 0):.2f}",
-                'Mean Rate': f"{data.get('mean_funding', 0):.4%}",
-                'Net Edge': f"{detection.get('net_edge_bps', 0):.1f} bps",
-            },
-            action="Consider SHORT if positive funding, LONG if negative"
-        )
-    
     async def send_iv_alert(self, detection: Dict) -> bool:
         """Send options IV spike alert (Tier 1 - immediate)."""
         data = detection.get('detection_data', {})
@@ -708,43 +690,6 @@ Reply <code>no</code> — Confirm you skipped the trade
                 'Underlying': f"${data.get('underlying_price', 0):,.0f}",
             },
             action="Check Deribit for put spreads - HIGH IV = sell premium"
-        )
-    
-    async def send_liquidation_alert(self, detection: Dict) -> bool:
-        """Send liquidation cascade alert (Tier 1 if large)."""
-        data = detection.get('detection_data', {})
-        total = data.get('total_liquidations_usd', 0)
-        
-        tier = 1 if total >= 5_000_000 else 2
-        
-        return await self.send_alert(
-            tier=tier,
-            alert_type='liquidation',
-            title=f"💥 Liquidation Cascade: {detection.get('asset', 'Unknown')}",
-            details={
-                'Total Liquidated': f"${total:,.0f}",
-                'Long Liquidations': f"${data.get('long_liquidations_usd', 0):,.0f}",
-                'Short Liquidations': f"${data.get('short_liquidations_usd', 0):,.0f}",
-                'Dominant Side': data.get('dominant_side', 'Unknown'),
-            },
-            action="Consider fading the move after cascade completes"
-        )
-    
-    async def send_basis_alert(self, detection: Dict) -> bool:
-        """Send basis arbitrage opportunity alert."""
-        data = detection.get('detection_data', {})
-        
-        return await self.send_alert(
-            tier=2,
-            alert_type='basis',
-            title=f"Basis Opportunity: {detection.get('asset', 'Unknown')}",
-            details={
-                'Spot Price': f"${data.get('spot_price', 0):,.2f}",
-                'Perp Price': f"${data.get('perp_price', 0):,.2f}",
-                'Basis': f"{data.get('basis_bps', 0):.1f} bps",
-                'Net Edge': f"{detection.get('net_edge_bps', 0):.1f} bps",
-            },
-            action="Spot-perp convergence expected"
         )
     
     async def send_daily_summary(self, stats: Dict) -> bool:

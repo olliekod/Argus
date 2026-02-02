@@ -19,15 +19,8 @@ from .core.gap_risk_tracker import GapRiskTracker
 from .core.reddit_monitor import RedditMonitor
 from .core.conditions_monitor import ConditionsMonitor
 from .connectors.bybit_ws import BybitWebSocket
-from .connectors.coinbase_client import CoinbaseClient
-from .connectors.okx_client import OKXClient
 from .connectors.deribit_client import DeribitClient
-from .connectors.coinglass_client import CoinglassClient
 from .connectors.yahoo_client import YahooFinanceClient
-from .detectors.funding_detector import FundingDetector
-from .detectors.basis_detector import BasisDetector
-from .detectors.cross_exchange_detector import CrossExchangeDetector
-from .detectors.liquidation_detector import LiquidationDetector
 from .detectors.options_iv_detector import OptionsIVDetector
 from .detectors.volatility_detector import VolatilityDetector
 from .detectors.ibit_detector import IBITDetector
@@ -83,10 +76,7 @@ class ArgusOrchestrator:
         
         # Components will be initialized in setup()
         self.bybit_ws: Optional[BybitWebSocket] = None
-        self.coinbase_client: Optional[CoinbaseClient] = None
-        self.okx_client: Optional[OKXClient] = None
         self.deribit_client: Optional[DeribitClient] = None
-        self.coinglass_client: Optional[CoinglassClient] = None
         self.yahoo_client: Optional[YahooFinanceClient] = None
         self.telegram: Optional[TelegramBot] = None
         
@@ -107,7 +97,6 @@ class ArgusOrchestrator:
         self._tasks: List[asyncio.Task] = []
         self._start_time = datetime.now(timezone.utc)
         self._last_price_snapshot: Dict[str, datetime] = {}
-        self._last_coinglass_check: Optional[datetime] = None
         self._last_health_check: Optional[datetime] = None
         self._research_last_run: Optional[datetime] = None
         self._research_last_symbol: Optional[str] = None
@@ -167,20 +156,6 @@ class ArgusOrchestrator:
         )
         self.logger.info(f"Bybit WS configured for {len(bybit_symbols)} symbols")
         
-        # Coinbase REST client (US-friendly, replaces Binance)
-        self.coinbase_client = CoinbaseClient(
-            symbols=self.symbols,
-            on_ticker=self._on_coinbase_ticker,
-        )
-        self.logger.info(f"Coinbase client configured for {len(self.symbols)} symbols")
-        
-        # OKX REST client
-        self.okx_client = OKXClient(
-            api_key=get_secret(self.secrets, 'okx', 'api_key') or '',
-            api_secret=get_secret(self.secrets, 'okx', 'api_secret') or '',
-            passphrase=get_secret(self.secrets, 'okx', 'passphrase') or '',
-        )
-        
         # Deribit REST client (public - no auth needed)
         # Use mainnet for real data
         self.deribit_client = DeribitClient(testnet=False)
@@ -193,36 +168,9 @@ class ArgusOrchestrator:
         )
         self.logger.info("Yahoo Finance client configured for IBIT/BITO")
         
-        # Coinglass client (optional - free tier limited)
-        coinglass_key = get_secret(self.secrets, 'coinglass', 'api_key')
-        if coinglass_key and not coinglass_key.startswith('PASTE_'):
-            self.coinglass_client = CoinglassClient(api_key=coinglass_key)
-        else:
-            self.logger.warning("Coinglass not configured - liquidation detection limited")
-    
     async def _setup_detectors(self) -> None:
         """Initialize all detectors."""
         thresholds = self.config.get('thresholds', {})
-        
-        # Funding rate detector
-        funding_config = thresholds.get('funding_rate', {})
-        if funding_config.get('enabled', True):
-            self.detectors['funding'] = FundingDetector(funding_config, self.db)
-        
-        # Basis detector
-        basis_config = thresholds.get('basis', {})
-        if basis_config.get('enabled', True):
-            self.detectors['basis'] = BasisDetector(basis_config, self.db)
-        
-        # Cross-exchange detector
-        cross_config = thresholds.get('cross_exchange', {})
-        if cross_config.get('enabled', True):
-            self.detectors['cross_exchange'] = CrossExchangeDetector(cross_config, self.db)
-        
-        # Liquidation detector
-        liq_config = thresholds.get('liquidation', {})
-        if liq_config.get('enabled', True):
-            self.detectors['liquidation'] = LiquidationDetector(liq_config, self.db)
         
         # Options IV detector (BTC options on Deribit - for research)
         iv_config = thresholds.get('options_iv', {})
@@ -500,43 +448,18 @@ class ArgusOrchestrator:
         """Collect data freshness signals for key tables."""
         tables = {
             "Detections": ("detections", 24 * 60 * 60),
-            "Funding": ("funding_rates", 2 * 60 * 60),
             "Options IV": ("options_iv", 2 * 60 * 60),
-            "Liquidations": ("liquidations", 2 * 60 * 60),
-            "Coinglass": ("coinglass_health", 10 * 60),
             "Prices": ("price_snapshots", 10 * 60),
             "Health": ("system_health", 10 * 60),
         }
         latest = await self.db.get_latest_timestamps(
-            [t[0] for t in tables.values() if t[0] != "coinglass_health"]
+            [t[0] for t in tables.values()]
         )
         now = datetime.now(timezone.utc)
         eastern = ZoneInfo("America/New_York")
         age_since_start = int((now - self._start_time).total_seconds())
         status: Dict[str, Dict[str, Optional[str]]] = {}
         for label, (table, threshold) in tables.items():
-            if label == "Liquidations" and not self.coinglass_client:
-                status[label] = {
-                    "status": "disabled",
-                    "last_seen_et": "N/A",
-                    "age_human": None,
-                }
-                continue
-            if label == "Coinglass":
-                if not self.coinglass_client:
-                    status[label] = {
-                        "status": "disabled",
-                        "last_seen_et": "N/A",
-                        "age_human": None,
-                    }
-                    continue
-                status[label] = self._format_freshness(
-                    self._last_coinglass_check,
-                    threshold,
-                    eastern,
-                    age_since_start,
-                )
-                continue
             ts = latest.get(table)
             if not ts:
                 if age_since_start < threshold:
@@ -571,33 +494,6 @@ class ArgusOrchestrator:
             }
         return status
 
-    def _format_freshness(
-        self,
-        last_seen: Optional[datetime],
-        threshold: int,
-        eastern: ZoneInfo,
-        age_since_start: int,
-    ) -> Dict[str, Optional[str]]:
-        """Format freshness for in-memory timestamps."""
-        if not last_seen:
-            if age_since_start < threshold:
-                return {
-                    "status": "pending",
-                    "last_seen_et": "N/A",
-                    "age_human": None,
-                }
-            return {
-                "status": "missing",
-                "last_seen_et": "N/A",
-                "age_human": None,
-            }
-        age_seconds = int((datetime.now(timezone.utc) - last_seen).total_seconds())
-        return {
-            "status": "ok" if age_seconds <= threshold else "stale",
-            "last_seen_et": last_seen.astimezone(eastern).strftime("%Y-%m-%d %H:%M:%S %Z"),
-            "age_human": self._format_age(age_seconds),
-        }
-
     @staticmethod
     def _format_age(age_seconds: int) -> str:
         """Format age in human-friendly units."""
@@ -619,37 +515,8 @@ class ArgusOrchestrator:
             volume=data.get('volume_24h'),
         )
         
-        # Run through all applicable detectors
-        if 'funding' in self.detectors:
-            detection = await self.detectors['funding'].analyze(data)
-            if detection:
-                await self._send_alert(detection)
-        
         if 'volatility' in self.detectors:
             await self.detectors['volatility'].analyze(data)
-        
-        if 'cross_exchange' in self.detectors:
-            self.detectors['cross_exchange'].update_price('bybit', data['symbol'], data['last_price'])
-        
-        if 'basis' in self.detectors:
-            self.detectors['basis'].update_perp_price(data['symbol'], data['last_price'])
-    
-    async def _on_coinbase_ticker(self, data: Dict) -> None:
-        """Handle Coinbase ticker update (replaces Binance)."""
-        await self._maybe_log_price_snapshot(
-            exchange='coinbase',
-            symbol=data.get('symbol'),
-            price=data.get('last_price'),
-            volume=data.get('volume_24h'),
-        )
-        if 'cross_exchange' in self.detectors:
-            self.detectors['cross_exchange'].update_price('coinbase', data['symbol'], data['last_price'])
-        
-        if 'basis' in self.detectors:
-            self.detectors['basis'].update_spot_price(data['symbol'], data['last_price'])
-            detection = await self.detectors['basis'].analyze(data)
-            if detection:
-                await self._send_alert(detection)
     
     async def _on_yahoo_update(self, data: Dict) -> None:
         """Handle IBIT/BITO price update from Yahoo Finance."""
@@ -710,14 +577,11 @@ class ArgusOrchestrator:
             f"Edge: {detection.get('net_edge_bps', 0):.1f} bps (tier {tier})"
         )
         
-        if op_type == 'funding_rate':
-            await self.telegram.send_funding_alert(detection)
-        elif op_type == 'options_iv':
+        if op_type == 'options_iv':
+            data = detection.get('detection_data', {})
+            if data.get('is_data_only'):
+                return
             await self.telegram.send_iv_alert(detection)
-        elif op_type == 'liquidation':
-            await self.telegram.send_liquidation_alert(detection)
-        elif op_type == 'basis':
-            await self.telegram.send_basis_alert(detection)
         elif op_type == 'ibit_options':
             await self._send_ibit_alert(detection)
     
@@ -778,40 +642,6 @@ class ArgusOrchestrator:
             
             await asyncio.sleep(interval)
     
-    async def _poll_coinglass(self) -> None:
-        """Poll Coinglass for liquidation data."""
-        if not self.coinglass_client:
-            self.logger.info("Coinglass not available - liquidation polling disabled")
-            return
-        
-        interval = 60  # Less frequent to avoid rate limits
-        
-        while self._running:
-            try:
-                for symbol in ['BTC', 'ETH', 'SOL']:
-                    cascade = await self.coinglass_client.check_liquidation_cascade(symbol)
-                    if cascade and 'liquidation' in self.detectors:
-                        detection = await self.detectors['liquidation'].analyze(cascade)
-                        if detection:
-                            await self._send_alert(detection)
-                self._last_coinglass_check = datetime.now(timezone.utc)
-                await self.db.insert_health_check(
-                    component="coinglass",
-                    status="ok",
-                )
-            except Exception as e:
-                # Don't spam logs for known API limit issues
-                if 'Upgrade plan' not in str(e):
-                    self.logger.error(f"Coinglass polling error: {e}")
-                self._last_coinglass_check = datetime.now(timezone.utc)
-                await self.db.insert_health_check(
-                    component="coinglass",
-                    status="error",
-                    error_message=str(e),
-                )
-            
-            await asyncio.sleep(interval)
-
     async def _run_research_farm(self) -> None:
         """Continuously evaluate farm signals for research."""
         if not self.paper_trader_farm:
@@ -904,7 +734,6 @@ class ArgusOrchestrator:
             # Log health status
             status = {
                 'bybit_connected': self.bybit_ws.is_connected if self.bybit_ws else False,
-                'coinbase_connected': self.coinbase_client.is_connected if self.coinbase_client else False,
                 'detectors_active': len(self.detectors),
                 'timestamp': datetime.now(timezone.utc).isoformat(),
             }
@@ -914,10 +743,6 @@ class ArgusOrchestrator:
             await self.db.insert_health_check(
                 component="bybit_ws",
                 status="connected" if status['bybit_connected'] else "disconnected",
-            )
-            await self.db.insert_health_check(
-                component="coinbase_client",
-                status="connected" if status['coinbase_connected'] else "disconnected",
             )
             await self.db.insert_health_check(
                 component="detectors",
@@ -937,13 +762,10 @@ class ArgusOrchestrator:
             self._tasks.append(asyncio.create_task(self.bybit_ws.connect()))
         
         # Start polling tasks
-        if self.coinbase_client:
-            self._tasks.append(asyncio.create_task(self.coinbase_client.poll(interval_seconds=10)))
         if self.yahoo_client:
             self._tasks.append(asyncio.create_task(self.yahoo_client.poll(interval_seconds=60)))
         
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
-        self._tasks.append(asyncio.create_task(self._poll_coinglass()))
         self._tasks.append(asyncio.create_task(self._health_check()))
         if self.research_enabled:
             self._tasks.append(asyncio.create_task(self._run_research_farm()))
@@ -992,14 +814,8 @@ class ArgusOrchestrator:
             await self.bybit_ws.disconnect()
         
         # Close REST clients
-        if self.coinbase_client:
-            await self.coinbase_client.close()
-        if self.okx_client:
-            await self.okx_client.close()
         if self.deribit_client:
             await self.deribit_client.close()
-        if self.coinglass_client:
-            await self.coinglass_client.close()
         if self.yahoo_client:
             await self.yahoo_client.close()
         

@@ -4,96 +4,14 @@
 # IMPORTANT: These are CONSERVATIVE initial values for observation mode.
 # After Week 3 analysis, thresholds may be adjusted based on real data.
 #
-# ⚠️ 90-DAY RULE: After bot deployment, DO NOT change these for 90 days!
+# ⚠️ 90-DAY RULE: After strategy adoption, DO NOT change these for 90 days!
 # This discipline prevents curve-fitting to noise.
 # =============================================================================
 
 # -----------------------------------------------------------------------------
-# Detector #1: Funding Rate Mean Reversion
-# Strategy: Enter opposite direction when funding rates spike to extremes
-# -----------------------------------------------------------------------------
-funding_rate:
-  enabled: true
-  
-  # Entry Criteria
-  threshold_percent: 0.08    # 8 bps per 8h (annualized: ~35%)
-  z_score_threshold: 2.5     # 2.5 standard deviations above mean
-  lookback_periods: 30       # Compare to last 30 funding periods (10 days)
-  
-  # Filters (only trade liquid markets)
-  min_volume_usd: 50000000   # 50M+ daily volume
-  min_open_interest: 100000000  # 100M+ open interest
-  
-  # Exit Criteria
-  take_profit_threshold: 0.03  # Close when funding normalizes to 3 bps
-  stop_loss_percent: 1.5       # Stop loss at -1.5%
-  max_hold_hours: 48           # Force close after 48h
-  
-  # Position Sizing
-  position_size_percent: 10    # 10% of capital per trade
-  max_leverage: 3
-
-# -----------------------------------------------------------------------------
-# Detector #2: Spot-Perp Basis Arbitrage
-# Strategy: Profit from price divergence between spot and perpetual
-# -----------------------------------------------------------------------------
-basis_arbitrage:
-  enabled: true
-  
-  # Spot-perp price difference
-  threshold_percent: 0.5       # 50 bps difference
-  min_edge_after_fees_bps: 10  # Must have 10+ bps net edge
-  max_hold_hours: 24           # Expected convergence time
-  
-  # Filters
-  min_volume_spot: 10000000    # 10M+ spot volume
-  min_volume_perp: 50000000    # 50M+ perp volume
-
-# -----------------------------------------------------------------------------
-# Detector #3: Cross-Exchange Arbitrage
-# Strategy: Same asset at different prices on different exchanges
-# -----------------------------------------------------------------------------
-cross_exchange:
-  enabled: true
-  
-  # Price discrepancies between exchanges
-  threshold_percent: 0.15      # 15 bps difference
-  min_edge_after_fees_bps: 5   # 5+ bps net edge
-  
-  # Exchanges to compare (US-friendly)
-  exchanges:
-    - "bybit"
-    - "coinbase"
-    - "okx"
-  
-  # Execution constraints
-  max_execution_seconds: 10    # Must complete both legs within 10s
-  min_liquidity_depth_usd: 100000  # 100k liquidity on both sides
-
-# -----------------------------------------------------------------------------
-# Detector #4: Post-Liquidation Snapback
-# Strategy: Fade large liquidation cascades
-# -----------------------------------------------------------------------------
-liquidation:
-  enabled: true
-  
-  # Liquidation cascade detection
-  min_liquidation_usd: 5000000  # 5M+ liquidations
-  time_window_minutes: 5        # Within 5 minutes
-  
-  # Snapback criteria
-  snapback_threshold_percent: 0.3  # Expect 30+ bps bounce
-  entry_delay_seconds: 30          # Wait 30s after cascade peak
-  
-  # Exit
-  take_profit_percent: 0.5   # Take profit at 50 bps
-  stop_loss_percent: 1.0     # Stop at -1%
-  max_hold_minutes: 30       # Quick trade
-
-# -----------------------------------------------------------------------------
-# Detector #5: BTC Options IV Spike (MANUAL TRADING)
+# Detector #1: BTC Options IV Spike (MANUAL TRADING)
 # Strategy: Sell premium when IV spikes during panic
-# NOTE: This detector alerts YOU - it does not auto-trade
+# NOTE: This detector logs IV data for IBIT/BITO decisions
 # -----------------------------------------------------------------------------
 options_iv:
   enabled: true
@@ -113,7 +31,7 @@ options_iv:
   max_positions: 3             # Max 3 open positions
 
 # -----------------------------------------------------------------------------
-# Detector #6: Volatility Regime Changes
+# Detector #2: Volatility Regime Changes
 # Strategy: Detect sudden expansion/compression in volatility
 # NOTE: Provides context for other strategies, not standalone trades
 # -----------------------------------------------------------------------------
@@ -132,7 +50,7 @@ volatility:
   min_observations: 60         # Need 60+ data points
 
 # -----------------------------------------------------------------------------
-# Detector #7: IBIT Options Opportunity (MANUAL TRADING)
+# Detector #3: IBIT Options Opportunity (MANUAL TRADING)
 # Strategy: Sell put spreads on IBIT when BTC volatility spikes
 # NOTE: This detector alerts YOU to check Robinhood for opportunities
 # 
@@ -166,7 +84,7 @@ ibit:
   account_size: 3000             # For position sizing
 
 # -----------------------------------------------------------------------------
-# Detector #8: BITO Options Opportunity (MANUAL TRADING)
+# Detector #4: BITO Options Opportunity (MANUAL TRADING)
 # Strategy: Same as IBIT - sell put spreads on crypto volatility
 # BITO = ProShares Bitcoin Strategy ETF (tracks BTC futures)
 # Adding this DOUBLES your trade opportunities

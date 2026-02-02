@@ -8,8 +8,7 @@ for proactive opportunity alerts.
 Inputs:
 - BTC IV (Deribit) → elevated = opportunity
 - Funding rate (Bybit) → extremes = contrarian signal
-- Open Interest changes → conviction indicator
-- IBIT/BITO price movement (Yahoo) → correlation confirmation
+- BTC price momentum (Bybit) → fear/relief context
 
 Output:
 - Composite score 1-10
@@ -39,7 +38,6 @@ class ConditionsSnapshot:
     btc_iv_percentile: float  # IV percentile (0-100)
     funding_rate: float  # Current funding rate
     funding_zscore: float  # How extreme is funding
-    oi_change_24h: float  # OI change %
     btc_price: float
     btc_change_24h: float
     
@@ -104,9 +102,7 @@ class ConditionsMonitor:
         # Data sources (set by orchestrator)
         self._get_btc_iv: Optional[Callable] = None
         self._get_funding: Optional[Callable] = None
-        self._get_oi: Optional[Callable] = None
         self._get_btc_price: Optional[Callable] = None
-        self._get_ibit_price: Optional[Callable] = None
         
         logger.info("Conditions Monitor initialized")
     
@@ -114,16 +110,12 @@ class ConditionsMonitor:
         self,
         get_btc_iv: Optional[Callable] = None,
         get_funding: Optional[Callable] = None,
-        get_oi: Optional[Callable] = None,
         get_btc_price: Optional[Callable] = None,
-        get_ibit_price: Optional[Callable] = None,
     ):
         """Set callbacks for fetching data from connectors."""
         self._get_btc_iv = get_btc_iv
         self._get_funding = get_funding
-        self._get_oi = get_oi
         self._get_btc_price = get_btc_price
-        self._get_ibit_price = get_ibit_price
     
     def _is_market_open(self) -> bool:
         """Check if US stock market is currently open."""
@@ -169,16 +161,6 @@ class ConditionsMonitor:
             return "bullish", 1  # Less ideal, but IV often elevated
         else:
             return "neutral", 1
-    
-    def _calculate_oi_signal(self, oi_change: float) -> int:
-        """Calculate OI contribution to score."""
-        # Rising OI = conviction
-        if oi_change >= 5:
-            return 2
-        elif oi_change >= 2:
-            return 1
-        else:
-            return 0
     
     def _get_warmth_label(self, score: int) -> str:
         """Convert score to label."""
@@ -239,14 +221,6 @@ class ConditionsMonitor:
             except Exception as e:
                 logger.warning(f"Failed to get funding: {e}")
         
-        oi_change = 0.0
-        if self._get_oi:
-            try:
-                oi_data = await self._get_oi()
-                oi_change = oi_data.get('change_24h_pct', 0) if oi_data else 0
-            except Exception as e:
-                logger.warning(f"Failed to get OI: {e}")
-        
         btc_price = 95000.0  # Default
         btc_change = 0.0
         if self._get_btc_price:
@@ -262,13 +236,11 @@ class ConditionsMonitor:
         iv_signal, iv_score = self._calculate_iv_signal(btc_iv)
         funding_signal, funding_score = self._calculate_funding_signal(funding_rate)
         momentum_signal, momentum_score = self._calculate_momentum_signal(btc_change)
-        oi_score = self._calculate_oi_signal(oi_change)
-        
         # Market open bonus
         market_bonus = 1 if market_open else 0
         
         # Calculate total score (1-10 scale)
-        raw_score = iv_score + funding_score + momentum_score + oi_score + market_bonus
+        raw_score = iv_score + funding_score + momentum_score + market_bonus
         score = min(10, max(1, raw_score))
         
         # Get label and implication
@@ -298,7 +270,6 @@ class ConditionsMonitor:
             btc_iv_percentile=iv_percentile,
             funding_rate=funding_rate,
             funding_zscore=funding_zscore,
-            oi_change_24h=oi_change,
             btc_price=btc_price,
             btc_change_24h=btc_change,
             market_open=market_open,
@@ -402,16 +373,12 @@ async def test_conditions_monitor():
     async def mock_funding():
         return {'rate': -0.0005}  # -0.05% (shorts paying)
     
-    async def mock_oi():
-        return {'change_24h_pct': 3.5}
-    
     async def mock_btc_price():
         return {'price': 97500, 'change_24h_pct': -2.1}
     
     monitor.set_data_sources(
         get_btc_iv=mock_iv,
         get_funding=mock_funding,
-        get_oi=mock_oi,
         get_btc_price=mock_btc_price,
     )
     
@@ -420,7 +387,7 @@ async def test_conditions_monitor():
     print(f"Score: {snapshot.score}/10 ({snapshot.label})")
     print(f"BTC IV: {snapshot.btc_iv}% ({snapshot.iv_signal})")
     print(f"Funding: {snapshot.funding_rate:+.3f}% ({snapshot.funding_signal})")
-    print(f"OI Change: {snapshot.oi_change_24h:+.1f}%")
+    print(f"BTC Change: {snapshot.btc_change_24h:+.1f}%")
     print(f"BTC: ${snapshot.btc_price:,.0f} ({snapshot.btc_change_24h:+.1f}%)")
     print(f"Market: {'OPEN' if snapshot.market_open else 'CLOSED'}")
     print()

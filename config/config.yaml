@@ -34,16 +34,6 @@ exchanges:
     reconnect_delay: 5  # initial delay, will use exponential backoff
     max_reconnect_delay: 300  # max 5 minutes between reconnects
   
-  binance:
-    enabled: true
-    testnet: false
-    rate_limit: 10
-  
-  okx:
-    enabled: true
-    testnet: false
-    rate_limit: 5
-  
   deribit:
     enabled: true
     testnet: true  # Start with testnet for safety
@@ -55,8 +45,8 @@ exchanges:
 alerts:
   telegram:
     enabled: true
-    tier_1_immediate: true   # Options IV >80%, Liquidations >5M
-    tier_2_fyi: true         # Funding extremes, Basis arb
+    tier_1_immediate: true   # IBIT/BITO put spread signal
+    tier_2_fyi: true         # IV spike confirmations
     tier_3_background: false # Minor events, logged only
     daily_summary: true
     daily_summary_time: "20:00"  # 8 PM UTC
@@ -106,7 +96,6 @@ circuit_breakers:
 # -----------------------------------------------------------------------------
 data_retention:
   price_snapshots_days: 30
-  funding_rates_days: 90
   detections_days: 180
   logs_days: 30
 
