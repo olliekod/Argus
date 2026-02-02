@@ -601,6 +601,17 @@ class Database:
         """, (component,))
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+    async def get_latest_timestamps(self, tables: List[str]) -> Dict[str, Optional[str]]:
+        """Fetch the most recent timestamp for each table."""
+        results: Dict[str, Optional[str]] = {}
+        for table in tables:
+            cursor = await self._connection.execute(
+                f"SELECT MAX(timestamp) AS latest FROM {table}"
+            )
+            row = await cursor.fetchone()
+            results[table] = row["latest"] if row and row["latest"] else None
+        return results
     
     # =========================================================================
     # Statistics Operations

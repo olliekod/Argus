@@ -8,6 +8,7 @@ Supports commands: /help, /status, /positions, /pnl
 
 import asyncio
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, List, Optional
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
@@ -60,6 +61,7 @@ class TelegramBot:
 /status — Current conditions score and system status
 /positions — View open paper trading positions
 /pnl — Today's P&L summary
+/farm_status — Paper trader farm status
 
 <b>Trade Confirmation:</b>
 Reply <code>yes</code> — Confirm you took the trade
@@ -106,6 +108,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         self._get_conditions: Optional[Callable] = None
         self._get_positions: Optional[Callable] = None
         self._get_pnl: Optional[Callable] = None
+        self._get_farm_status: Optional[Callable] = None
         self._on_trade_confirmation: Optional[Callable] = None
         
         # Track last signal for yes/no confirmation
@@ -123,12 +126,14 @@ Reply <code>no</code> — Confirm you skipped the trade
         get_conditions: Optional[Callable] = None,
         get_positions: Optional[Callable] = None,
         get_pnl: Optional[Callable] = None,
+        get_farm_status: Optional[Callable] = None,
         on_trade_confirmation: Optional[Callable] = None,
     ):
         """Set callback functions for data access."""
         self._get_conditions = get_conditions
         self._get_positions = get_positions
         self._get_pnl = get_pnl
+        self._get_farm_status = get_farm_status
         self._on_trade_confirmation = on_trade_confirmation
     
     async def start_polling(self) -> None:
@@ -141,6 +146,7 @@ Reply <code>no</code> — Confirm you skipped the trade
             self._app.add_handler(CommandHandler("status", self._cmd_status))
             self._app.add_handler(CommandHandler("positions", self._cmd_positions))
             self._app.add_handler(CommandHandler("pnl", self._cmd_pnl))
+            self._app.add_handler(CommandHandler("farm_status", self._cmd_farm_status))
             
             # Add message handler for yes/no responses
             self._app.add_handler(MessageHandler(
@@ -183,6 +189,9 @@ Reply <code>no</code> — Confirm you skipped the trade
                 conditions = await self._get_conditions()
                 score = conditions.get('score', 0)
                 warmth = conditions.get('warmth_label', 'unknown')
+                market_time = conditions.get('market_time_et', 'N/A')
+                updated = conditions.get('last_updated_et') or "N/A"
+                data_status = conditions.get('data_status', {})
                 
                 lines = [
                     f"🌡️ <b>CONDITIONS: {score}/10 ({warmth.upper()})</b>",
@@ -190,9 +199,26 @@ Reply <code>no</code> — Confirm you skipped the trade
                     f"• BTC IV: {conditions.get('btc_iv', 'N/A')}%",
                     f"• Funding: {conditions.get('funding', 'N/A')}",
                     f"• Market: {'🟢 OPEN' if conditions.get('market_open') else '🔴 CLOSED'}",
+                    f"• Market Time: {market_time}",
+                    f"• Updated: {updated}",
                     "",
-                    f"<i>Updated: {datetime.utcnow().strftime('%H:%M:%S')} UTC</i>",
                 ]
+                if data_status:
+                    lines.append("<b>🧭 Data Freshness</b>")
+                    for label, info in data_status.items():
+                        state = info.get('status')
+                        if state == "ok":
+                            emoji = "✅"
+                        elif state == "pending":
+                            emoji = "⏳"
+                        elif state == "disabled":
+                            emoji = "🚫"
+                        else:
+                            emoji = "⚠️"
+                        last_seen = info.get('last_seen_et', 'N/A')
+                        age = info.get('age_human')
+                        age_suffix = f" ({age})" if age else ""
+                        lines.append(f"{emoji} {label}: {last_seen}{age_suffix}")
                 await update.message.reply_text("\n".join(lines), parse_mode="HTML")
             else:
                 await update.message.reply_text(
@@ -274,6 +300,44 @@ Reply <code>no</code> — Confirm you skipped the trade
                 )
         except Exception as e:
             logger.error(f"Error in /pnl: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+
+    async def _cmd_farm_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /farm_status command."""
+        try:
+            if not self._get_farm_status:
+                await update.message.reply_text(
+                    "⚠️ Farm status not available. Paper trader farm not connected.",
+                    parse_mode="HTML"
+                )
+                return
+            status = await self._get_farm_status()
+            if not status:
+                await update.message.reply_text(
+                    "⚠️ Farm status not available. Paper trader farm not connected.",
+                    parse_mode="HTML"
+                )
+                return
+            last_eval = status.get("last_evaluation_time")
+            if last_eval:
+                try:
+                    dt = datetime.fromisoformat(last_eval)
+                except ValueError:
+                    dt = None
+                if dt:
+                    last_eval = dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
+            lines = [
+                "<b>🚜 Paper Trader Farm Status</b>",
+                "",
+                f"Configs: {status.get('total_configs', 0):,}",
+                f"Active traders: {status.get('active_traders', 0):,}",
+                f"Last evaluation: {last_eval or 'N/A'}",
+                f"Last symbol: {status.get('last_evaluation_symbol') or 'N/A'}",
+                f"Traders entered: {status.get('last_evaluation_entered', 0):,}",
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error in /farm_status: {e}")
             await update.message.reply_text(f"❌ Error: {e}")
     
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -456,7 +520,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         
         # Add timestamp
         lines.append("")
-        lines.append(f"<i>{datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')} UTC</i>")
+        lines.append(f"<i>{self._now_et().strftime('%Y-%m-%d %H:%M:%S %Z')}</i>")
         
         text = "\n".join(lines)
         
@@ -464,6 +528,11 @@ Reply <code>no</code> — Confirm you skipped the trade
         silent = tier > 1
         
         return await self.send_message(text, disable_notification=silent)
+
+    @staticmethod
+    def _now_et() -> datetime:
+        """Return current time in US/Eastern."""
+        return datetime.now(ZoneInfo("America/New_York"))
     
     async def send_conditions_alert(
         self,
@@ -493,7 +562,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         lines.append("")
         lines.append(f"💡 <b>Implication:</b> {implication}")
         lines.append("")
-        lines.append(f"<i>{datetime.utcnow().strftime('%H:%M:%S')} UTC</i>")
+        lines.append(f"<i>{self._now_et().strftime('%H:%M:%S %Z')}</i>")
         
         return await self.send_message("\n".join(lines))
     
@@ -573,7 +642,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         """Send daily summary report."""
         lines = [
             f"📈 <b>Daily Market Monitor Summary</b>",
-            f"<i>{datetime.utcnow().strftime('%Y-%m-%d')}</i>",
+            f"<i>{self._now_et().strftime('%Y-%m-%d')}</i>",
             "",
             "<b>Detections Today:</b>",
         ]
