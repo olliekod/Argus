@@ -183,6 +183,12 @@ Reply <code>no</code> — Confirm you skipped the trade
                 conditions = await self._get_conditions()
                 score = conditions.get('score', 0)
                 warmth = conditions.get('warmth_label', 'unknown')
+                market_time = conditions.get('market_time_et', 'N/A')
+                updated = conditions.get('last_updated')
+                if updated:
+                    updated = updated.replace("T", " ").replace("+00:00", " UTC")
+                else:
+                    updated = datetime.utcnow().strftime('%H:%M:%S UTC')
                 
                 lines = [
                     f"🌡️ <b>CONDITIONS: {score}/10 ({warmth.upper()})</b>",
@@ -190,8 +196,9 @@ Reply <code>no</code> — Confirm you skipped the trade
                     f"• BTC IV: {conditions.get('btc_iv', 'N/A')}%",
                     f"• Funding: {conditions.get('funding', 'N/A')}",
                     f"• Market: {'🟢 OPEN' if conditions.get('market_open') else '🔴 CLOSED'}",
+                    f"• Market Time: {market_time}",
                     "",
-                    f"<i>Updated: {datetime.utcnow().strftime('%H:%M:%S')} UTC</i>",
+                    f"<i>Updated: {updated}</i>",
                 ]
                 await update.message.reply_text("\n".join(lines), parse_mode="HTML")
             else:

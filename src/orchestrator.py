@@ -585,7 +585,18 @@ class ArgusOrchestrator:
             }
             
             self.logger.info(f"Health check: {status}")
-            await self.db.insert_system_health(status)
+            await self.db.insert_health_check(
+                component="bybit_ws",
+                status="connected" if status['bybit_connected'] else "disconnected",
+            )
+            await self.db.insert_health_check(
+                component="coinbase_client",
+                status="connected" if status['coinbase_connected'] else "disconnected",
+            )
+            await self.db.insert_health_check(
+                component="detectors",
+                status=f"active_{status['detectors_active']}",
+            )
     
     async def run(self) -> None:
         """Start all components and run main loop."""
