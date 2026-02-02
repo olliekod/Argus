@@ -115,10 +115,10 @@ class IBITDetector(BaseDetector):
             ibit_price = self._current_ibit_data.get('price', 0)
 
         iv_elevated = btc_iv >= self.btc_iv_threshold
-        ibit_dropped = ibit_change <= self.ibit_drop_threshold
+        ibit_dropped = ibit_change <= self.drop_threshold
         iv_score = btc_iv / self.btc_iv_threshold if self.btc_iv_threshold > 0 else 0
-        drop_score = abs(ibit_change) / abs(self.ibit_drop_threshold) if ibit_change < 0 else 0
-        combined_score = (iv_score + drop_score) / 2 if (self.btc_iv_threshold and self.ibit_drop_threshold) else 0
+        drop_score = abs(ibit_change) / abs(self.drop_threshold) if ibit_change < 0 else 0
+        combined_score = (iv_score + drop_score) / 2 if (self.btc_iv_threshold and self.drop_threshold) else 0
 
         cooldown_remaining = None
         if self._last_alert_time:
@@ -139,7 +139,7 @@ class IBITDetector(BaseDetector):
             'btc_iv_ok': iv_elevated,
             'ibit_price': ibit_price,
             'ibit_change_pct': ibit_change,
-            'ibit_drop_threshold': self.ibit_drop_threshold,
+            'ibit_drop_threshold': self.drop_threshold,
             'ibit_drop_ok': ibit_dropped,
             'combined_score': combined_score,
             'combined_score_threshold': self.combined_score_threshold,

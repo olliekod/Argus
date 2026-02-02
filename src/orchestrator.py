@@ -476,6 +476,15 @@ class ArgusOrchestrator:
             return {}
         aggregate = self.paper_trader_farm.get_aggregate_pnl()
         status = self.paper_trader_farm.get_status_summary()
+        data_ready = False
+        ibit_detector = self.detectors.get('ibit')
+        bito_detector = self.detectors.get('bito')
+        if ibit_detector:
+            checklist = ibit_detector.get_signal_checklist()
+            data_ready = data_ready or (checklist.get('has_btc_iv') and checklist.get('has_ibit_data'))
+        if bito_detector:
+            checklist = bito_detector.get_signal_checklist()
+            data_ready = data_ready or (checklist.get('has_btc_iv') and checklist.get('has_ibit_data'))
         return {
             'research_enabled': self.research_enabled,
             'evaluation_interval_seconds': self.research_config.get('evaluation_interval_seconds', 60),
@@ -484,6 +493,7 @@ class ArgusOrchestrator:
             'last_entered': self._research_last_entered,
             'aggregate': aggregate,
             'status': status,
+            'data_ready': data_ready,
         }
 
     async def _get_data_status(self) -> Dict[str, Dict[str, Optional[str]]]:

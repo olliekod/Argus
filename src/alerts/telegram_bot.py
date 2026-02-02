@@ -430,6 +430,7 @@ Reply <code>no</code> — Confirm you skipped the trade
                 f"Last run: {last_run or 'N/A'}",
                 f"Last symbol: {status.get('last_symbol') or 'N/A'}",
                 f"Entered last run: {status.get('last_entered', 0):,}",
+                f"Data ready: {'✅' if status.get('data_ready') else '❌'}",
                 "",
                 "<b>📊 Aggregate</b>",
                 f"Total trades: {aggregate.get('total_trades', 0):,}",
