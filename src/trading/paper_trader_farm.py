@@ -78,7 +78,12 @@ class PaperTraderFarm:
         
         # Track open positions by symbol for correlation check
         self._positions_by_symbol: Dict[str, int] = {}  # symbol -> count
-        
+
+        # P3: Drawdown circuit breaker
+        self._peak_balance: float = starting_balance
+        self._drawdown_breaker_pct: float = 20.0  # halt at 20% drawdown
+        self._drawdown_halted: bool = False
+
         logger.info(f"PaperTraderFarm initialized (full_coverage={full_coverage})")
     
     async def initialize(self) -> None:
@@ -232,47 +237,56 @@ class PaperTraderFarm:
         Returns:
             List of trades that were entered
         """
+        # P3: Drawdown circuit breaker check
+        if self._drawdown_halted:
+            logger.debug(f"Blocked signal for {symbol}: drawdown circuit breaker active")
+            return []
+
         # 1. Check economic calendar blackout periods (FOMC, CPI, Jobs)
         is_blackout, event = self.economic_calendar.is_blackout_period()
         if is_blackout:
             logger.debug(f"Blocked signal for {symbol}: blackout period ({event.name if event else 'unknown'})")
             return []
-        
+
         # 2. Check IBIT/BITO correlation (both track BTC, don't double-up)
         btc_symbols = {'IBIT', 'BITO', 'GBTC', 'BTCO'}  # All BTC-tracking ETFs
         if symbol.upper() in btc_symbols:
-            # Count existing BTC exposure across all symbols
             btc_exposure = sum(
                 count for sym, count in self._positions_by_symbol.items()
                 if sym.upper() in btc_symbols
             )
-            # Limit total BTC exposure to 50% of traders that would enter
             max_btc_exposure = len(self.trader_configs) // 2
             if btc_exposure >= max_btc_exposure:
                 logger.debug(f"Blocked {symbol}: BTC exposure limit reached ({btc_exposure:,} positions)")
                 return []
-        
+
         entered_trades = []
+        db_batch = []
         self.last_evaluation_time = datetime.now(timezone.utc)
         self.last_evaluation_symbol = symbol
         self.last_evaluation_entered = 0
-        
-        # Get current time for session filters
+
+        # P1 fix: Convert timestamp to Eastern Time for session filters
+        eastern = ZoneInfo("America/New_York")
         current_time = signal_data.get('timestamp')
         if isinstance(current_time, str):
             try:
                 current_time = datetime.fromisoformat(current_time)
             except ValueError:
                 current_time = None
-        
+        if current_time is None:
+            current_time = datetime.now(timezone.utc)
+        # Ensure timezone-aware
+        if current_time.tzinfo is None:
+            current_time = current_time.replace(tzinfo=timezone.utc)
+        current_time_et = current_time.astimezone(eastern)
+
         # 3. Vectorized Evaluation on GPU
         from ..analysis.gpu_engine import get_gpu_engine
         import torch
         engine = get_gpu_engine()
-        
+
         # Prepare market data tensor
-        # 0: iv | 1: warmth | 2: dte | 3: pop | 4: gap_risk 
-        # 5: bull | 6: bear | 7: neutral | 8: morning | 9: midday | 10: afternoon
         dir_val = signal_data.get('direction', 'neutral')
         market_tensor = torch.tensor([
             signal_data.get('iv', 50),
@@ -283,53 +297,77 @@ class PaperTraderFarm:
             1.0 if dir_val == 'bullish' else 0.0,
             1.0 if dir_val == 'bearish' else 0.0,
             1.0 if dir_val == 'neutral' else 0.0,
-            # We skip session filters in this specific batch check for now 
-            # or could add them to the tensor if needed. 
-            0.0, 0.0, 0.0 
+            0.0, 0.0, 0.0
         ], device=engine._device, dtype=torch.float32)
-        
+
         # Batch evaluate
         start_eval = datetime.now()
         mask = engine.evaluate_traders_batch(self.trader_tensors, market_tensor)
         eval_time = (datetime.now() - start_eval).total_seconds() * 1000
-        
+
         # Get indices of traders that should enter
         entry_indices = torch.where(mask)[0].cpu().tolist()
-        
+
         if self._promoted_indices is not None:
             entry_indices = [i for i in entry_indices if i in self._promoted_indices]
-        
+
+        # P1 fix: Use Eastern Time hour for session filter
+        et_hour = current_time_et.hour + (current_time_et.minute / 60)
+
+        # P1: Base credit from signal, apply realistic fill slippage
+        raw_credit = signal_data.get('credit', 0.40)
+        # Apply 5% bid-ask slippage to simulate realistic fills
+        slippage_factor = 0.95
+        realistic_credit = raw_credit * slippage_factor
+
         for idx in entry_indices:
             config = self.trader_configs[idx]
-            
-            # Check session filter (this is the only part not yet in the tensor mask)
-            # We could add it to the tensor for 100% speed, but it's only for the matches
-            dt = current_time or datetime.now(timezone.utc)
-            hour = dt.hour + (dt.minute / 60)
+
+            # P1 fix: Session filter uses Eastern Time
             session = config.session_filter
             if session != 'any':
-                if session == 'morning' and not (9.5 <= hour <= 11.5): continue
-                elif session == 'midday' and not (11.5 < hour <= 14.0): continue
-                elif session == 'afternoon' and not (14.0 < hour <= 16.0): continue
-            
+                if session == 'morning' and not (9.5 <= et_hour <= 11.5): continue
+                elif session == 'midday' and not (11.5 < et_hour <= 14.0): continue
+                elif session == 'afternoon' and not (14.0 < et_hour <= 16.0): continue
+
             # Re-check max positions for this specific config
-            # (Note: active_traders only tracks those with open positions)
             active_trader = self.active_traders.get(config.trader_id)
             if active_trader and len(active_trader.open_positions) >= config.max_position_size:
                 continue
-                
+
             # Instantiate trader if not already active (Lazy Loading)
             if not active_trader:
                 active_trader = PaperTrader(config=config, db=self.db)
                 self.active_traders[config.trader_id] = active_trader
-            
+
+            # P1: Differentiate trade construction per config
+            # Compute contracts from position_size_pct and max_risk_dollars
+            base_spread_width = 4.0  # Default $4 spread width
+            try:
+                strikes_str = signal_data.get('strikes', '')
+                if '/' in strikes_str:
+                    parts = strikes_str.replace('$', '').split('/')
+                    base_spread_width = abs(float(parts[0]) - float(parts[1]))
+            except (ValueError, IndexError):
+                pass
+
+            max_risk_per_contract = (base_spread_width - realistic_credit) * 100
+            if max_risk_per_contract > 0:
+                risk_budget = min(
+                    self.starting_balance * (config.position_size_pct / 100),
+                    config.max_risk_dollars,
+                )
+                contracts = max(1, int(risk_budget / max_risk_per_contract))
+            else:
+                contracts = 1
+
             # Execute paper trade
             trade = active_trader.enter_trade(
                 symbol=symbol,
                 strikes=signal_data.get('strikes', 'N/A'),
                 expiry=signal_data.get('expiry', 'N/A'),
-                entry_credit=signal_data.get('credit', 0.40),
-                contracts=1,  # Base contracts
+                entry_credit=realistic_credit,
+                contracts=contracts,
                 market_conditions={
                     'iv': signal_data.get('iv'),
                     'warmth': signal_data.get('warmth'),
@@ -339,35 +377,60 @@ class PaperTraderFarm:
                     'iv_rank': signal_data.get('iv_rank'),
                     'dte': signal_data.get('dte'),
                     'credit': signal_data.get('credit'),
+                    'realistic_credit': realistic_credit,
+                    'contracts': contracts,
                     'conditions_label': signal_data.get('conditions_label'),
                     'btc_change_pct': signal_data.get('btc_change_pct'),
                     'ibit_change_pct': signal_data.get('ibit_change_pct'),
                     'timestamp': datetime.now(timezone.utc).isoformat(),
                 },
             )
-            
+
             entered_trades.append(trade)
-            
+            db_batch.append(trade)
+
             # Track positions by symbol for correlation check
             self._positions_by_symbol[symbol] = self._positions_by_symbol.get(symbol, 0) + 1
-            
-            # Log to database
-            if self.db:
-                await self._save_trade(trade)
-        
+
+        # P2: Batch database writes for entries
+        if db_batch and self.db:
+            await self._save_trades_batch(db_batch)
+
         if entered_trades:
             logger.info(
-                f"Vectorized evaluation complete in {eval_time:.1f}ms: "
-                f"{len(entered_trades)}/{len(self.trader_configs)} traders entered"
-            )
-        
-        if entered_trades:
-            logger.info(
-                f"Signal evaluated: {len(entered_trades)}/{len(self.trader_configs)} "
-                f"traders entered {symbol}"
+                f"Signal evaluated in {eval_time:.1f}ms: "
+                f"{len(entered_trades)}/{len(self.trader_configs)} "
+                f"traders entered {symbol} (credit=${realistic_credit:.3f}, slippage={1-slippage_factor:.0%})"
             )
         self.last_evaluation_entered = len(entered_trades)
+
+        # P3: Update drawdown circuit breaker
+        self._update_drawdown_check()
+
         return entered_trades
+
+    def _update_drawdown_check(self) -> None:
+        """P3: Check portfolio drawdown and halt if exceeded."""
+        total_pnl = sum(
+            t.stats['total_pnl'] for t in self.active_traders.values()
+        )
+        current_balance = self.starting_balance + total_pnl
+        if current_balance > self._peak_balance:
+            self._peak_balance = current_balance
+        if self._peak_balance > 0:
+            drawdown_pct = ((self._peak_balance - current_balance) / self._peak_balance) * 100
+            if drawdown_pct >= self._drawdown_breaker_pct:
+                if not self._drawdown_halted:
+                    self._drawdown_halted = True
+                    logger.warning(
+                        f"DRAWDOWN CIRCUIT BREAKER: {drawdown_pct:.1f}% drawdown "
+                        f"(peak=${self._peak_balance:,.0f}, current=${current_balance:,.0f}). "
+                        f"New entries halted."
+                    )
+            elif self._drawdown_halted and drawdown_pct < self._drawdown_breaker_pct * 0.5:
+                # Reset breaker when drawdown recovers below half threshold
+                self._drawdown_halted = False
+                logger.info(f"Drawdown circuit breaker reset (drawdown={drawdown_pct:.1f}%)")
 
     def get_status_summary(self) -> Dict[str, Any]:
         """Return last evaluation status for the farm."""
@@ -391,9 +454,9 @@ class PaperTraderFarm:
         self._promoted_indices = indices
     
     async def _save_trade(self, trade: PaperTrade) -> None:
-        """Save a trade to the database."""
+        """Save a single trade to the database."""
         await self.db.execute("""
-            INSERT OR REPLACE INTO paper_trades 
+            INSERT OR REPLACE INTO paper_trades
             (id, trader_id, strategy_type, symbol, timestamp, strikes, expiry,
              entry_credit, contracts, status, close_timestamp, close_price,
              realized_pnl, market_conditions)
@@ -414,19 +477,41 @@ class PaperTraderFarm:
             trade.realized_pnl,
             json.dumps(trade.market_conditions) if trade.market_conditions else None,
         ))
+
+    async def _save_trades_batch(self, trades: List[PaperTrade]) -> None:
+        """Save multiple trades in a single batch transaction (P2)."""
+        if not trades:
+            return
+        rows = [
+            (
+                t.id, t.trader_id, t.strategy_type, t.symbol, t.timestamp,
+                t.strikes, t.expiry, t.entry_credit, t.contracts, t.status,
+                t.close_timestamp, t.close_price, t.realized_pnl,
+                json.dumps(t.market_conditions) if t.market_conditions else None,
+            )
+            for t in trades
+        ]
+        await self.db.execute_many("""
+            INSERT OR REPLACE INTO paper_trades
+            (id, trader_id, strategy_type, symbol, timestamp, strikes, expiry,
+             entry_credit, contracts, status, close_timestamp, close_price,
+             realized_pnl, market_conditions)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, rows)
     
     async def check_exits(self, current_prices: Dict[str, Dict[str, float]]) -> List[PaperTrade]:
         """
         Check all traders for exit conditions.
-        
+
         Args:
             current_prices: Dict mapping symbol to {trade_id: current_price}
-            
+
         Returns:
             List of closed trades
         """
         all_closed = []
-        
+        db_batch = []
+
         # Only check traders with open positions
         for trader_id, trader in list(self.active_traders.items()):
             # Get prices relevant to this trader's positions
@@ -436,45 +521,62 @@ class PaperTraderFarm:
                     prices = current_prices[trade.symbol]
                     if trade.id in prices:
                         trader_prices[trade.id] = prices[trade.id]
-            
+
             if not trader_prices:
                 continue
-                
+
             closed = trader.check_exits(trader_prices)
-            
+
             for trade in closed:
-                if self.db:
-                    await self._save_trade(trade)
+                db_batch.append(trade)
                 all_closed.append(trade)
-            
+                # P0 fix: Decrement position counter
+                if trade.symbol in self._positions_by_symbol:
+                    self._positions_by_symbol[trade.symbol] = max(
+                        0, self._positions_by_symbol[trade.symbol] - 1
+                    )
+
             # Clean up active_traders if no more open positions
             if not trader.open_positions:
                 del self.active_traders[trader_id]
-        
+
+        # P2: Batch database writes
+        if db_batch and self.db:
+            await self._save_trades_batch(db_batch)
+
         if all_closed:
             logger.info(f"Exit check: {len(all_closed)} trades closed")
-        
+
         return all_closed
-    
+
     async def expire_positions(self, expiry_date: str) -> List[PaperTrade]:
         """Handle expiration for a given date."""
         all_expired = []
-        
+        db_batch = []
+
         for trader_id, trader in list(self.active_traders.items()):
             expired = trader.expire_positions(expiry_date, {})
-            
+
             for trade in expired:
-                if self.db:
-                    await self._save_trade(trade)
+                db_batch.append(trade)
                 all_expired.append(trade)
-            
+                # P0 fix: Decrement position counter
+                if trade.symbol in self._positions_by_symbol:
+                    self._positions_by_symbol[trade.symbol] = max(
+                        0, self._positions_by_symbol[trade.symbol] - 1
+                    )
+
             # Clean up active_traders if no more open positions
             if not trader.open_positions:
                 del self.active_traders[trader_id]
-        
+
+        # P2: Batch database writes
+        if db_batch and self.db:
+            await self._save_trades_batch(db_batch)
+
         if all_expired:
             logger.info(f"Expiration: {len(all_expired)} trades expired for {expiry_date}")
-        
+
         return all_expired
     
     # =========================================================================

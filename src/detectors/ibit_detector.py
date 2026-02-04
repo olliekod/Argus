@@ -7,6 +7,7 @@ Integrates with TradeCalculator for precise recommendations.
 """
 
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional
 import logging
 
@@ -206,8 +207,9 @@ class IBITDetector(BaseDetector):
         }
     
     def _check_market_hours(self) -> bool:
-        """Check if US stock market is open (9:30 AM - 4:00 PM EST)."""
-        now = datetime.now()
+        """Check if US stock market is open (9:30 AM - 4:00 PM ET)."""
+        eastern = ZoneInfo("America/New_York")
+        now = datetime.now(eastern)
         is_weekday = now.weekday() < 5
         market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
         market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)

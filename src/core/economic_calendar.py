@@ -85,14 +85,43 @@ class EconomicCalendar:
     # Map years to their event schedules
     FOMC_DATES = {2025: FOMC_2025, 2026: FOMC_2026}
     CPI_DATES = {2025: CPI_2025, 2026: CPI_2026}
-    
+
     # Jobs Report: First Friday of each month, 8:30 AM EST
     # This is calculated dynamically
-    
+
     def __init__(self):
         """Initialize economic calendar."""
         self._events_cache: Optional[List[EconomicEvent]] = None
+        self._events_cache_year: Optional[int] = None
         logger.info("Economic Calendar initialized")
+
+    @classmethod
+    def _estimate_fomc_dates(cls, year: int) -> List[tuple]:
+        """
+        P3: Estimate FOMC meeting dates for years beyond hardcoded data.
+
+        The Fed typically meets 8 times per year roughly every 6 weeks.
+        This provides a reasonable approximation based on historical patterns.
+        """
+        # Typical FOMC months and approximate Wednesday end dates
+        return [
+            (1, 29), (3, 19), (5, 7), (6, 18),
+            (7, 30), (9, 17), (11, 5), (12, 17),
+        ]
+
+    @classmethod
+    def _estimate_cpi_dates(cls, year: int) -> List[tuple]:
+        """
+        P3: Estimate CPI release dates for years beyond hardcoded data.
+
+        CPI is typically released on the 2nd or 3rd Tuesday-Wednesday
+        of each month. This approximates mid-month.
+        """
+        return [
+            (1, 14), (2, 12), (3, 12), (4, 10),
+            (5, 13), (6, 11), (7, 15), (8, 12),
+            (9, 11), (10, 14), (11, 12), (12, 10),
+        ]
     
     def _get_first_friday(self, year: int, month: int) -> datetime:
         """Get first Friday of a given month."""
@@ -111,13 +140,13 @@ class EconomicCalendar:
         Returns:
             List of EconomicEvent objects sorted by date
         """
-        if self._events_cache:
+        if self._events_cache and self._events_cache_year == year:
             return self._events_cache
-        
+
         events = []
-        
-        # FOMC meetings (announcement at 2 PM EST)
-        fomc_dates = self.FOMC_DATES.get(year, self.FOMC_2026)  # Fallback to 2026
+
+        # P3: Dynamic FOMC dates — use hardcoded if available, else estimate
+        fomc_dates = self.FOMC_DATES.get(year, None) or self._estimate_fomc_dates(year)
         for month, day in fomc_dates:
             try:
                 dt = datetime(year, month, day, 14, 0)  # 2 PM
@@ -131,8 +160,8 @@ class EconomicCalendar:
             except ValueError:
                 continue
         
-        # CPI releases (8:30 AM EST)
-        cpi_dates = self.CPI_DATES.get(year, self.CPI_2026)  # Fallback to 2026
+        # P3: Dynamic CPI dates — use hardcoded if available, else estimate
+        cpi_dates = self.CPI_DATES.get(year, None) or self._estimate_cpi_dates(year)
         for month, day in cpi_dates:
             try:
                 dt = datetime(year, month, day, 8, 30)
@@ -161,7 +190,8 @@ class EconomicCalendar:
         # Sort by date
         events.sort(key=lambda e: e.date)
         self._events_cache = events
-        
+        self._events_cache_year = year
+
         return events
     
     def get_next_event(self, from_date: datetime = None) -> Optional[EconomicEvent]:

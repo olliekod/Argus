@@ -135,15 +135,16 @@ class GPUEngine:
     ) -> float:
         """
         Calculate Probability of Profit using Monte Carlo simulation.
-        
-        Simulates price paths using Geometric Brownian Motion and counts
-        what percentage of paths result in profit.
-        
+
+        P2 fix: Uses Heston stochastic volatility model instead of GBM
+        to account for vol-of-vol, mean reversion, and price-vol correlation.
+        This produces more realistic tail risk estimates for crypto underlyings.
+
         For a put credit spread:
         - Max profit: credit received (if price stays above short strike)
         - Max loss: spread width - credit (if price drops below long strike)
         - Breakeven: short strike - credit
-        
+
         Args:
             S: Current underlying price
             short_strike: Strike sold (higher)
@@ -152,52 +153,26 @@ class GPUEngine:
             T: Time to expiration in years
             sigma: Implied volatility (decimal, e.g., 0.40 for 40%)
             simulations: Number of simulations (default 1M)
-            
+
         Returns:
             Probability of profit as percentage (0-100)
         """
         if not TORCH_AVAILABLE or self._device is None:
-            # Fallback to analytical approximation
             return self._analytical_pop(S, short_strike, credit, T, sigma)
-        
-        simulations = simulations or self.DEFAULT_SIMULATIONS
-        
-        import time
-        start_time = time.perf_counter()
-        
-        # Calculate breakeven price
-        breakeven = short_strike - credit
-        
-        # Generate random price paths using GBM
-        # S_T = S * exp((r - 0.5*sigma^2)*T + sigma*sqrt(T)*Z)
-        # where Z ~ N(0,1)
-        
-        drift = (self.RISK_FREE_RATE - 0.5 * sigma ** 2) * T
-        vol = sigma * math.sqrt(T)
-        
-        # Generate random numbers on GPU
-        z = torch.randn(simulations, device=self._device)
-        
-        # Calculate terminal prices
-        S_T = S * torch.exp(drift + vol * z)
-        
-        # Count profitable outcomes
-        # For put credit spread: profitable if price stays above breakeven
-        profitable = (S_T >= breakeven).float()
-        pop = profitable.mean().item() * 100
-        
-        # Update stats
-        elapsed_ms = (time.perf_counter() - start_time) * 1000
-        self._stats.total_simulations += simulations
-        self._stats.computation_time_ms = elapsed_ms
-        self._stats.simulations_per_second = simulations / (elapsed_ms / 1000)
-        
-        logger.debug(
-            f"Monte Carlo PoP: {pop:.1f}% | {simulations:,} sims in {elapsed_ms:.1f}ms "
-            f"({self._stats.simulations_per_second:,.0f}/sec)"
+
+        # P2: Delegate to Heston model which accounts for stochastic vol
+        v0 = sigma ** 2  # Convert IV to initial variance
+        result = self.monte_carlo_pop_heston(
+            S=S,
+            short_strike=short_strike,
+            long_strike=long_strike,
+            credit=credit,
+            T=T,
+            v0=v0,
+            simulations=simulations,
+            steps=max(10, int(T * 252)),  # Daily steps
         )
-        
-        return pop
+        return result['pop']
     
     def _analytical_pop(
         self,

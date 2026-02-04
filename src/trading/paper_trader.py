@@ -9,6 +9,7 @@ Evaluates signals and logs trades to database.
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, date, timezone
+from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Any
 from enum import Enum
 import json
@@ -191,20 +192,22 @@ class PaperTrader:
         Returns:
             True if should enter trade
         """
-        # 1. Check session filter (time-of-day)
+        # 1. Check session filter (time-of-day) using Eastern Time
         session = self.config.session_filter
         if session != 'any':
             dt = current_time or datetime.now(timezone.utc)
-            # Convert to Eastern Time for session checks
-            # In production this would use the timezone-fixed value
-            # For simplicity here, we assume the provided time reflects market hours
-            hour = dt.hour + (dt.minute / 60)
-            
+            # P1 fix: Convert to Eastern Time for session checks
+            eastern = ZoneInfo("America/New_York")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            dt_et = dt.astimezone(eastern)
+            hour = dt_et.hour + (dt_et.minute / 60)
+
             # Sessions (Eastern Time):
             # morning: 9:30 AM - 11:30 AM (9.5 - 11.5)
             # midday: 11:30 AM - 2:00 PM (11.5 - 14.0)
             # afternoon: 2:00 PM - 4:00 PM (14.0 - 16.0)
-            
+
             if session == 'morning' and not (9.5 <= hour <= 11.5):
                 return False
             elif session == 'midday' and not (11.5 < hour <= 14.0):
@@ -289,7 +292,7 @@ class PaperTrader:
             Created paper trade
         """
         trade = PaperTrade(
-            id=str(uuid.uuid4())[:8],
+            id=str(uuid.uuid4()),
             trader_id=self.config.trader_id,
             strategy_type=self.config.strategy_type.value,
             symbol=symbol,
