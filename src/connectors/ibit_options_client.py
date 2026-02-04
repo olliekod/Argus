@@ -11,6 +11,7 @@ import logging
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Tuple
 from functools import lru_cache
+from zoneinfo import ZoneInfo
 import time
 
 try:
@@ -103,7 +104,8 @@ class IBITOptionsClient:
         Returns:
             List of (expiration_date, dte) tuples
         """
-        today = datetime.now().date()
+        eastern = ZoneInfo("America/New_York")
+        today = datetime.now(eastern).date()
         expirations = self.get_available_expirations()
         
         result = []
@@ -325,14 +327,14 @@ class IBITOptionsClient:
     def get_market_status(self) -> Dict:
         """
         Get current market status and IBIT overview.
-        
+
         Returns:
             Dict with price, IV, IV rank, and market hours status
         """
-        now = datetime.now()
-        
-        # Check if market is open (9:30 AM - 4:00 PM EST, weekdays)
-        # Simplified check - doesn't account for holidays
+        eastern = ZoneInfo("America/New_York")
+        now = datetime.now(eastern)
+
+        # Check if market is open (9:30 AM - 4:00 PM ET, weekdays)
         is_weekday = now.weekday() < 5
         market_open = now.replace(hour=9, minute=30, second=0, microsecond=0)
         market_close = now.replace(hour=16, minute=0, second=0, microsecond=0)

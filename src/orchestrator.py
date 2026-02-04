@@ -659,6 +659,89 @@ class ArgusOrchestrator:
             
             await asyncio.sleep(interval)
     
+    async def _get_current_spread_prices(self) -> Dict[str, Dict[str, float]]:
+        """Get current spread prices for open positions to evaluate exits."""
+        prices: Dict[str, Dict[str, float]] = {}
+        if not self.paper_trader_farm:
+            return prices
+
+        for trader_id, trader in self.paper_trader_farm.active_traders.items():
+            for trade in trader.open_positions:
+                symbol = trade.symbol
+                if symbol not in prices:
+                    prices[symbol] = {}
+
+                current_price = None
+                detector = self.detectors.get(symbol.lower())
+                if detector and hasattr(detector, '_current_ibit_data') and detector._current_ibit_data:
+                    current_price = detector._current_ibit_data.get('price')
+                if current_price is None:
+                    continue
+
+                try:
+                    if '/' not in trade.strikes:
+                        continue
+                    parts = trade.strikes.replace('$', '').split('/')
+                    short_strike = float(parts[0])
+                    long_strike = float(parts[1])
+                    spread_width = short_strike - long_strike
+                    entry_credit = trade.entry_credit
+
+                    if current_price >= short_strike:
+                        otm_pct = (current_price - short_strike) / current_price
+                        decay_factor = max(0.0, 1.0 - otm_pct * 10)
+                        current_value = entry_credit * decay_factor * 0.3
+                    elif current_price <= long_strike:
+                        current_value = spread_width
+                    else:
+                        itm_pct = (short_strike - current_price) / spread_width
+                        current_value = entry_credit + (spread_width - entry_credit) * itm_pct
+
+                    prices[symbol][trade.id] = max(0.0, current_value)
+                except (ValueError, IndexError, ZeroDivisionError):
+                    continue
+
+        return prices
+
+    async def _run_market_close_snapshot(self) -> None:
+        """Take gap risk snapshots at market close (4 PM ET) on weekdays."""
+        if not self.gap_risk_tracker:
+            return
+        eastern = ZoneInfo("America/New_York")
+        last_snapshot_date = None
+
+        while self._running:
+            try:
+                now_et = datetime.now(eastern)
+                today = now_et.date()
+                is_weekday = now_et.weekday() < 5
+                past_close = now_et.hour >= 16
+
+                if is_weekday and past_close and last_snapshot_date != today:
+                    btc_price_data = await self._get_btc_price()
+                    btc_price = btc_price_data.get('price', 0) if btc_price_data else 0
+
+                    ibit_price = None
+                    bito_price = None
+                    ibit_det = self.detectors.get('ibit')
+                    if ibit_det and hasattr(ibit_det, '_current_ibit_data') and ibit_det._current_ibit_data:
+                        ibit_price = ibit_det._current_ibit_data.get('price')
+                    bito_det = self.detectors.get('bito')
+                    if bito_det and hasattr(bito_det, '_current_ibit_data') and bito_det._current_ibit_data:
+                        bito_price = bito_det._current_ibit_data.get('price')
+
+                    if btc_price > 0:
+                        await self.gap_risk_tracker.snapshot_market_close(
+                            btc_price=btc_price,
+                            ibit_price=ibit_price,
+                            bito_price=bito_price,
+                        )
+                        last_snapshot_date = today
+                        self.logger.info(f"Market close snapshot taken: BTC=${btc_price:,.0f}")
+            except Exception as e:
+                self.logger.error(f"Market close snapshot error: {e}")
+            await asyncio.sleep(300)
+
     async def _run_research_farm(self) -> None:
         """Continuously evaluate farm signals for research."""
         if not self.paper_trader_farm:
@@ -667,6 +750,21 @@ class ArgusOrchestrator:
         interval = max(10, interval)
         while self._running and self.research_enabled:
             try:
+                # P0 fix: Check exits on every iteration
+                current_prices = await self._get_current_spread_prices()
+                if current_prices:
+                    closed_trades = await self.paper_trader_farm.check_exits(current_prices)
+                    if closed_trades:
+                        self.logger.info(f"Research farm: {len(closed_trades)} trades closed via exit checks")
+
+                # P0 fix: Check expirations
+                eastern = ZoneInfo("America/New_York")
+                today_et = datetime.now(eastern).strftime('%Y-%m-%d')
+                expired_trades = await self.paper_trader_farm.expire_positions(today_et)
+                if expired_trades:
+                    self.logger.info(f"Research farm: {len(expired_trades)} trades expired")
+
+                # Evaluate new signals
                 conditions = {}
                 if self.conditions_monitor:
                     conditions = await self.conditions_monitor.get_current_conditions()
@@ -788,7 +886,11 @@ class ArgusOrchestrator:
         self._tasks.append(asyncio.create_task(self._health_check()))
         if self.research_enabled:
             self._tasks.append(asyncio.create_task(self._run_research_farm()))
-        
+
+        # P3: Automate gap risk snapshots at market close
+        if self.gap_risk_tracker:
+            self._tasks.append(asyncio.create_task(self._run_market_close_snapshot()))
+
         # Start conditions monitoring (synthesis layer)
         if self.conditions_monitor:
             self._tasks.append(asyncio.create_task(self.conditions_monitor.start_monitoring()))

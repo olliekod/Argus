@@ -59,7 +59,12 @@ class Database:
         """Execute a SQL statement (for external use)."""
         await self._connection.execute(sql, params)
         await self._connection.commit()
-    
+
+    async def execute_many(self, sql: str, params_list: List[tuple]) -> None:
+        """Execute a SQL statement with multiple parameter sets in a single transaction."""
+        await self._connection.executemany(sql, params_list)
+        await self._connection.commit()
+
     async def fetch_one(self, sql: str, params: tuple = ()) -> Optional[tuple]:
         """Fetch one row from a query."""
         cursor = await self._connection.execute(sql, params)
