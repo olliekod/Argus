@@ -26,6 +26,7 @@ from .detectors.volatility_detector import VolatilityDetector
 from .detectors.ibit_detector import IBITDetector
 from .alerts.telegram_bot import TelegramBot
 from .analysis.daily_review import DailyReview
+from .analysis.uniformity_monitor import run_uniformity_check
 from .trading.paper_trader_farm import PaperTraderFarm
 
 
@@ -153,7 +154,8 @@ class ArgusOrchestrator:
             startup_msg += f"<i>Time: {now_et}</i>\n\n"
             startup_msg += f"✅ Detectors: {len(self.detectors)}\n"
             startup_msg += f"✅ GPU Engine: {'Enabled (CUDA)' if getattr(self.paper_trader_farm, 'trader_tensors', None) is not None else 'Disabled (CPU Fallback)'}\n"
-            startup_msg += f"✅ Farm: 400,000 configurations loaded\n\n"
+            farm_count = len(self.paper_trader_farm.trader_configs) if self.paper_trader_farm else 0
+            startup_msg += f"✅ Farm: {farm_count:,} configurations loaded\n\n"
             startup_msg += f"Monitoring active for IBIT, BITO, and Crypto markets."
             await self.telegram.send_message(startup_msg)
         
@@ -338,6 +340,8 @@ class ArgusOrchestrator:
             get_signal_status=self._get_signal_status,
             get_research_status=self._get_research_status,
             get_dashboard=self._get_dashboard,
+            get_zombies=self._get_zombies,
+            get_followed=self._get_followed_traders,
         )
     
     async def _on_conditions_alert(self, snapshot) -> None:
@@ -477,6 +481,41 @@ class ArgusOrchestrator:
             'status': status,
             'data_ready': data_ready,
         }
+
+    async def _get_zombies(self) -> Dict[str, Any]:
+        """Detect and optionally clean zombie positions."""
+        zombies_raw = await self.db.get_zombie_positions(stale_hours=48)
+        now = datetime.now(timezone.utc)
+
+        zombies = []
+        for z in zombies_raw:
+            try:
+                opened = datetime.fromisoformat(z['timestamp'])
+                if opened.tzinfo is None:
+                    opened = opened.replace(tzinfo=timezone.utc)
+                age_hours = (now - opened).total_seconds() / 3600
+            except (ValueError, TypeError):
+                age_hours = 999
+            zombies.append({
+                **z,
+                'age_hours': age_hours,
+            })
+
+        # Auto-clean zombies with past expiry dates
+        to_clean = [z['id'] for z in zombies if z.get('expiry') and z['expiry'] < now.strftime('%Y-%m-%d')]
+        cleaned = 0
+        if to_clean:
+            cleaned = await self.db.mark_zombies(to_clean, reason='zombie_auto_clean')
+
+        return {
+            'zombies': zombies,
+            'total': len(zombies),
+            'cleaned': cleaned,
+        }
+
+    async def _get_followed_traders(self) -> List[Dict]:
+        """Get the followed traders list from DB."""
+        return await self.db.get_followed_traders()
 
     async def _get_dashboard(self) -> Dict[str, Any]:
         """Get full system dashboard data for Telegram /dashboard command."""
@@ -929,11 +968,16 @@ class ArgusOrchestrator:
                     total_entered += entered
                     self._research_last_symbol = signal['symbol']
 
+                    # Alert if any followed traders entered
+                    if trades and self.telegram:
+                        await self._alert_followed_trades(trades, signal)
+
                 self._research_last_entered = total_entered
                 self._today_opened += total_entered
                 self._research_consecutive_errors = 0
                 self._research_last_error = None
                 await self._maybe_promote_configs()
+                await self._run_uniformity_check()
             except Exception as e:
                 self._research_consecutive_errors += 1
                 self._research_last_error = str(e)
@@ -992,7 +1036,81 @@ class ArgusOrchestrator:
                 detector = self.detectors.get(key)
                 if detector:
                     detector.paper_trading_enabled = True
-    
+
+    async def _alert_followed_trades(self, trades: list, signal: dict) -> None:
+        """Send Telegram alert when followed traders enter positions."""
+        if not self.telegram:
+            return
+        try:
+            followed = await self.db.get_followed_traders()
+            if not followed:
+                return
+            followed_ids = {t['trader_id'] for t in followed}
+            matched = [t for t in trades if hasattr(t, 'trader_id') and t.trader_id in followed_ids]
+            if not matched:
+                return
+
+            symbol = signal.get('symbol', '?')
+            for trade in matched[:5]:  # Cap at 5 to avoid spam
+                lines = [
+                    f"⭐ <b>Followed Trader Entry</b>",
+                    "",
+                    f"Trader: <b>{trade.trader_id}</b>",
+                    f"Symbol: {symbol}",
+                    f"Strategy: {trade.strategy}",
+                    f"Strikes: {trade.strikes}",
+                    f"Expiry: {trade.expiry}",
+                    f"Credit: ${trade.entry_credit:.2f}",
+                    "",
+                    f"<i>{datetime.now(ZoneInfo('America/New_York')).strftime('%H:%M:%S %Z')}</i>",
+                ]
+                await self.telegram.send_message("\n".join(lines))
+        except Exception as e:
+            self.logger.warning(f"Follow alert error: {e}")
+
+    async def _run_uniformity_check(self) -> None:
+        """Run uniformity check every N evaluations to detect convergence bugs."""
+        if not hasattr(self, '_uniformity_check_count'):
+            self._uniformity_check_count = 0
+        self._uniformity_check_count += 1
+
+        # Run every 10 evaluations to avoid overhead
+        if self._uniformity_check_count % 10 != 0:
+            return
+
+        if not self.paper_trader_farm:
+            return
+
+        # Gather recent trades from active traders
+        recent_trades = []
+        for trader_id, trader in self.paper_trader_farm.active_traders.items():
+            for pos in trader.open_positions:
+                recent_trades.append({
+                    'trader_id': trader_id,
+                    'strategy_type': pos.strategy if hasattr(pos, 'strategy') else '',
+                    'strikes': pos.strikes if hasattr(pos, 'strikes') else '',
+                    'expiry': pos.expiry if hasattr(pos, 'expiry') else '',
+                    'entry_credit': pos.entry_credit if hasattr(pos, 'entry_credit') else 0,
+                    'contracts': pos.contracts if hasattr(pos, 'contracts') else 0,
+                })
+
+        if len(recent_trades) < 20:
+            return
+
+        try:
+            results = await run_uniformity_check(
+                trades=recent_trades,
+                db=self.db,
+            )
+            alerts = [r for r in results if r.get('is_alert')]
+            if alerts and self.telegram:
+                from .analysis.uniformity_monitor import format_uniformity_report
+                report = format_uniformity_report(results)
+                msg = f"⚠️ <b>Uniformity Alert</b>\n<pre>{report[:1500]}</pre>"
+                await self.telegram.send_message(msg)
+        except Exception as e:
+            self.logger.warning(f"Uniformity check error: {e}")
+
     async def _health_check(self) -> None:
         """Periodic health check and status logging."""
         interval = 300  # 5 minutes

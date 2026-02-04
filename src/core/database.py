@@ -77,7 +77,96 @@ class Database:
     
     async def _create_tables(self) -> None:
         """Create all database tables if they don't exist."""
-        
+
+        # Followed traders list (for best-trader follow feature)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS followed_traders (
+                trader_id TEXT PRIMARY KEY,
+                followed_at TEXT NOT NULL,
+                score REAL,
+                scoring_method TEXT,
+                window_days INTEGER,
+                config_json TEXT
+            )
+        """)
+
+        # Signals table (order intent / signal log)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS trade_signals (
+                id TEXT PRIMARY KEY,
+                timestamp TEXT NOT NULL,
+                trader_id TEXT,
+                strategy_type TEXT,
+                symbol TEXT NOT NULL,
+                direction TEXT,
+                signal_source TEXT,
+                iv_at_signal REAL,
+                warmth_at_signal REAL,
+                pop_at_signal REAL,
+                gap_risk_at_signal REAL,
+                underlying_price REAL,
+                btc_price REAL,
+                btc_iv REAL,
+                conditions_score INTEGER,
+                conditions_label TEXT,
+                strikes TEXT,
+                expiry TEXT,
+                target_credit REAL,
+                bid_price REAL,
+                ask_price REAL,
+                spread_width REAL,
+                contracts INTEGER,
+                outcome TEXT,
+                outcome_reason TEXT
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_ts ON trade_signals(timestamp)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_trader ON trade_signals(trader_id)"
+        )
+
+        # Uniformity monitor snapshots
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS uniformity_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                strategy_type TEXT,
+                variable_name TEXT NOT NULL,
+                unique_count INTEGER,
+                total_count INTEGER,
+                modal_value TEXT,
+                modal_pct REAL,
+                hhi REAL,
+                entropy REAL,
+                is_alert INTEGER DEFAULT 0,
+                alert_reason TEXT
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_uniformity_ts ON uniformity_snapshots(timestamp)"
+        )
+
+        # Daily trader metrics (for per-trader PnL analytics)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS trader_daily_metrics (
+                trader_id TEXT NOT NULL,
+                date TEXT NOT NULL,
+                realized_pnl REAL DEFAULT 0,
+                trades_closed INTEGER DEFAULT 0,
+                trades_opened INTEGER DEFAULT 0,
+                wins INTEGER DEFAULT 0,
+                losses INTEGER DEFAULT 0,
+                peak_pnl REAL DEFAULT 0,
+                max_drawdown REAL DEFAULT 0,
+                PRIMARY KEY (trader_id, date)
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_tdm_date ON trader_daily_metrics(date)"
+        )
+
         # Main detections table
         await self._connection.execute("""
             CREATE TABLE IF NOT EXISTS detections (
@@ -636,6 +725,105 @@ class Database:
         """, (exchange, asset, price_type, cutoff_timestamp))
         row = await cursor.fetchone()
         return dict(row) if row else None
+
+    async def get_per_trader_pnl(self, days: int = 30, min_trades: int = 1) -> List[Dict[str, Any]]:
+        """Get per-trader realized PnL statistics for /pnl analytics.
+
+        Computes per-trader return as realized_pnl / starting_equity.
+        Each trader starts with the same notional ($5000), so return = total_pnl / 5000.
+        """
+        cursor = await self._connection.execute("""
+            SELECT
+                trader_id,
+                strategy_type,
+                COUNT(*) as total_trades,
+                SUM(CASE WHEN status != 'open' THEN 1 ELSE 0 END) as closed_trades,
+                SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) as open_trades,
+                SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as wins,
+                SUM(CASE WHEN realized_pnl <= 0 AND realized_pnl IS NOT NULL THEN 1 ELSE 0 END) as losses,
+                SUM(realized_pnl) as total_pnl,
+                AVG(realized_pnl) as avg_pnl,
+                MIN(realized_pnl) as worst_trade,
+                MAX(realized_pnl) as best_trade
+            FROM paper_trades
+            WHERE timestamp >= datetime('now', ?)
+            GROUP BY trader_id, strategy_type
+            HAVING closed_trades >= ?
+        """, (f"-{days} days", min_trades))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_zombie_positions(self, stale_hours: int = 48) -> List[Dict[str, Any]]:
+        """Find zombie positions: open trades with no updates for stale_hours.
+
+        A zombie position is an open position that is no longer reachable by the
+        strategy lifecycle (e.g., missing close event, orphan order, expired option
+        not settled, process crash before DB update).
+
+        Detection rules:
+        1. Status = 'open' AND timestamp < (now - stale_hours)
+        2. Status = 'open' AND expiry date is in the past
+        """
+        cursor = await self._connection.execute("""
+            SELECT id, trader_id, strategy_type, symbol, timestamp,
+                   strikes, expiry, entry_credit, contracts, status,
+                   market_conditions
+            FROM paper_trades
+            WHERE status = 'open'
+              AND (
+                  timestamp < datetime('now', ?)
+                  OR (expiry IS NOT NULL AND expiry < date('now'))
+              )
+            ORDER BY timestamp ASC
+        """, (f"-{stale_hours} hours",))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def mark_zombies(self, trade_ids: List[str], reason: str = 'zombie_detected') -> int:
+        """Mark a list of trades as zombie (expired with reason)."""
+        if not trade_ids:
+            return 0
+        now = datetime.utcnow().isoformat()
+        placeholders = ','.join(['?'] * len(trade_ids))
+        await self._connection.execute(f"""
+            UPDATE paper_trades
+            SET status = 'expired',
+                close_timestamp = ?,
+                market_conditions = json_set(
+                    COALESCE(market_conditions, '{{}}'),
+                    '$.zombie_reason', ?
+                )
+            WHERE id IN ({placeholders})
+              AND status = 'open'
+        """, (now, reason, *trade_ids))
+        await self._connection.commit()
+        return len(trade_ids)
+
+    async def get_followed_traders(self) -> List[Dict[str, Any]]:
+        """Get the list of followed traders."""
+        cursor = await self._connection.execute(
+            "SELECT * FROM followed_traders ORDER BY score DESC"
+        )
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def set_followed_traders(self, traders: List[Dict[str, Any]]) -> None:
+        """Replace the followed traders list."""
+        await self._connection.execute("DELETE FROM followed_traders")
+        for t in traders:
+            await self._connection.execute("""
+                INSERT INTO followed_traders
+                (trader_id, followed_at, score, scoring_method, window_days, config_json)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                t['trader_id'],
+                t.get('followed_at', datetime.utcnow().isoformat()),
+                t.get('score'),
+                t.get('scoring_method'),
+                t.get('window_days'),
+                t.get('config_json'),
+            ))
+        await self._connection.commit()
 
     async def get_trader_performance(self, days: int = 60) -> List[Dict[str, Any]]:
         """Get aggregated trader performance over a window."""

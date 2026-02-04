@@ -158,9 +158,9 @@ def generate_all_configs(
     all_configs = []
     current_id = 0
     
-    MAX_TRADERS = 400_000
     if full_coverage:
-        # Generate ALL unique combinations for each strategy
+        # Generate ALL unique combinations for each strategy — no artificial cap.
+        # The number of traders = the number of unique parameter combos.
         for strategy in strategies:
             configs = generate_configs_for_strategy(
                 strategy=strategy,
@@ -169,17 +169,8 @@ def generate_all_configs(
             )
             all_configs.extend(configs)
             current_id += len(configs)
-        
-        # Sample down if over cap
-        if len(all_configs) > MAX_TRADERS:
-            random.seed(42)  # Deterministic sampling
-            all_configs = random.sample(all_configs, MAX_TRADERS)
-            # Re-index
-            for i, config in enumerate(all_configs):
-                config.trader_id = f"PT-{i:06d}"
     else:
-        # Distribute total_traders evenly, capped at MAX_TRADERS
-        total_traders = min(total_traders, MAX_TRADERS)
+        # Distribute total_traders evenly across strategies
         traders_per_strategy = total_traders // len(strategies)
         remainder = total_traders % len(strategies)
         

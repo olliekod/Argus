@@ -57,14 +57,17 @@ class TelegramBot:
 
 /dashboard — System health at a glance
 /positions — Open positions + top unrealized P&L
-/pnl — Today's P&L and trade activity
+/pnl — Per-trader P&L stats (mean/median/std/deciles)
 /signals — IBIT/BITO signal conditions
 /status — Conditions score + data freshness
+/zombies — Detect stale/orphaned positions
+/follow — Show followed (best) traders
 /help — This message
 
 <b>Automatic Notifications:</b>
 Market open (9:30 AM ET)
 Market close (4:00 PM ET) + daily summary
+Follow-list trade alerts (when followed traders enter)
 System error alerts (if loops crash)
 
 <b>Trade Confirmation:</b>
@@ -110,6 +113,8 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         self._get_signal_status: Optional[Callable] = None
         self._get_research_status: Optional[Callable] = None
         self._get_dashboard: Optional[Callable] = None
+        self._get_zombies: Optional[Callable] = None
+        self._get_followed: Optional[Callable] = None
         self._on_trade_confirmation: Optional[Callable] = None
         
         # Track last signal for yes/no confirmation
@@ -131,6 +136,8 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         get_signal_status: Optional[Callable] = None,
         get_research_status: Optional[Callable] = None,
         get_dashboard: Optional[Callable] = None,
+        get_zombies: Optional[Callable] = None,
+        get_followed: Optional[Callable] = None,
         on_trade_confirmation: Optional[Callable] = None,
     ):
         """Set callback functions for data access."""
@@ -141,6 +148,8 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         self._get_signal_status = get_signal_status
         self._get_research_status = get_research_status
         self._get_dashboard = get_dashboard
+        self._get_zombies = get_zombies
+        self._get_followed = get_followed
         self._on_trade_confirmation = on_trade_confirmation
     
     async def start_polling(self) -> None:
@@ -158,6 +167,8 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
             self._app.add_handler(CommandHandler("signal_status", self._cmd_signal_status))
             self._app.add_handler(CommandHandler("farm_status", self._cmd_farm_status))
             self._app.add_handler(CommandHandler("research_status", self._cmd_research_status))
+            self._app.add_handler(CommandHandler("zombies", self._cmd_zombies))
+            self._app.add_handler(CommandHandler("follow", self._cmd_follow))
             
             # Add message handler for yes/no responses
             self._app.add_handler(MessageHandler(
@@ -375,39 +386,71 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
             await update.message.reply_text(f"Error: {e}")
     
     async def _cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /pnl command."""
+        """Handle /pnl command — statistically sane per-trader metrics."""
         try:
-            if self._get_pnl:
-                pnl = await self._get_pnl()
-                
-                today_pnl = pnl.get('today_pnl', 0)
-                month_pnl = pnl.get('month_pnl', 0)
-                today_emoji = "🟢" if today_pnl >= 0 else "🔴"
-                month_emoji = "🟢" if month_pnl >= 0 else "🔴"
-                
-                year_pnl = pnl.get('year_pnl', 0)
-                year_emoji = "🟢" if year_pnl >= 0 else "🔴"
-                lines = [
-                    "<b>💰 P&L Summary</b>",
-                    "",
-                    f"{today_emoji} Today: ${today_pnl:+.2f} ({pnl.get('today_pct', 0):+.1f}%)",
-                    f"{month_emoji} Month-to-Date: ${month_pnl:+.2f} ({pnl.get('month_pct', 0):+.1f}%)",
-                    f"{year_emoji} Year-to-Date: ${year_pnl:+.2f} ({pnl.get('year_pct', 0):+.1f}%)",
-                    "",
-                    f"Opened today: {pnl.get('opened_today', 0)}",
-                    f"Closed today: {pnl.get('trades_today', 0)}",
-                    f"MTD closed trades: {pnl.get('trades_mtd', 0)}",
-                    f"Win rate (MTD): {pnl.get('win_rate_mtd', 0):.0f}%",
-                    f"Open positions: {pnl.get('open_positions', 0)}",
-                    "",
-                    f"<i>Paper account: ${pnl.get('account_value', 5000):.2f}</i>",
-                ]
-                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-            else:
+            if not self._get_pnl:
                 await update.message.reply_text(
                     "⚠️ P&L not available. Paper trader not connected.",
                     parse_mode="HTML"
                 )
+                return
+
+            pnl = await self._get_pnl()
+
+            today_pnl = pnl.get('today_pnl', 0)
+            month_pnl = pnl.get('month_pnl', 0)
+            year_pnl = pnl.get('year_pnl', 0)
+            today_emoji = "🟢" if today_pnl >= 0 else "🔴"
+            month_emoji = "🟢" if month_pnl >= 0 else "🔴"
+            year_emoji = "🟢" if year_pnl >= 0 else "🔴"
+
+            lines = [
+                "<b>💰 P&L Summary</b>",
+                "",
+                "<b>Aggregate (all traders):</b>",
+                f"{today_emoji} Today: ${today_pnl:+.2f}",
+                f"{month_emoji} MTD: ${month_pnl:+.2f}",
+                f"{year_emoji} YTD: ${year_pnl:+.2f}",
+                "",
+                f"Opened today: {pnl.get('opened_today', 0)}",
+                f"Closed today: {pnl.get('trades_today', 0)}",
+                f"MTD closed: {pnl.get('trades_mtd', 0)}",
+                f"Win rate (MTD): {pnl.get('win_rate_mtd', 0):.0f}%",
+                f"Open positions: {pnl.get('open_positions', 0)}",
+            ]
+
+            # Per-trader distribution (statistically correct)
+            pt = pnl.get('per_trader')
+            if pt:
+                lines += [
+                    "",
+                    f"<b>Per-Trader Returns ({pt['window_days']}d):</b>",
+                    f"<i>Return = realized PnL / ${pt['starting_balance']:.0f}</i>",
+                    f"  Traders: {pt['active_traders']:,}",
+                    f"  Mean: {pt['mean_return_pct']:+.2f}%",
+                    f"  Median: {pt['median_return_pct']:+.2f}%",
+                    f"  Std Dev: {pt['std_return_pct']:.2f}%",
+                    f"  Best: {pt['best_return_pct']:+.2f}%",
+                    f"  Worst: {pt['worst_return_pct']:+.2f}%",
+                    "",
+                    "<b>Deciles:</b>",
+                    f"  Top 10% avg: {pt['top_decile_avg_pct']:+.2f}%",
+                    f"  Bottom 10% avg: {pt['bottom_decile_avg_pct']:+.2f}%",
+                ]
+                mc = pt.get('most_consistent')
+                if mc:
+                    lines += [
+                        "",
+                        f"<b>Most Consistent:</b>",
+                        f"  {mc['trader_id']} ({mc['strategy']})",
+                        f"  Return: {mc['return_pct']:+.2f}% | "
+                        f"Win: {mc['win_rate']:.0f}% | "
+                        f"Score: {mc['stability_score']:.2f}",
+                    ]
+
+            lines.append("")
+            lines.append(f"<i>Paper account: ${pnl.get('account_value', 5000):.2f}</i>")
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         except Exception as e:
             logger.error(f"Error in /pnl: {e}")
             await update.message.reply_text(f"❌ Error: {e}")
@@ -556,6 +599,100 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
             logger.error(f"Error in /research_status: {e}")
             await update.message.reply_text(f"❌ Error: {e}")
     
+    async def _cmd_zombies(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /zombies — detect and report stale/orphaned positions."""
+        try:
+            if not self._get_zombies:
+                await update.message.reply_text("Zombie detection not available.")
+                return
+            result = await self._get_zombies()
+            zombies = result.get('zombies', [])
+            total = result.get('total', 0)
+            cleaned = result.get('cleaned', 0)
+
+            if total == 0:
+                await update.message.reply_text("✅ No zombie positions detected.")
+                return
+
+            lines = [
+                f"🧟 <b>Zombie Positions Detected: {total}</b>",
+                "",
+            ]
+            if cleaned > 0:
+                lines.append(f"Cleaned: {cleaned} positions marked as expired")
+                lines.append("")
+
+            # Show up to 10 details
+            for z in zombies[:10]:
+                age_hours = z.get('age_hours', 0)
+                lines.append(
+                    f"  {z.get('trader_id', '?')} | "
+                    f"{z.get('symbol', '?')} {z.get('strikes', '?')} | "
+                    f"Opened {age_hours:.0f}h ago | "
+                    f"Expiry: {z.get('expiry', '?')}"
+                )
+            if total > 10:
+                lines.append(f"  ... and {total - 10} more")
+
+            lines += [
+                "",
+                "<i>Zombies are auto-cleaned on restart and by /zombies</i>",
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error in /zombies: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+
+    async def _cmd_follow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /follow — show followed (best) traders."""
+        try:
+            if not self._get_followed:
+                await update.message.reply_text("Follow list not available.")
+                return
+            traders = await self._get_followed()
+            if not traders:
+                await update.message.reply_text(
+                    "No followed traders yet.\n"
+                    "Run <code>python -m scripts.select_best_trader</code> to select.",
+                    parse_mode="HTML",
+                )
+                return
+
+            lines = [
+                f"<b>⭐ Followed Traders ({len(traders)})</b>",
+                "",
+            ]
+            for i, t in enumerate(traders, 1):
+                import json as _json
+                config = {}
+                try:
+                    config = _json.loads(t.get('config_json', '{}') or '{}')
+                except Exception:
+                    pass
+                score = t.get('score', 0)
+                strategy = config.get('strategy_type', '?')
+                ret = config.get('return_pct', 0)
+                wr = config.get('win_rate', 0)
+                trades = config.get('closed_trades', 0)
+                lines.append(
+                    f"{i}. <b>{t['trader_id']}</b> ({strategy})\n"
+                    f"   Score: {score:.4f} | "
+                    f"Ret: {ret:+.2f}% | "
+                    f"WR: {wr:.0f}% | "
+                    f"Trades: {trades}"
+                )
+
+            window = traders[0].get('window_days', '?') if traders else '?'
+            lines += [
+                "",
+                f"<i>Window: {window} days | "
+                f"Method: {traders[0].get('scoring_method', '?')}</i>",
+            ]
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error in /follow: {e}")
+            await update.message.reply_text(f"❌ Error: {e}")
+
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle non-command messages (yes/no trade confirmations)."""
         if not update.message or not update.message.text:
