@@ -320,6 +320,27 @@ class PaperTraderFarm:
         slippage_factor = 0.95
         realistic_credit = raw_credit * slippage_factor
 
+        # Per-strategy strike computation (Bug 2+8 fix)
+        put_strikes_str = signal_data.get('strikes', '')
+        underlying_price = signal_data.get('price', 0)
+        put_short = put_long = 0.0
+        put_spread_width = 2.0
+        try:
+            if '/' in put_strikes_str:
+                parts = put_strikes_str.replace('$', '').split('/')
+                put_short = float(parts[0])
+                put_long = float(parts[1])
+                put_spread_width = abs(put_short - put_long)
+        except (ValueError, IndexError):
+            pass
+
+        # Compute call-side strikes mirrored from underlying price
+        call_short = call_long = 0.0
+        if underlying_price > 0 and put_short > 0:
+            put_distance = underlying_price - put_short
+            call_short = round(underlying_price + put_distance, 1)
+            call_long = round(call_short + put_spread_width, 1)
+
         for idx in entry_indices:
             config = self.trader_configs[idx]
 
@@ -340,18 +361,29 @@ class PaperTraderFarm:
                 active_trader = PaperTrader(config=config, db=self.db)
                 self.active_traders[config.trader_id] = active_trader
 
-            # P1: Differentiate trade construction per config
-            # Compute contracts from position_size_pct and max_risk_dollars
-            base_spread_width = 4.0  # Default $4 spread width
-            try:
-                strikes_str = signal_data.get('strikes', '')
-                if '/' in strikes_str:
-                    parts = strikes_str.replace('$', '').split('/')
-                    base_spread_width = abs(float(parts[0]) - float(parts[1]))
-            except (ValueError, IndexError):
-                pass
+            # Per-strategy strike and credit selection
+            strat = config.strategy_type
+            if strat == StrategyType.BEAR_CALL and call_short > 0:
+                trade_strikes = f"{call_short}/{call_long}"
+                trade_credit = realistic_credit * 0.9  # Calls typically earn less premium
+                trade_spread_width = put_spread_width
+            elif strat == StrategyType.IRON_CONDOR and call_short > 0:
+                trade_strikes = f"{call_short}/{call_long}/{put_short}/{put_long}"
+                trade_credit = realistic_credit * 1.7  # Both legs combined credit
+                trade_spread_width = put_spread_width  # Risk is max of either side
+            elif strat == StrategyType.STRADDLE_SELL and underlying_price > 0:
+                atm = round(underlying_price, 0)
+                trade_strikes = f"{atm}C/{atm}P"
+                trade_credit = realistic_credit * 2.5  # Straddle collects both premiums
+                trade_spread_width = put_spread_width
+            else:
+                # Default: bull_put (original behavior)
+                trade_strikes = put_strikes_str or 'N/A'
+                trade_credit = realistic_credit
+                trade_spread_width = put_spread_width
 
-            max_risk_per_contract = (base_spread_width - realistic_credit) * 100
+            # P1: Differentiate trade construction per config
+            max_risk_per_contract = (trade_spread_width - trade_credit) * 100
             if max_risk_per_contract > 0:
                 risk_budget = min(
                     self.starting_balance * (config.position_size_pct / 100),
@@ -364,9 +396,9 @@ class PaperTraderFarm:
             # Execute paper trade
             trade = active_trader.enter_trade(
                 symbol=symbol,
-                strikes=signal_data.get('strikes', 'N/A'),
+                strikes=trade_strikes,
                 expiry=signal_data.get('expiry', 'N/A'),
-                entry_credit=realistic_credit,
+                entry_credit=trade_credit,
                 contracts=contracts,
                 market_conditions={
                     'iv': signal_data.get('iv'),
@@ -377,8 +409,9 @@ class PaperTraderFarm:
                     'iv_rank': signal_data.get('iv_rank'),
                     'dte': signal_data.get('dte'),
                     'credit': signal_data.get('credit'),
-                    'realistic_credit': realistic_credit,
+                    'realistic_credit': trade_credit,
                     'contracts': contracts,
+                    'strategy': strat.value if hasattr(strat, 'value') else str(strat),
                     'conditions_label': signal_data.get('conditions_label'),
                     'btc_change_pct': signal_data.get('btc_change_pct'),
                     'ibit_change_pct': signal_data.get('ibit_change_pct'),
@@ -889,6 +922,35 @@ class PaperTraderFarm:
             'win_rate_ytd': win_rate_ytd,
             'account_value': self.starting_balance + ytd_stats['realized_pnl'],
         }
+
+    async def get_top_unrealized(self, n: int = 3) -> List[Dict]:
+        """Get top N positions by unrealized P&L for display.
+
+        Scans in-memory active traders and estimates current P&L
+        based on entry credit (since we don't have live option prices
+        for every position, we report the entry credit as the reference).
+        """
+        candidates = []
+        for trader in self.active_traders.values():
+            for trade in trader.open_positions:
+                # Simple unrealized estimate: entry_credit * contracts * 100
+                # represents max profit if the spread expires worthless
+                entry_credit = trade.entry_credit or 0
+                contracts = trade.contracts or 1
+                max_profit = entry_credit * contracts * 100
+                candidates.append({
+                    'trader_id': trade.trader_id,
+                    'strategy': trade.strategy_type,
+                    'symbol': trade.symbol,
+                    'strikes': trade.strikes,
+                    'entry_credit': entry_credit,
+                    'contracts': contracts,
+                    'unrealized_pnl': max_profit * 0.5,  # Estimate 50% of max at open
+                    'pnl_pct': 50.0,  # Placeholder until live pricing
+                    'expiry': trade.expiry,
+                })
+        candidates.sort(key=lambda x: x['unrealized_pnl'], reverse=True)
+        return candidates[:n]
 
     async def get_pnl_for_telegram(self) -> Dict:
         """

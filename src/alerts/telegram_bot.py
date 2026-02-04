@@ -53,26 +53,22 @@ class TelegramBot:
         'warmth': "🌡️",
     }
     
-    HELP_TEXT = """
-<b>📋 Argus Commands</b>
+    HELP_TEXT = """<b>Argus Commands</b>
 
-<b>Status Commands:</b>
-/help — Show this help message
-/status — Current conditions score and system status
-/positions — View open paper trading positions
-/pnl — Today's P&L summary
-/farm_status — Paper trader farm status
-/signal_status — IBIT/BITO signal checklist
-/research_status — Research mode status
+/dashboard — System health at a glance
+/positions — Open positions + top unrealized P&L
+/pnl — Today's P&L and trade activity
+/signals — IBIT/BITO signal conditions
+/status — Conditions score + data freshness
+/help — This message
+
+<b>Automatic Notifications:</b>
+Market open (9:30 AM ET)
+Market close (4:00 PM ET) + daily summary
+System error alerts (if loops crash)
 
 <b>Trade Confirmation:</b>
-Reply <code>yes</code> — Confirm you took the trade
-Reply <code>no</code> — Confirm you skipped the trade
-
-<b>Alert Tiers:</b>
-🚨 Tier 1 — Immediate action needed
-📊 Tier 2 — FYI, no action required
-📝 Tier 3 — Logged only (not sent)
+Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
 """
     
     def __init__(
@@ -113,6 +109,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         self._get_farm_status: Optional[Callable] = None
         self._get_signal_status: Optional[Callable] = None
         self._get_research_status: Optional[Callable] = None
+        self._get_dashboard: Optional[Callable] = None
         self._on_trade_confirmation: Optional[Callable] = None
         
         # Track last signal for yes/no confirmation
@@ -133,6 +130,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         get_farm_status: Optional[Callable] = None,
         get_signal_status: Optional[Callable] = None,
         get_research_status: Optional[Callable] = None,
+        get_dashboard: Optional[Callable] = None,
         on_trade_confirmation: Optional[Callable] = None,
     ):
         """Set callback functions for data access."""
@@ -142,6 +140,7 @@ Reply <code>no</code> — Confirm you skipped the trade
         self._get_farm_status = get_farm_status
         self._get_signal_status = get_signal_status
         self._get_research_status = get_research_status
+        self._get_dashboard = get_dashboard
         self._on_trade_confirmation = on_trade_confirmation
     
     async def start_polling(self) -> None:
@@ -151,11 +150,13 @@ Reply <code>no</code> — Confirm you skipped the trade
             
             # Add command handlers
             self._app.add_handler(CommandHandler("help", self._cmd_help))
+            self._app.add_handler(CommandHandler("dashboard", self._cmd_dashboard))
             self._app.add_handler(CommandHandler("status", self._cmd_status))
             self._app.add_handler(CommandHandler("positions", self._cmd_positions))
             self._app.add_handler(CommandHandler("pnl", self._cmd_pnl))
-            self._app.add_handler(CommandHandler("farm_status", self._cmd_farm_status))
+            self._app.add_handler(CommandHandler("signals", self._cmd_signal_status))
             self._app.add_handler(CommandHandler("signal_status", self._cmd_signal_status))
+            self._app.add_handler(CommandHandler("farm_status", self._cmd_farm_status))
             self._app.add_handler(CommandHandler("research_status", self._cmd_research_status))
             
             # Add message handler for yes/no responses
@@ -191,7 +192,104 @@ Reply <code>no</code> — Confirm you skipped the trade
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command."""
         await update.message.reply_text(self.HELP_TEXT, parse_mode="HTML")
-    
+
+    async def _cmd_dashboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /dashboard — single view of whether everything is working."""
+        try:
+            if not self._get_dashboard:
+                await update.message.reply_text("Dashboard not available.")
+                return
+            d = await self._get_dashboard()
+
+            # Overall health
+            issues = []
+            research_age = d.get('research_loop_age_s')
+            exit_age = d.get('exit_monitor_age_s')
+            health_age = d.get('health_check_age_s')
+            errors = d.get('research_errors', 0)
+
+            if research_age is not None and research_age > 120:
+                issues.append(f"Research loop stale ({research_age}s)")
+            if errors > 0:
+                issues.append(f"Research: {errors} consecutive errors")
+            if exit_age is not None and exit_age > 120:
+                issues.append(f"Exit monitor stale ({exit_age}s)")
+            if health_age is not None and health_age > 600:
+                issues.append(f"Health check stale ({health_age}s)")
+
+            # Data freshness issues
+            for label, info in d.get('data_status', {}).items():
+                if info.get('status') not in ('ok', 'pending'):
+                    issues.append(f"{label} data stale")
+
+            if issues:
+                health_line = "🔴 <b>Issues Detected</b>"
+            else:
+                health_line = "🟢 <b>All Systems Operational</b>"
+
+            market_icon = "🟢 OPEN" if d.get('market_open') else "🔴 CLOSED"
+
+            lines = [
+                f"<b>Argus Dashboard</b>",
+                f"Uptime: {d.get('uptime', '?')} | Market: {market_icon}",
+                health_line,
+            ]
+
+            if issues:
+                for iss in issues:
+                    lines.append(f"  - {iss}")
+                last_err = d.get('research_last_error')
+                if last_err:
+                    lines.append(f"  Last error: <code>{last_err[:120]}</code>")
+            lines.append("")
+
+            # Task heartbeats
+            def _fmt_age(s):
+                if s is None:
+                    return "never"
+                if s < 60:
+                    return f"{s}s ago"
+                return f"{s // 60}m ago"
+
+            r_icon = "✅" if research_age is not None and research_age < 120 and errors == 0 else "⚠️"
+            e_icon = "✅" if exit_age is not None and exit_age < 120 else "⚠️"
+            h_icon = "✅" if health_age is not None and health_age < 600 else "⚠️"
+            lines.append("<b>Tasks:</b>")
+            lines.append(f"  {r_icon} Research Loop ({_fmt_age(research_age)})")
+            lines.append(f"  {e_icon} Exit Monitor ({_fmt_age(exit_age)})")
+            lines.append(f"  {h_icon} Health Check ({_fmt_age(health_age)})")
+
+            # Data feeds
+            lines.append("")
+            lines.append("<b>Data Feeds:</b>")
+            for label, info in d.get('data_status', {}).items():
+                state = info.get('status', 'unknown')
+                icon = "✅" if state == "ok" else ("⏳" if state == "pending" else "⚠️")
+                age = info.get('age_human', '')
+                lines.append(f"  {icon} {label} ({age})" if age else f"  {icon} {label}")
+
+            # Farm
+            lines.append("")
+            lines.append("<b>Farm:</b>")
+            lines.append(f"  Configs: {d.get('total_configs', 0):,}")
+            lines.append(f"  Active traders: {d.get('active_traders', 0):,}")
+            lines.append(f"  Open positions: {d.get('open_positions', 0):,}")
+            lines.append(f"  Today opened/closed/expired: "
+                         f"{d.get('today_opened', 0):,}/"
+                         f"{d.get('today_closed', 0):,}/"
+                         f"{d.get('today_expired', 0):,}")
+
+            lines.append("")
+            lines.append(
+                f"Conditions: {d.get('conditions_score', '?')}/10 "
+                f"{str(d.get('conditions_label', '')).upper()}"
+            )
+
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error in /dashboard: {e}")
+            await update.message.reply_text(f"Error: {e}")
+
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /status command."""
         try:
@@ -240,47 +338,41 @@ Reply <code>no</code> — Confirm you skipped the trade
             await update.message.reply_text(f"❌ Error: {e}")
     
     async def _cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /positions command."""
+        """Handle /positions command — grouped by strategy with top unrealized."""
         try:
-            if self._get_positions:
-                positions = await self._get_positions()
-                
-                if not positions:
-                    await update.message.reply_text("📭 No open paper positions.")
-                    return
-                
-                lines = ["<b>📊 Open Paper Positions</b>", ""]
-                
-                for pos in positions:
-                    # Handle both individual position and grouped formats
-                    if 'count' in pos:
-                        # Grouped format from farm
-                        strategy = pos.get('strategy', 'unknown')
-                        lines.append(
-                            f"🔸 <b>{pos.get('symbol')}</b> {pos.get('sample_strikes', '')}\n"
-                            f"   Strategy: {strategy} | Positions: {pos.get('count')} "
-                            f"across {pos.get('traders_entered', 0)} traders"
-                        )
-                    else:
-                        # Individual position format
-                        pnl = pos.get('unrealized_pnl', 0)
-                        pnl_emoji = "🟢" if pnl >= 0 else "🔴"
-                        lines.append(
-                            f"{pnl_emoji} {pos.get('symbol')} {pos.get('strikes', '')}\n"
-                            f"   Entry: ${pos.get('entry_credit', 0):.2f} | "
-                            f"P&L: ${pnl:+.2f}"
-                        )
-                    lines.append("")
-                
-                await update.message.reply_text("\n".join(lines), parse_mode="HTML")
-            else:
-                await update.message.reply_text(
-                    "⚠️ Positions not available. Paper trader not connected.",
-                    parse_mode="HTML"
-                )
+            if not self._get_positions:
+                await update.message.reply_text("Positions not available.")
+                return
+            positions = await self._get_positions()
+            if not positions:
+                await update.message.reply_text("No open paper positions.")
+                return
+
+            # Count total
+            total = sum(p.get('count', 1) for p in positions)
+            lines = [f"<b>Open Positions</b> ({total:,} total)", ""]
+
+            # Strategy breakdown
+            lines.append("<b>By Strategy:</b>")
+            for pos in positions:
+                strategy = pos.get('strategy', 'unknown')
+                count = pos.get('count', 1)
+                strikes = pos.get('sample_strikes', '')
+                lines.append(f"  {pos.get('symbol')} {strategy}: {count:,} @ {strikes}")
+            lines.append("")
+
+            # Top unrealized gains (from research status if available)
+            if self._get_research_status:
+                try:
+                    research = await self._get_research_status()
+                    farm_status = research.get('status', {})
+                except Exception:
+                    farm_status = {}
+
+            await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         except Exception as e:
             logger.error(f"Error in /positions: {e}")
-            await update.message.reply_text(f"❌ Error: {e}")
+            await update.message.reply_text(f"Error: {e}")
     
     async def _cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /pnl command."""
@@ -393,9 +485,9 @@ Reply <code>no</code> — Confirm you skipped the trade
                              f"{'✅' if checklist.get('iv_rank_ok') else '❌'})")
                 cooldown = checklist.get('cooldown_remaining_hours')
                 if cooldown is None:
-                    lines.append("• Cooldown: ✅ none")
+                    lines.append("• Alert Cooldown: ✅ none")
                 else:
-                    lines.append(f"• Cooldown: {cooldown:.2f}h remaining")
+                    lines.append(f"• Alert Cooldown: {cooldown:.2f}h (live alerts only, farm unaffected)")
                 data_ready = "✅" if checklist.get('has_btc_iv') and checklist.get('has_ibit_data') else "❌"
                 lines.append(f"• Data Ready: {data_ready}")
                 lines.append("")
@@ -430,23 +522,32 @@ Reply <code>no</code> — Confirm you skipped the trade
                     last_run = dt.astimezone(ZoneInfo("America/New_York")).strftime("%Y-%m-%d %H:%M:%S %Z")
             aggregate = status.get("aggregate", {})
             farm_status = status.get("status", {})
+            errors = status.get('consecutive_errors', 0)
+            error_icon = "✅" if errors == 0 else "⚠️"
             lines = [
-                "<b>🧪 Research Mode Status</b>",
+                "<b>Research Mode Status</b>",
                 "",
                 f"Enabled: {'✅' if status.get('research_enabled') else '❌'}",
+                f"Loop: {error_icon} ({errors} errors)" if errors else f"Loop: ✅ healthy",
                 f"Interval: {status.get('evaluation_interval_seconds', 0)}s",
                 f"Last run: {last_run or 'N/A'}",
                 f"Last symbol: {status.get('last_symbol') or 'N/A'}",
                 f"Entered last run: {status.get('last_entered', 0):,}",
                 f"Data ready: {'✅' if status.get('data_ready') else '❌'}",
+            ]
+            if errors > 0:
+                last_err = status.get('last_error', '')
+                if last_err:
+                    lines.append(f"Last error: <code>{last_err[:150]}</code>")
+            lines += [
                 "",
-                "<b>📊 Aggregate</b>",
+                "<b>Aggregate</b>",
                 f"Total trades: {aggregate.get('total_trades', 0):,}",
                 f"Win rate: {aggregate.get('win_rate', 0):.1f}%",
                 f"Realized P&L: ${aggregate.get('realized_pnl', 0):+.2f}",
                 f"Open positions: {aggregate.get('open_positions', 0)}",
                 "",
-                "<b>👥 Farm</b>",
+                "<b>Farm</b>",
                 f"Active traders: {farm_status.get('active_traders', 0):,}",
                 f"Promoted traders: {farm_status.get('promoted_traders', 0):,}",
             ]
