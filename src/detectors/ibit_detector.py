@@ -124,10 +124,14 @@ class IBITDetector(BaseDetector):
         drop_score = abs(ibit_change) / abs(self.drop_threshold) if ibit_change < 0 else 0
         combined_score = (iv_score + drop_score) / 2 if (self.btc_iv_threshold and self.drop_threshold) else 0
 
+        # Cooldown only applies to live alert path (analyze()), NOT research farm
         cooldown_remaining = None
+        cooldown_note = 'research_bypasses'
         if self._last_alert_time:
             elapsed = (datetime.now(timezone.utc) - self._last_alert_time).total_seconds() / 3600
-            cooldown_remaining = max(0.0, self.cooldown_hours - elapsed)
+            remaining = max(0.0, self.cooldown_hours - elapsed)
+            if remaining > 0:
+                cooldown_remaining = remaining
 
         iv_rank = None
         try:
@@ -152,6 +156,7 @@ class IBITDetector(BaseDetector):
             'iv_rank_threshold': self.iv_rank_threshold,
             'iv_rank_ok': iv_rank is not None and iv_rank >= self.iv_rank_threshold,
             'cooldown_remaining_hours': cooldown_remaining,
+            'cooldown_note': cooldown_note,
             'has_btc_iv': bool(self._current_btc_iv),
             'has_ibit_data': bool(self._current_ibit_data),
         }
@@ -188,6 +193,7 @@ class IBITDetector(BaseDetector):
 
         return {
             'symbol': self.symbol,
+            'price': recommendation.underlying_price,
             'iv': self._current_btc_iv,
             'warmth': conditions_score,
             'dte': recommendation.dte,

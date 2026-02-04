@@ -101,12 +101,23 @@ class ArgusOrchestrator:
         self._research_last_run: Optional[datetime] = None
         self._research_last_symbol: Optional[str] = None
         self._research_last_entered: int = 0
+        self._research_last_error: Optional[str] = None
+        self._research_consecutive_errors: int = 0
+        self._exit_monitor_last_run: Optional[datetime] = None
         self._research_promoted: bool = False
         self.research_config: Dict[str, Any] = self.config.get('research', {})
         self.research_enabled = self.research_config.get('enabled', False)
         self.research_alerts_enabled = self.research_config.get('alerts_enabled', False)
         self.research_daily_review_enabled = self.research_config.get('daily_review_enabled', False)
-        
+
+        # Market session tracking
+        self._market_was_open: bool = False
+        self._last_market_open_date = None
+        self._last_market_close_date = None
+        self._today_opened: int = 0
+        self._today_closed: int = 0
+        self._today_expired: int = 0
+
         self.logger.info("Argus Orchestrator initialized")
     
     async def setup(self) -> None:
@@ -131,6 +142,9 @@ class ArgusOrchestrator:
         # Initialize detectors
         await self._setup_detectors()
         
+        # Clean up zombie positions from previous runs (Bug 3 fix)
+        await self._cleanup_zombie_positions()
+
         # Send Startup Notification
         if self.telegram:
             eastern = ZoneInfo("America/New_York")
@@ -323,6 +337,7 @@ class ArgusOrchestrator:
             get_farm_status=self._get_farm_status,
             get_signal_status=self._get_signal_status,
             get_research_status=self._get_research_status,
+            get_dashboard=self._get_dashboard,
         )
     
     async def _on_conditions_alert(self, snapshot) -> None:
@@ -456,9 +471,72 @@ class ArgusOrchestrator:
             'last_run': self._research_last_run.isoformat() if self._research_last_run else None,
             'last_symbol': self._research_last_symbol,
             'last_entered': self._research_last_entered,
+            'consecutive_errors': self._research_consecutive_errors,
+            'last_error': self._research_last_error,
             'aggregate': aggregate,
             'status': status,
             'data_ready': data_ready,
+        }
+
+    async def _get_dashboard(self) -> Dict[str, Any]:
+        """Get full system dashboard data for Telegram /dashboard command."""
+        now = datetime.now(timezone.utc)
+        eastern = ZoneInfo("America/New_York")
+        now_et = datetime.now(eastern)
+        uptime_s = int((now - self._start_time).total_seconds())
+        hours, remainder = divmod(uptime_s, 3600)
+        minutes, _ = divmod(remainder, 60)
+
+        # Task health
+        def _age(ts):
+            if not ts:
+                return None
+            return int((now - ts).total_seconds())
+
+        research_age = _age(self._research_last_run)
+        exit_age = _age(self._exit_monitor_last_run)
+        health_age = _age(self._last_health_check)
+
+        # Data freshness
+        data_status = await self._get_data_status()
+
+        # Farm stats
+        farm = self.paper_trader_farm
+        active_traders = len(farm.active_traders) if farm else 0
+        open_positions = sum(
+            len(t.open_positions) for t in farm.active_traders.values()
+        ) if farm else 0
+        total_configs = len(farm.trader_configs) if farm else 0
+
+        # Market status
+        is_weekday = now_et.weekday() < 5
+        market_open_time = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+        market_close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+        market_open = is_weekday and market_open_time <= now_et <= market_close_time
+
+        # Conditions
+        conditions = {}
+        if self.conditions_monitor:
+            conditions = await self.conditions_monitor.get_current_conditions()
+
+        return {
+            'uptime': f"{hours}h {minutes}m",
+            'market_open': market_open,
+            'market_time_et': now_et.strftime('%H:%M %Z'),
+            'conditions_score': conditions.get('score', 'N/A'),
+            'conditions_label': conditions.get('warmth_label', 'N/A'),
+            'data_status': data_status,
+            'research_loop_age_s': research_age,
+            'research_errors': self._research_consecutive_errors,
+            'research_last_error': self._research_last_error,
+            'exit_monitor_age_s': exit_age,
+            'health_check_age_s': health_age,
+            'total_configs': total_configs,
+            'active_traders': active_traders,
+            'open_positions': open_positions,
+            'today_opened': self._today_opened,
+            'today_closed': self._today_closed,
+            'today_expired': self._today_expired,
         }
 
     async def _get_data_status(self) -> Dict[str, Dict[str, Optional[str]]]:
@@ -742,29 +820,79 @@ class ArgusOrchestrator:
                 self.logger.error(f"Market close snapshot error: {e}")
             await asyncio.sleep(300)
 
-    async def _run_research_farm(self) -> None:
-        """Continuously evaluate farm signals for research."""
+    async def _cleanup_zombie_positions(self) -> None:
+        """Close orphaned positions from previous runs that are still 'open' in DB."""
+        try:
+            row = await self.db.fetch_one(
+                "SELECT COUNT(*) as cnt FROM paper_trades WHERE status = 'open'"
+            )
+            zombie_count = row['cnt'] if row else 0
+            if zombie_count == 0:
+                return
+
+            self.logger.info(f"Found {zombie_count:,} zombie positions from previous runs, marking as expired")
+            await self.db.execute(
+                """UPDATE paper_trades SET status = 'expired',
+                   close_reason = 'system_restart_cleanup',
+                   closed_at = ?
+                   WHERE status = 'open'""",
+                (datetime.now(timezone.utc).isoformat(),)
+            )
+            self.logger.info(f"Cleaned up {zombie_count:,} zombie positions")
+        except Exception as e:
+            self.logger.error(f"Failed to cleanup zombie positions: {e}")
+
+    async def _run_exit_monitor(self) -> None:
+        """Independent task: check exits and expirations every 30 seconds.
+
+        Decoupled from the research signal loop so exits still happen even
+        if signal evaluation crashes.
+        """
         if not self.paper_trader_farm:
             return
-        interval = int(self.research_config.get('evaluation_interval_seconds', 60))
-        interval = max(10, interval)
-        while self._running and self.research_enabled:
+        interval = 30
+
+        while self._running:
             try:
-                # P0 fix: Check exits on every iteration
+                # Check exits based on current prices
                 current_prices = await self._get_current_spread_prices()
                 if current_prices:
                     closed_trades = await self.paper_trader_farm.check_exits(current_prices)
                     if closed_trades:
-                        self.logger.info(f"Research farm: {len(closed_trades)} trades closed via exit checks")
+                        n = len(closed_trades)
+                        self._today_closed += n
+                        self.logger.info(f"Exit monitor: {n} trades closed")
 
-                # P0 fix: Check expirations
+                # Check expirations
                 eastern = ZoneInfo("America/New_York")
                 today_et = datetime.now(eastern).strftime('%Y-%m-%d')
                 expired_trades = await self.paper_trader_farm.expire_positions(today_et)
                 if expired_trades:
-                    self.logger.info(f"Research farm: {len(expired_trades)} trades expired")
+                    n = len(expired_trades)
+                    self._today_expired += n
+                    self.logger.info(f"Exit monitor: {n} trades expired")
 
-                # Evaluate new signals
+                self._exit_monitor_last_run = datetime.now(timezone.utc)
+            except Exception as e:
+                self.logger.error(f"Exit monitor error: {e}")
+            await asyncio.sleep(interval)
+
+    async def _run_research_farm(self) -> None:
+        """Continuously evaluate farm signals for research.
+
+        Exit checking is handled by the separate _run_exit_monitor task,
+        so this loop only handles signal evaluation and new entries.
+        """
+        if not self.paper_trader_farm:
+            return
+        interval = int(self.research_config.get('evaluation_interval_seconds', 60))
+        interval = max(10, interval)
+
+        while self._running and self.research_enabled:
+            # Always update the timestamp so we can see the loop is alive
+            self._research_last_run = datetime.now(timezone.utc)
+            try:
+                # Gather market conditions
                 conditions = {}
                 if self.conditions_monitor:
                     conditions = await self.conditions_monitor.get_current_conditions()
@@ -779,27 +907,49 @@ class ArgusOrchestrator:
                     detector = self.detectors.get(key)
                     if not detector:
                         continue
-                    signal = detector.get_research_signal(
-                        conditions_score=conditions_score,
-                        conditions_label=conditions_label,
-                        btc_change_24h_pct=btc_change,
-                        btc_change_5d_pct=btc_change_5d,
-                        timestamp=timestamp,
-                    )
+                    try:
+                        signal = await asyncio.to_thread(
+                            detector.get_research_signal,
+                            conditions_score=conditions_score,
+                            conditions_label=conditions_label,
+                            btc_change_24h_pct=btc_change,
+                            btc_change_5d_pct=btc_change_5d,
+                            timestamp=timestamp,
+                        )
+                    except Exception as e:
+                        self.logger.error(f"Signal generation failed for {key}: {e}")
+                        continue
                     if not signal:
                         continue
                     trades = await self.paper_trader_farm.evaluate_signal(
                         symbol=signal['symbol'],
                         signal_data=signal,
                     )
-                    total_entered += len(trades)
+                    entered = len(trades)
+                    total_entered += entered
                     self._research_last_symbol = signal['symbol']
 
-                self._research_last_run = datetime.now(timezone.utc)
                 self._research_last_entered = total_entered
+                self._today_opened += total_entered
+                self._research_consecutive_errors = 0
+                self._research_last_error = None
                 await self._maybe_promote_configs()
             except Exception as e:
-                self.logger.error(f"Research farm loop error: {e}")
+                self._research_consecutive_errors += 1
+                self._research_last_error = str(e)
+                self.logger.error(
+                    f"Research farm error (#{self._research_consecutive_errors}): {e}"
+                )
+                # Alert via telegram if errors persist
+                if self._research_consecutive_errors == 5 and self.telegram:
+                    try:
+                        await self.telegram.send_message(
+                            f"⚠️ <b>Research Loop Degraded</b>\n"
+                            f"5 consecutive errors.\n"
+                            f"Last error: <code>{str(e)[:200]}</code>"
+                        )
+                    except Exception:
+                        pass
             await asyncio.sleep(interval)
 
     async def _maybe_promote_configs(self) -> None:
@@ -846,27 +996,143 @@ class ArgusOrchestrator:
     async def _health_check(self) -> None:
         """Periodic health check and status logging."""
         interval = 300  # 5 minutes
-        
+
         while self._running:
-            # Log health status
-            status = {
-                'bybit_connected': self.bybit_ws.is_connected if self.bybit_ws else False,
-                'detectors_active': len(self.detectors),
-                'timestamp': datetime.now(timezone.utc).isoformat(),
-            }
-            
-            self.logger.info(f"Health check: {status}")
-            self._last_health_check = datetime.now(timezone.utc)
-            await self.db.insert_health_check(
-                component="bybit_ws",
-                status="connected" if status['bybit_connected'] else "disconnected",
-            )
-            await self.db.insert_health_check(
-                component="detectors",
-                status=f"active_{status['detectors_active']}",
-            )
-            
+            try:
+                status = {
+                    'bybit_connected': self.bybit_ws.is_connected if self.bybit_ws else False,
+                    'detectors_active': len(self.detectors),
+                    'timestamp': datetime.now(timezone.utc).isoformat(),
+                }
+
+                self.logger.info(f"Health check: {status}")
+                self._last_health_check = datetime.now(timezone.utc)
+                await self.db.insert_health_check(
+                    component="bybit_ws",
+                    status="connected" if status['bybit_connected'] else "disconnected",
+                )
+                await self.db.insert_health_check(
+                    component="detectors",
+                    status=f"active_{status['detectors_active']}",
+                )
+            except Exception as e:
+                self.logger.error(f"Health check error: {e}")
+
             await asyncio.sleep(interval)
+
+    async def _run_market_session_monitor(self) -> None:
+        """Monitor market open/close transitions and send notifications."""
+        eastern = ZoneInfo("America/New_York")
+
+        while self._running:
+            try:
+                now_et = datetime.now(eastern)
+                today = now_et.date()
+                is_weekday = now_et.weekday() < 5
+                market_open_time = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+                market_close_time = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+                is_open = is_weekday and market_open_time <= now_et <= market_close_time
+
+                # Detect market OPEN transition
+                if is_open and not self._market_was_open and self._last_market_open_date != today:
+                    self._last_market_open_date = today
+                    self._today_opened = 0
+                    self._today_closed = 0
+                    self._today_expired = 0
+                    await self._send_market_open_notification(now_et)
+
+                # Detect market CLOSE transition
+                if not is_open and self._market_was_open and self._last_market_close_date != today:
+                    self._last_market_close_date = today
+                    await self._send_market_close_notification(now_et)
+
+                self._market_was_open = is_open
+            except Exception as e:
+                self.logger.error(f"Market session monitor error: {e}")
+            await asyncio.sleep(30)
+
+    async def _send_market_open_notification(self, now_et: datetime) -> None:
+        """Send notification when market opens."""
+        if not self.telegram:
+            return
+        conditions = {}
+        if self.conditions_monitor:
+            conditions = await self.conditions_monitor.get_current_conditions()
+        score = conditions.get('score', 'N/A')
+        label = conditions.get('warmth_label', 'N/A')
+        btc_iv = conditions.get('btc_iv', 'N/A')
+
+        active = len(self.paper_trader_farm.active_traders) if self.paper_trader_farm else 0
+        open_positions = sum(
+            len(t.open_positions) for t in self.paper_trader_farm.active_traders.values()
+        ) if self.paper_trader_farm else 0
+
+        lines = [
+            f"🔔 <b>Market Open</b> — {now_et.strftime('%b %d, %Y')}",
+            "",
+            f"Conditions: {score}/10 {str(label).upper()}",
+            f"BTC IV: {btc_iv}%",
+        ]
+
+        ibit_det = self.detectors.get('ibit')
+        if ibit_det and hasattr(ibit_det, '_current_ibit_data') and ibit_det._current_ibit_data:
+            lines.append(f"IBIT: ${ibit_det._current_ibit_data.get('price', 0):.2f}")
+        bito_det = self.detectors.get('bito')
+        if bito_det and hasattr(bito_det, '_current_ibit_data') and bito_det._current_ibit_data:
+            lines.append(f"BITO: ${bito_det._current_ibit_data.get('price', 0):.2f}")
+
+        lines += [
+            "",
+            f"Farm: {len(self.paper_trader_farm.trader_configs):,} configs" if self.paper_trader_farm else "Farm: N/A",
+            f"Active traders: {active:,}",
+            f"Open positions: {open_positions:,}",
+        ]
+        try:
+            await self.telegram.send_message("\n".join(lines))
+        except Exception as e:
+            self.logger.error(f"Failed to send market open notification: {e}")
+
+    async def _send_market_close_notification(self, now_et: datetime) -> None:
+        """Send end-of-day summary when market closes."""
+        if not self.telegram:
+            return
+
+        farm = self.paper_trader_farm
+        aggregate = farm.get_aggregate_pnl() if farm else {}
+        top_gains = await farm.get_top_unrealized(n=3) if farm else []
+
+        lines = [
+            f"🔔 <b>Market Close</b> — {now_et.strftime('%b %d, %Y')}",
+            "",
+            "<b>Today's Activity:</b>",
+            f"• Opened: {self._today_opened:,}",
+            f"• Closed: {self._today_closed:,}",
+            f"• Expired: {self._today_expired:,}",
+            f"• Realized P&L: ${aggregate.get('realized_pnl', 0):+.2f}",
+            "",
+        ]
+
+        if top_gains:
+            lines.append("<b>Top 3 Unrealized Gains:</b>")
+            for i, g in enumerate(top_gains, 1):
+                lines.append(
+                    f"{i}. {g['strategy']} {g['symbol']} {g['strikes']} — "
+                    f"${g['unrealized_pnl']:+.2f} ({g['pnl_pct']:+.1f}%)"
+                )
+            lines.append("")
+
+        conditions = {}
+        if self.conditions_monitor:
+            conditions = await self.conditions_monitor.get_current_conditions()
+        lines.append(
+            f"Conditions at close: {conditions.get('score', 'N/A')}/10 "
+            f"{str(conditions.get('warmth_label', 'N/A')).upper()}"
+        )
+
+        try:
+            await self.telegram.send_message("\n".join(lines))
+        except Exception as e:
+            self.logger.error(f"Failed to send market close notification: {e}")
     
     async def run(self) -> None:
         """Start all components and run main loop."""
@@ -884,10 +1150,18 @@ class ArgusOrchestrator:
         
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._health_check()))
+
+        # Exit monitor runs independently of research loop
+        if self.paper_trader_farm:
+            self._tasks.append(asyncio.create_task(self._run_exit_monitor()))
+
         if self.research_enabled:
             self._tasks.append(asyncio.create_task(self._run_research_farm()))
 
-        # P3: Automate gap risk snapshots at market close
+        # Market session monitor (open/close notifications)
+        self._tasks.append(asyncio.create_task(self._run_market_session_monitor()))
+
+        # Automate gap risk snapshots at market close
         if self.gap_risk_tracker:
             self._tasks.append(asyncio.create_task(self._run_market_close_snapshot()))
 
