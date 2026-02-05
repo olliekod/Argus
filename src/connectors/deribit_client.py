@@ -12,7 +12,7 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from ..core.logger import get_connector_logger
-from ..core.events import QuoteEvent, TOPIC_MARKET_QUOTES
+from ..core.events import QuoteEvent, MetricEvent, TOPIC_MARKET_QUOTES, TOPIC_MARKET_METRICS
 
 logger = get_connector_logger('deribit')
 
@@ -311,21 +311,32 @@ class DeribitClient:
             'timestamp': datetime.utcnow().isoformat(),
         }
 
-        # Publish QuoteEvent for the underlying index
+        # Publish QuoteEvent for the underlying index (price-only)
         if self._event_bus is not None:
             import time as _time
             try:
+                now = _time.time()
                 quote = QuoteEvent(
                     symbol=f"{currency}-INDEX",
                     bid=index_price,
                     ask=index_price,
                     mid=index_price,
                     last=index_price,
-                    timestamp=_time.time(),
+                    timestamp=now,
                     source='deribit',
-                    extra={'atm_iv': avg_atm_iv, 'sample_size': len(atm_iv_values)},
                 )
                 self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
+
+                # Publish ATM IV as a separate metric
+                if avg_atm_iv is not None:
+                    self._event_bus.publish(TOPIC_MARKET_METRICS, MetricEvent(
+                        symbol=f"{currency}-INDEX",
+                        metric='atm_iv',
+                        value=avg_atm_iv,
+                        timestamp=now,
+                        source='deribit',
+                        extra={'sample_size': len(atm_iv_values)},
+                    ))
             except Exception as e:
                 logger.error(f"QuoteEvent publish error: {e}")
 
