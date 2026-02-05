@@ -7,8 +7,8 @@ Subscribes to ``market.quotes`` and aggregates tick data into
 
 Rules
 -----
-* Use exchange ``timestamp`` when available; fall back to
-  ``receive_time`` otherwise.
+* Use exchange ``timestamp`` only (no wall-clock fallback).
+* Reject quotes missing a valid ``source_ts``.
 * Bars are aligned to the **start** of each UTC minute
   (e.g. 12:03:00.000 – 12:03:59.999 → bar timestamp 12:03:00).
 * When a new minute begins, the completed bar is published to
@@ -135,7 +135,9 @@ class BarBuilder:
         self._quotes_received_by_symbol: Dict[str, int] = {}
         self._bars_emitted_window_minutes = 60
         self._bars_emitted_timestamps_by_symbol: Dict[str, Deque[float]] = {}
-        self._bar_invariant_violations = 0
+        self._invariant_violation_count = 0
+        self._quotes_rejected_total = 0
+        self._quotes_rejected_by_symbol: Dict[str, int] = {}
         self._start_time = time.time()
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
         bus.subscribe(TOPIC_SYSTEM_MINUTE_TICK, self._on_minute_tick)
@@ -166,14 +168,20 @@ class BarBuilder:
 
     def _on_quote(self, event: QuoteEvent) -> None:
         """Ingest a quote and build / emit bars."""
-        # Prefer exchange timestamp; fall back to receive_time
-        ts = event.timestamp if event.timestamp and event.timestamp > 0 else event.receive_time
+        if not event.timestamp or event.timestamp <= 0:
+            self._reject_quote(event, "missing/invalid timestamp")
+            return
+        if not event.source_ts or event.source_ts <= 0:
+            self._reject_quote(event, "missing/invalid source_ts")
+            return
+
+        ts = event.timestamp
         minute = _minute_floor(ts)
         price = event.last if event.last else event.mid
         if price <= 0:
             return
 
-        source_ts = getattr(event, 'source_ts', 0.0) or event.timestamp
+        source_ts = event.source_ts
 
         self._quotes_received_by_symbol[event.symbol] = (
             self._quotes_received_by_symbol.get(event.symbol, 0) + 1
@@ -260,7 +268,7 @@ class BarBuilder:
             valid = False
 
         if not valid:
-            self._bar_invariant_violations += 1
+            self._invariant_violation_count += 1
 
         return valid
 
@@ -269,10 +277,11 @@ class BarBuilder:
     def _emit_bar(self, symbol: str, acc: _BarAccumulator,
                   close_reason: CloseReason = CloseReason.MINUTE_BOUNDARY) -> BarEvent:
         # Enforce invariants before publishing
-        self._enforce_invariants(acc)
+        valid = self._enforce_invariants(acc)
 
         # Collect late-tick count for this symbol and reset
         late_dropped = self._late_ticks_dropped_by_symbol.get(symbol, 0)
+        self._late_ticks_dropped_by_symbol[symbol] = 0
 
         now = time.time()
         bar = BarEvent(
@@ -292,6 +301,7 @@ class BarBuilder:
             late_ticks_dropped=late_dropped,
             close_reason=int(close_reason),
             source_ts=acc.first_source_ts,
+            repaired=not valid,
             event_ts=now,
         )
         self._bus.publish(TOPIC_MARKET_BARS, bar)
@@ -343,7 +353,9 @@ class BarBuilder:
             health=health,
             extra={
                 "bars_emitted_total": self._bars_emitted_total,
-                "bar_invariant_violations": self._bar_invariant_violations,
+                "bar_invariant_violations": self._invariant_violation_count,
+                "invariant_violation_count": self._invariant_violation_count,
+                "quotes_rejected_total": self._quotes_rejected_total,
             },
         )
         self._bus.publish(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, hb)
@@ -359,7 +371,7 @@ class BarBuilder:
             late_ticks_total = self._late_ticks_dropped_total
             late_ticks_by_symbol = dict(self._late_ticks_dropped_by_symbol)
             quotes_received_by_symbol = dict(self._quotes_received_by_symbol)
-            invariant_violations = self._bar_invariant_violations
+            invariant_violations = self._invariant_violation_count
             bars_emitted_recent_by_symbol = {
                 symbol: sum(1 for ts in timestamps if (now - ts) <= (self._bars_emitted_window_minutes * 60))
                 for symbol, timestamps in self._bars_emitted_timestamps_by_symbol.items()
@@ -407,7 +419,22 @@ class BarBuilder:
                 "late_ticks_dropped_total": late_ticks_total,
                 "late_ticks_dropped_by_symbol": late_ticks_by_symbol,
                 "quotes_received_by_symbol": quotes_received_by_symbol,
+                "quotes_rejected_total": self._quotes_rejected_total,
+                "quotes_rejected_by_symbol": dict(self._quotes_rejected_by_symbol),
                 "active_symbols_count": len(active_symbols),
                 "bar_invariant_violations": invariant_violations,
+                "invariant_violation_count": invariant_violations,
             },
+        )
+
+    def _reject_quote(self, event: QuoteEvent, reason: str) -> None:
+        self._quotes_rejected_total += 1
+        self._quotes_rejected_by_symbol[event.symbol] = (
+            self._quotes_rejected_by_symbol.get(event.symbol, 0) + 1
+        )
+        logger.warning(
+            "Rejected quote for %s (%s): %s",
+            event.symbol,
+            event.source,
+            reason,
         )

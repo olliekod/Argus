@@ -91,6 +91,7 @@ class BarEvent:
     * ``late_ticks_dropped`` — ticks discarded because they arrived
       after this bar's minute had already been emitted.
     * ``close_reason`` — why this bar was closed (see :class:`CloseReason`).
+    * ``repaired`` — True if invariants were repaired deterministically.
     """
     symbol: str
     open: float
@@ -108,6 +109,7 @@ class BarEvent:
     late_ticks_dropped: int = 0    # ticks dropped for this symbol since last bar
     close_reason: int = 0          # CloseReason enum value
     source_ts: float = 0.0        # bar-level source timestamp (= first_source_ts)
+    repaired: bool = False
     event_ts: float = field(default_factory=time.time)
     receive_time: float = field(default_factory=time.time)
     v: int = SCHEMA_VERSION
@@ -188,7 +190,7 @@ class ComponentHeartbeatEvent:
 class RegimeChangeEvent:
     """Regime transition detected by the RegimeDetector.
 
-    Published to: signals.regime
+    Published to: signals.regime (legacy compatibility)
     """
     symbol: str
     old_regime: str           # e.g. 'LO_VOL_TREND'

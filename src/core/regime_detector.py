@@ -15,12 +15,12 @@ Regimes
 * ``HI_VOL_TREND``  — high volatility with directional momentum
 * ``CRASH``         — extreme downside move detected
 
-Emits ``RegimeChangeEvent`` to ``signals.regime`` on transitions.
+Emits ``SignalEvent`` to ``signals.detections`` on transitions.
 
 Safety constraints
 ------------------
 * Downstream-only: subscribes to ``market.metrics``, publishes to
-  ``signals.regime``.  Never touches upstream bar/quote state.
+  ``signals.detections``.  Never touches upstream bar/quote state.
 * Uses deterministic threshold logic (no ML, no randomness).
 * Bounded state per symbol.
 """
@@ -38,7 +38,10 @@ from .events import (
     ComponentHeartbeatEvent,
     MetricEvent,
     RegimeChangeEvent,
+    SignalEvent,
+    Priority,
     TOPIC_MARKET_METRICS,
+    TOPIC_SIGNALS,
     TOPIC_SIGNALS_REGIME,
     TOPIC_SYSTEM_COMPONENT_HEARTBEAT,
 )
@@ -157,7 +160,23 @@ class RegimeDetector:
         self._current_regime[symbol] = new_regime
         self._regime_changes += 1
 
-        event = RegimeChangeEvent(
+        signal = SignalEvent(
+            detector="regime_detector",
+            symbol=symbol,
+            signal_type="regime_change",
+            priority=Priority.MEDIUM,
+            timestamp=ts,
+            data={
+                "old_regime": old,
+                "new_regime": new_regime,
+                "confidence": 1.0,
+                **data,
+            },
+            source_ts=ts,
+        )
+        self._bus.publish(TOPIC_SIGNALS, signal)
+
+        legacy_event = RegimeChangeEvent(
             symbol=symbol,
             old_regime=old,
             new_regime=new_regime,
@@ -165,7 +184,7 @@ class RegimeDetector:
             data=data,
             timestamp=ts,
         )
-        self._bus.publish(TOPIC_SIGNALS_REGIME, event)
+        self._bus.publish(TOPIC_SIGNALS_REGIME, legacy_event)
         logger.info("Regime change %s: %s → %s", symbol, old, new_regime)
 
     # ── public API ───────────────────────────────────────────

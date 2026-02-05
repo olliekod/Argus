@@ -16,9 +16,8 @@ Run with:  python -m pytest tests/replay_harness.py -v
 
 from __future__ import annotations
 
-import copy
 import time
-from typing import List
+from typing import List, Sequence, Union
 
 from src.core.bar_builder import BarBuilder, _minute_floor
 from src.core.bus import EventBus
@@ -97,8 +96,19 @@ def _build_tape() -> List[QuoteEvent]:
         _quote("ETH", 2020.0, 520.0, M1 + 10, source_ts=M1 + 9.1),
     ]
 
+def _build_minute_tick_tape() -> List[Union[QuoteEvent, MinuteTickEvent]]:
+    """Tape that closes bars via MinuteTickEvent and includes a late tick."""
+    return [
+        _quote("BTC", 100.0, 1000.0, M0 + 5, source_ts=M0 + 4.8),
+        _quote("BTC", 101.0, 1010.0, M0 + 20, source_ts=M0 + 19.9),
+        MinuteTickEvent(timestamp=M1),
+        _quote("BTC", 102.0, 1020.0, M1 + 5, source_ts=M1 + 4.7),
+        _quote("BTC",  50.0, 1030.0, M0 + 30, source_ts=M0 + 29.5),  # late
+        MinuteTickEvent(timestamp=M2),
+    ]
 
-def _run_tape(tape: List[QuoteEvent]) -> List[BarEvent]:
+
+def _run_tape(tape: Sequence[Union[QuoteEvent, MinuteTickEvent]]) -> List[BarEvent]:
     """Play *tape* through a fresh BarBuilder and return emitted bars."""
     bus = EventBus()
     emitted: List[BarEvent] = []
@@ -107,8 +117,11 @@ def _run_tape(tape: List[QuoteEvent]) -> List[BarEvent]:
     bus.start()
 
     try:
-        for quote in tape:
-            bb._on_quote(quote)
+        for event in tape:
+            if isinstance(event, MinuteTickEvent):
+                bb._on_minute_tick(event)
+            else:
+                bb._on_quote(event)
 
         # Flush remaining bars (shutdown path)
         flushed = bb.flush()
@@ -137,6 +150,8 @@ def _bar_key(bar: BarEvent) -> tuple:
         bar.last_source_ts,
         bar.late_ticks_dropped,
         bar.close_reason,
+        bar.source_ts,
+        bar.repaired,
     )
 
 
@@ -174,6 +189,12 @@ class TestReplayDeterminism:
         assert "ETH" in symbols
         assert len(bars) >= 4  # 2 BTC + 1–2 ETH minimum
 
+    def test_minute_tick_replay_is_deterministic(self):
+        tape = _build_minute_tick_tape()
+        run1 = _run_tape(tape)
+        run2 = _run_tape(tape)
+        assert [_bar_key(b) for b in run1] == [_bar_key(b) for b in run2]
+
 
 class TestProvenanceFields:
     """Verify provenance fields are populated correctly."""
@@ -207,6 +228,19 @@ class TestProvenanceFields:
         bars = _run_tape(tape)
         for bar in bars:
             assert bar.source_ts == bar.first_source_ts
+
+
+class TestMinuteTickClosure:
+    def test_minute_tick_close_reason_and_late_tick(self):
+        tape = _build_minute_tick_tape()
+        bars = _run_tape(tape)
+        m0_bar = next((b for b in bars if b.timestamp == M0), None)
+        m1_bar = next((b for b in bars if b.timestamp == M1), None)
+        assert m0_bar is not None
+        assert m1_bar is not None
+        assert m0_bar.close_reason == int(CloseReason.MINUTE_TICK)
+        assert m0_bar.low != 50.0
+        assert m1_bar.late_ticks_dropped >= 1
 
 
 class TestInvariantEnforcement:
