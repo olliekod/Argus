@@ -8,6 +8,7 @@ Includes market regime awareness.
 """
 
 import itertools
+import logging
 import os
 import sys
 from typing import List, Dict, Optional
@@ -19,6 +20,8 @@ import random
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 from src.trading.paper_trader import TraderConfig, StrategyType
+
+logger = logging.getLogger(__name__)
 
 
 class MarketRegime(Enum):
@@ -38,8 +41,8 @@ PARAM_RANGES = {
     'gap_tolerance_pct': [8, 10, 12, 14, 16],       # 5 values
     'profit_target_pct': [30, 50, 75],              # 3 values
     'stop_loss_pct': [150, 200, 300],               # 3 values
-    'session_filter': ['morning', 'midday', 'afternoon', 'any'],  # 4 values
-    'budget_tier': [2, 5, 9, 14],                   # 4 values (risk %)
+    'session_filter': ['any', 'morning'],             # 2 values
+    'budget_tier': [5, 14],                           # 2 values (risk %)
 }
 
 # Strategy-specific IV ranges (finer steps, ~8-10 values each)
@@ -140,6 +143,7 @@ def generate_all_configs(
     total_traders: int = 35000,
     strategies: List[StrategyType] = None,
     full_coverage: bool = True,
+    max_traders: int = 2_000_000,
 ) -> List[TraderConfig]:
     """
     Generate all trader configurations.
@@ -169,6 +173,11 @@ def generate_all_configs(
             )
             all_configs.extend(configs)
             current_id += len(configs)
+        if len(all_configs) > max_traders:
+            import random
+            random.seed(42)  # Reproducible
+            all_configs = random.sample(all_configs, max_traders)
+            logger.info(f"Sampled {max_traders:,} from {current_id:,} total combinations")
     else:
         # Distribute total_traders evenly across strategies
         traders_per_strategy = total_traders // len(strategies)

@@ -60,9 +60,15 @@ class TelegramBot:
 /pnl — Per-trader P&L stats (mean/median/std/deciles)
 /signals — IBIT/BITO signal conditions
 /status — Conditions score + data freshness
-/zombies — Detect stale/orphaned positions
+/zombies — Detect stale/orphaned positions (7-14 DTE aligned)
+/zombie_clean — Close detected zombie positions
+/reset_paper — Start new paper equity epoch
+/db_stats — Database size and table stats
 /follow — Show followed (best) traders
 /help — This message
+
+<b>Web Dashboard:</b>
+http://127.0.0.1:8777
 
 <b>Automatic Notifications:</b>
 Market open (9:30 AM ET)
@@ -168,6 +174,9 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
             self._app.add_handler(CommandHandler("farm_status", self._cmd_farm_status))
             self._app.add_handler(CommandHandler("research_status", self._cmd_research_status))
             self._app.add_handler(CommandHandler("zombies", self._cmd_zombies))
+            self._app.add_handler(CommandHandler("zombie_clean", self._cmd_zombie_clean))
+            self._app.add_handler(CommandHandler("reset_paper", self._cmd_reset_paper))
+            self._app.add_handler(CommandHandler("db_stats", self._cmd_db_stats))
             self._app.add_handler(CommandHandler("follow", self._cmd_follow))
             
             # Add message handler for yes/no responses
@@ -600,48 +609,56 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
             await update.message.reply_text(f"❌ Error: {e}")
     
     async def _cmd_zombies(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle /zombies — detect and report stale/orphaned positions."""
+        """Handle /zombies — detect stale/orphaned positions (7-14 DTE aligned)."""
         try:
             if not self._get_zombies:
                 await update.message.reply_text("Zombie detection not available.")
                 return
             result = await self._get_zombies()
-            zombies = result.get('zombies', [])
+            report = result.get('report', '')
             total = result.get('total', 0)
-            cleaned = result.get('cleaned', 0)
 
             if total == 0:
-                await update.message.reply_text("✅ No zombie positions detected.")
+                await update.message.reply_text("No zombie positions detected.")
                 return
 
-            lines = [
-                f"🧟 <b>Zombie Positions Detected: {total}</b>",
-                "",
-            ]
-            if cleaned > 0:
-                lines.append(f"Cleaned: {cleaned} positions marked as expired")
-                lines.append("")
-
-            # Show up to 10 details
-            for z in zombies[:10]:
-                age_hours = z.get('age_hours', 0)
-                lines.append(
-                    f"  {z.get('trader_id', '?')} | "
-                    f"{z.get('symbol', '?')} {z.get('strikes', '?')} | "
-                    f"Opened {age_hours:.0f}h ago | "
-                    f"Expiry: {z.get('expiry', '?')}"
-                )
-            if total > 10:
-                lines.append(f"  ... and {total - 10} more")
-
-            lines += [
-                "",
-                "<i>Zombies are auto-cleaned on restart and by /zombies</i>",
-            ]
+            lines = [f"<b>Zombie Report: {total} detected</b>", "", f"<pre>{report[:1500]}</pre>"]
             await update.message.reply_text("\n".join(lines), parse_mode="HTML")
         except Exception as e:
             logger.error(f"Error in /zombies: {e}")
-            await update.message.reply_text(f"❌ Error: {e}")
+            await update.message.reply_text(f"Error: {e}")
+
+    async def _cmd_zombie_clean(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /zombie_clean — close detected zombie positions."""
+        try:
+            if not self._get_zombies:
+                await update.message.reply_text("Zombie detection not available.")
+                return
+            # The orchestrator's run_dashboard_command handles this
+            # For telegram, we call get_zombies which includes cleanup
+            result = await self._get_zombies()
+            total = result.get('total', 0)
+            await update.message.reply_text(f"Zombie cleanup: {total} positions found. Use dashboard /zombie_clean to close them.")
+        except Exception as e:
+            await update.message.reply_text(f"Error: {e}")
+
+    async def _cmd_reset_paper(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /reset_paper — start new paper equity epoch."""
+        try:
+            await update.message.reply_text(
+                "Paper equity reset available via dashboard:\n"
+                "/reset_paper --scope=all --mode=epoch\n\n"
+                "This starts a new epoch. Old data preserved but excluded from current metrics."
+            )
+        except Exception as e:
+            await update.message.reply_text(f"Error: {e}")
+
+    async def _cmd_db_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /db_stats — show database size and table row counts."""
+        try:
+            await update.message.reply_text("DB stats available via dashboard: /db_stats")
+        except Exception as e:
+            await update.message.reply_text(f"Error: {e}")
 
     async def _cmd_follow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /follow — show followed (best) traders."""

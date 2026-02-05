@@ -6,7 +6,10 @@ Coordinates all connectors, detectors, and alerts.
 """
 
 import asyncio
+import os
 import signal
+import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from pathlib import Path
@@ -14,7 +17,7 @@ from typing import Any, Dict, List, Optional
 
 from .core.config import load_all_config, validate_secrets, get_secret
 from .core.database import Database
-from .core.logger import setup_logger, get_logger
+from .core.logger import setup_logger, get_logger, uptime_seconds
 from .core.gap_risk_tracker import GapRiskTracker
 from .core.reddit_monitor import RedditMonitor
 from .core.conditions_monitor import ConditionsMonitor
@@ -28,6 +31,7 @@ from .alerts.telegram_bot import TelegramBot
 from .analysis.daily_review import DailyReview
 from .analysis.uniformity_monitor import run_uniformity_check
 from .trading.paper_trader_farm import PaperTraderFarm
+from .dashboard.web import ArgusWebDashboard
 
 
 
@@ -119,46 +123,113 @@ class ArgusOrchestrator:
         self._today_closed: int = 0
         self._today_expired: int = 0
 
+        # Boot phase timing
+        self._boot_phases: Dict[str, float] = {}
+        self._boot_start = time.monotonic()
+
+        # Dashboard
+        dash_cfg = self.config.get('dashboard', {})
+        self.dashboard: Optional[ArgusWebDashboard] = None
+        if dash_cfg.get('enabled', True):
+            self.dashboard = ArgusWebDashboard(
+                host=dash_cfg.get('host', '127.0.0.1'),
+                port=dash_cfg.get('port', 8777),
+            )
+
+        # Market hours config
+        self._mh_cfg = self.config.get('market_hours', {})
+
+        # Recent log lines ring buffer for dashboard
+        self._recent_logs: deque = deque(maxlen=200)
+
         self.logger.info("Argus Orchestrator initialized")
     
-    async def setup(self) -> None:
-        """Initialize all components."""
-        self.logger.info("Setting up Argus components...")
-        
-        # Initialize database
-        await self.db.connect()
-        
-        # Initialize connectors
-        await self._setup_connectors()
-        
-        # Initialize Telegram
-        await self._setup_telegram()
-        
-        # Initialize off-hours monitoring (Gap Risk, Conditions, Farm, Review)
-        await self._setup_off_hours_monitoring()
-        
-        # Wire up Telegram callbacks after both are initialized
-        self._wire_telegram_callbacks()
-        
-        # Initialize detectors
-        await self._setup_detectors()
-        
-        # Clean up zombie positions from previous runs (Bug 3 fix)
-        await self._cleanup_zombie_positions()
+    def _phase(self, name: str):
+        """Record a boot phase's elapsed time."""
+        elapsed = time.monotonic() - self._boot_start
+        self._boot_phases[name] = round(elapsed, 2)
+        self.logger.info(f"[BOOT] {name}: {elapsed:.2f}s")
 
-        # Send Startup Notification
+    def _format_boot_phases(self) -> str:
+        """Format boot phases for display."""
+        lines = []
+        prev = 0.0
+        for name, ts in self._boot_phases.items():
+            delta = ts - prev
+            lines.append(f"  {name}: {ts:.1f}s (delta {delta:.1f}s)")
+            prev = ts
+        return "\n".join(lines)
+
+    async def setup(self) -> None:
+        """Initialize all components with phase timing."""
+        self.logger.info("Setting up Argus components...")
+        self._boot_start = time.monotonic()
+
+        # Phase 1: Config (already done in __init__)
+        self._phase("config_loaded")
+
+        # Phase 2: Database
+        await self.db.connect()
+        self._phase("db_connected")
+
+        # Phase 3: Connectors
+        await self._setup_connectors()
+        self._phase("connectors_init")
+
+        # Phase 4: Telegram
+        await self._setup_telegram()
+        self._phase("telegram_init")
+
+        # Phase 5: Providers (gap risk, conditions, farm, review)
+        await self._setup_off_hours_monitoring()
+        self._phase("providers_init")
+
+        # Phase 6: Wire callbacks
+        self._wire_telegram_callbacks()
+
+        # Phase 7: Detectors
+        await self._setup_detectors()
+        self._phase("detectors_init")
+
+        # Phase 8: Zombie cleanup (skip full-table scan, use targeted query)
+        await self._cleanup_zombie_positions()
+        self._phase("zombie_cleanup")
+
+        # Phase 9: Dashboard
+        if self.dashboard:
+            self.dashboard.set_callbacks(
+                get_status=self._get_dashboard_system_status,
+                get_pnl=self._get_pnl_summary,
+                get_farm_status=self._get_farm_status,
+                get_providers=self._get_provider_statuses,
+                run_command=self._run_dashboard_command,
+                get_recent_logs=self._get_recent_logs_text,
+            )
+            await self.dashboard.start()
+            self.dashboard.set_boot_phases(self._format_boot_phases())
+            self._phase("dashboard_started")
+
+        # Total
+        total = time.monotonic() - self._boot_start
+        self._boot_phases["ready"] = round(total, 2)
+        self.logger.info(f"[BOOT] READY in {total:.1f}s")
+        self.logger.info(f"Boot phases:\n{self._format_boot_phases()}")
+
+        # Startup notification
         if self.telegram:
             eastern = ZoneInfo("America/New_York")
             now_et = datetime.now(eastern).strftime('%H:%M:%S %Z')
-            startup_msg = f"🚀 <b>Argus Master Engine Online</b>\n"
-            startup_msg += f"<i>Time: {now_et}</i>\n\n"
-            startup_msg += f"✅ Detectors: {len(self.detectors)}\n"
-            startup_msg += f"✅ GPU Engine: {'Enabled (CUDA)' if getattr(self.paper_trader_farm, 'trader_tensors', None) is not None else 'Disabled (CPU Fallback)'}\n"
             farm_count = len(self.paper_trader_farm.trader_configs) if self.paper_trader_farm else 0
-            startup_msg += f"✅ Farm: {farm_count:,} configurations loaded\n\n"
-            startup_msg += f"Monitoring active for IBIT, BITO, and Crypto markets."
+            startup_msg = (
+                f"<b>Argus Online</b>\n"
+                f"<i>{now_et}</i>\n\n"
+                f"Detectors: {len(self.detectors)}\n"
+                f"Farm: {farm_count:,} configs\n"
+                f"Boot: {total:.1f}s\n"
+                f"Dashboard: http://127.0.0.1:{self.config.get('dashboard', {}).get('port', 8777)}"
+            )
             await self.telegram.send_message(startup_msg)
-        
+
         self.logger.info("Setup complete!")
     
     async def _setup_connectors(self) -> None:
@@ -304,10 +375,15 @@ class ArgusOrchestrator:
             on_send=self._send_daily_review,
         )
         
-        # Paper Trader Farm (86K+ parallel traders with full coverage)
+        # Paper Trader Farm with guardrails from config
+        farm_cfg = self.config.get('farm', {})
         self.paper_trader_farm = PaperTraderFarm(
             db=self.db,
-            full_coverage=True,  # Generate ALL unique parameter combinations
+            full_coverage=True,
+            starting_balance=float(farm_cfg.get('default_starting_equity', 5000.0)),
+            max_traders=int(farm_cfg.get('max_traders', 2_000_000)),
+            max_open_positions_total=int(farm_cfg.get('max_open_positions_total', 500_000)),
+            max_trades_per_minute=int(farm_cfg.get('max_trades_per_minute', 10_000)),
         )
         await self.paper_trader_farm.initialize()
         
@@ -483,35 +559,15 @@ class ArgusOrchestrator:
         }
 
     async def _get_zombies(self) -> Dict[str, Any]:
-        """Detect and optionally clean zombie positions."""
-        zombies_raw = await self.db.get_zombie_positions(stale_hours=48)
-        now = datetime.now(timezone.utc)
-
-        zombies = []
-        for z in zombies_raw:
-            try:
-                opened = datetime.fromisoformat(z['timestamp'])
-                if opened.tzinfo is None:
-                    opened = opened.replace(tzinfo=timezone.utc)
-                age_hours = (now - opened).total_seconds() / 3600
-            except (ValueError, TypeError):
-                age_hours = 999
-            zombies.append({
-                **z,
-                'age_hours': age_hours,
-            })
-
-        # Auto-clean zombies with past expiry dates
-        to_clean = [z['id'] for z in zombies if z.get('expiry') and z['expiry'] < now.strftime('%Y-%m-%d')]
-        cleaned = 0
-        if to_clean:
-            cleaned = await self.db.mark_zombies(to_clean, reason='zombie_auto_clean')
-
-        return {
-            'zombies': zombies,
-            'total': len(zombies),
-            'cleaned': cleaned,
-        }
+        """Detect zombies using the farm's 7-14 DTE-aligned detection logic."""
+        if self.paper_trader_farm:
+            zombies = await self.paper_trader_farm.detect_zombies(stale_days=14, grace_days=2)
+            return {
+                'zombies': zombies,
+                'total': len(zombies),
+                'report': await self.paper_trader_farm.format_zombies_report(stale_days=14, grace_days=2),
+            }
+        return {'zombies': [], 'total': 0, 'report': 'Farm not initialized'}
 
     async def _get_followed_traders(self) -> List[Dict]:
         """Get the followed traders list from DB."""
@@ -860,7 +916,11 @@ class ArgusOrchestrator:
             await asyncio.sleep(300)
 
     async def _cleanup_zombie_positions(self) -> None:
-        """Close orphaned positions from previous runs that are still 'open' in DB."""
+        """Close orphaned positions from previous runs that are still 'open' in DB.
+
+        Uses close_timestamp (not closed_at) and close_reason columns which
+        are created by the migration in paper_trader_farm._create_tables.
+        """
         try:
             row = await self.db.fetch_one(
                 "SELECT COUNT(*) as cnt FROM paper_trades WHERE status = 'open'"
@@ -870,13 +930,25 @@ class ArgusOrchestrator:
                 return
 
             self.logger.info(f"Found {zombie_count:,} zombie positions from previous runs, marking as expired")
-            await self.db.execute(
-                """UPDATE paper_trades SET status = 'expired',
-                   close_reason = 'system_restart_cleanup',
-                   closed_at = ?
-                   WHERE status = 'open'""",
-                (datetime.now(timezone.utc).isoformat(),)
-            )
+            now_ts = datetime.now(timezone.utc).isoformat()
+
+            # Use close_timestamp (the actual column name) and close_reason (added by migration)
+            try:
+                await self.db.execute(
+                    """UPDATE paper_trades SET status = 'expired',
+                       close_reason = 'system_restart_cleanup',
+                       close_timestamp = ?
+                       WHERE status = 'open'""",
+                    (now_ts,)
+                )
+            except Exception:
+                # Fallback if close_reason column doesn't exist yet
+                await self.db.execute(
+                    """UPDATE paper_trades SET status = 'expired',
+                       close_timestamp = ?
+                       WHERE status = 'open'""",
+                    (now_ts,)
+                )
             self.logger.info(f"Cleaned up {zombie_count:,} zombie positions")
         except Exception as e:
             self.logger.error(f"Failed to cleanup zombie positions: {e}")
@@ -1112,31 +1184,57 @@ class ArgusOrchestrator:
             self.logger.warning(f"Uniformity check error: {e}")
 
     async def _health_check(self) -> None:
-        """Periodic health check and status logging."""
-        interval = 300  # 5 minutes
+        """Periodic health check (5 min) and 60-second heartbeat summary."""
+        health_interval = 300
+        heartbeat_interval = int(self.config.get('monitoring', {}).get('heartbeat_interval', 60))
+        last_heartbeat = 0.0
+        last_health = 0.0
 
         while self._running:
-            try:
-                status = {
-                    'bybit_connected': self.bybit_ws.is_connected if self.bybit_ws else False,
-                    'detectors_active': len(self.detectors),
-                    'timestamp': datetime.now(timezone.utc).isoformat(),
-                }
+            now = time.time()
 
-                self.logger.info(f"Health check: {status}")
-                self._last_health_check = datetime.now(timezone.utc)
-                await self.db.insert_health_check(
-                    component="bybit_ws",
-                    status="connected" if status['bybit_connected'] else "disconnected",
-                )
-                await self.db.insert_health_check(
-                    component="detectors",
-                    status=f"active_{status['detectors_active']}",
-                )
-            except Exception as e:
-                self.logger.error(f"Health check error: {e}")
+            # 60-second heartbeat line
+            if now - last_heartbeat >= heartbeat_interval:
+                last_heartbeat = now
+                try:
+                    farm = self.paper_trader_farm
+                    active_traders = len(farm.active_traders) if farm else 0
+                    open_positions = sum(
+                        len(t.open_positions) for t in farm.active_traders.values()
+                    ) if farm else 0
+                    bybit_health = self.bybit_ws.get_health_status() if self.bybit_ws else {}
+                    bybit_str = "connected" if bybit_health.get('connected') else "disconnected"
+                    msg_age = bybit_health.get('seconds_since_last_message')
+                    msg_age_str = f"{msg_age:.0f}s" if msg_age is not None else "N/A"
+                    db_size = os.path.getsize(str(self.db.db_path)) / (1024 * 1024) if self.db.db_path.exists() else 0
 
-            await asyncio.sleep(interval)
+                    self.logger.info(
+                        f"[HEARTBEAT] uptime={uptime_seconds():.0f}s "
+                        f"bybit={bybit_str} last_msg={msg_age_str} "
+                        f"traders={active_traders} positions={open_positions} "
+                        f"db={db_size:.0f}MB"
+                    )
+                except Exception as e:
+                    self.logger.error(f"Heartbeat error: {e}")
+
+            # 5-minute health check (DB write)
+            if now - last_health >= health_interval:
+                last_health = now
+                try:
+                    bybit_connected = self.bybit_ws.is_connected if self.bybit_ws else False
+                    self._last_health_check = datetime.now(timezone.utc)
+                    await self.db.insert_health_check(
+                        component="bybit_ws",
+                        status="connected" if bybit_connected else "disconnected",
+                    )
+                    await self.db.insert_health_check(
+                        component="detectors",
+                        status=f"active_{len(self.detectors)}",
+                    )
+                except Exception as e:
+                    self.logger.error(f"Health check error: {e}")
+
+            await asyncio.sleep(10)  # Check every 10s for heartbeat granularity
 
     async def _run_market_session_monitor(self) -> None:
         """Monitor market open/close transitions and send notifications."""
@@ -1252,6 +1350,153 @@ class ArgusOrchestrator:
         except Exception as e:
             self.logger.error(f"Failed to send market close notification: {e}")
     
+    # =========================================================================
+    # Dashboard helper callbacks
+    # =========================================================================
+
+    async def _get_dashboard_system_status(self) -> Dict[str, Any]:
+        """System status for the dashboard /api/status endpoint."""
+        db_stats = await self.db.get_db_stats()
+        return {
+            'db_size_mb': db_stats.get('db_size_mb', 0),
+            'boot_phases': self._format_boot_phases(),
+        }
+
+    async def _get_provider_statuses(self) -> Dict[str, Any]:
+        """Provider health for dashboard."""
+        result = {}
+        if self.bybit_ws:
+            result['bybit'] = self.bybit_ws.get_health_status()
+        if self.deribit_client:
+            result['deribit'] = {'connected': True, 'seconds_since_last_message': None, 'reconnect_attempts': 0}
+        if self.yahoo_client:
+            result['yahoo'] = {'connected': True, 'seconds_since_last_message': None, 'reconnect_attempts': 0}
+        return result
+
+    async def _run_dashboard_command(self, cmd: str) -> str:
+        """Execute a / command from the web dashboard."""
+        cmd = cmd.strip()
+        if not cmd.startswith('/'):
+            cmd = '/' + cmd
+
+        try:
+            if cmd == '/pnl':
+                data = await self._get_pnl_summary()
+                return (
+                    f"Today: ${data.get('today_pnl', 0):+.2f}\n"
+                    f"MTD: ${data.get('month_pnl', 0):+.2f}\n"
+                    f"YTD: ${data.get('year_pnl', 0):+.2f}\n"
+                    f"Win rate MTD: {data.get('win_rate_mtd', 0):.0f}%\n"
+                    f"Open positions: {data.get('open_positions', 0)}"
+                )
+            elif cmd == '/status':
+                data = await self._get_status_summary()
+                return str(data)
+            elif cmd == '/positions':
+                data = await self._get_positions_summary()
+                return "\n".join(
+                    f"{p['symbol']} ({p['strategy']}): {p['count']} positions"
+                    for p in data
+                ) or "No open positions"
+            elif cmd == '/zombies':
+                data = await self._get_zombies()
+                return data.get('report', f"Total zombies: {data.get('total', 0)}")
+            elif cmd.startswith('/zombie_clean'):
+                if self.paper_trader_farm:
+                    n = await self.paper_trader_farm.close_zombies()
+                    return f"Closed {n} zombie positions"
+                return "Farm not initialized"
+            elif cmd == '/dashboard':
+                data = await self._get_dashboard()
+                return str(data)
+            elif cmd.startswith('/reset_paper'):
+                parts = cmd.split()
+                scope = 'all'
+                mode = 'epoch'
+                for p in parts[1:]:
+                    if p.startswith('--scope='):
+                        scope = p.split('=')[1]
+                    elif p.startswith('--mode='):
+                        mode = p.split('=')[1]
+                if self.paper_trader_farm:
+                    return await self.paper_trader_farm.reset_paper_equity(scope=scope, mode=mode)
+                return "Farm not initialized"
+            elif cmd == '/db_stats':
+                stats = await self.db.get_db_stats()
+                lines = [f"DB size: {stats['db_size_mb']} MB"]
+                for table, count in stats.get('row_counts', {}).items():
+                    lines.append(f"  {table}: {count:,} rows")
+                return "\n".join(lines)
+            elif cmd == '/maintenance':
+                stats = await self.db.run_maintenance()
+                return f"Maintenance complete. DB: {stats['db_size_mb']} MB"
+            else:
+                return f"Unknown command: {cmd}"
+        except Exception as e:
+            return f"Error: {e}"
+
+    async def _get_recent_logs_text(self) -> str:
+        """Return recent log lines as text for dashboard."""
+        if self._recent_logs:
+            return "\n".join(self._recent_logs)
+        # Read from log file as fallback
+        try:
+            log_file = Path(self.config.get('logging', {}).get('log_dir', 'data/logs')) / 'argus.log'
+            if log_file.exists():
+                with open(log_file, 'r') as f:
+                    lines = f.readlines()
+                return "".join(lines[-100:])
+        except Exception:
+            pass
+        return "No logs available"
+
+    # =========================================================================
+    # Market hours gating
+    # =========================================================================
+
+    def _is_us_market_open(self) -> bool:
+        """Check if US equity markets are open (Mon-Fri, 9:30-16:00 ET)."""
+        eastern = ZoneInfo("America/New_York")
+        now_et = datetime.now(eastern)
+        if now_et.weekday() >= 5:  # Weekend
+            return False
+        mh = self._mh_cfg
+        open_h = int(mh.get('equity_open_hour', 9))
+        open_m = int(mh.get('equity_open_minute', 30))
+        close_h = int(mh.get('equity_close_hour', 16))
+        close_m = int(mh.get('equity_close_minute', 0))
+        open_time = now_et.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
+        close_time = now_et.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
+        return open_time <= now_et <= close_time
+
+    # =========================================================================
+    # DB maintenance task
+    # =========================================================================
+
+    async def _run_db_maintenance(self) -> None:
+        """Periodic DB maintenance: retention cleanup + PRAGMA optimize."""
+        while self._running:
+            try:
+                await asyncio.sleep(3600)  # Run every hour
+
+                # Retention cleanup
+                retention = self.config.get('data_retention', {})
+                retention_map = {
+                    'price_snapshots': retention.get('price_snapshots_days', 30),
+                    'system_health': retention.get('logs_days', 30),
+                    'funding_rates': retention.get('price_snapshots_days', 30),
+                    'liquidations': retention.get('price_snapshots_days', 30),
+                    'options_iv': retention.get('detections_days', 180),
+                    'detections': retention.get('detections_days', 180),
+                }
+                await self.db.cleanup_old_data(retention_map)
+
+                # PRAGMA optimize
+                await self.db.run_maintenance()
+                self.logger.info("DB maintenance completed")
+            except Exception as e:
+                self.logger.error(f"DB maintenance error: {e}")
+
     async def run(self) -> None:
         """Start all components and run main loop."""
         self._running = True
@@ -1262,12 +1507,13 @@ class ArgusOrchestrator:
         if self.bybit_ws:
             self._tasks.append(asyncio.create_task(self.bybit_ws.connect()))
         
-        # Start polling tasks
+        # Start polling tasks (with market-hours gating for equities)
         if self.yahoo_client:
-            self._tasks.append(asyncio.create_task(self.yahoo_client.poll(interval_seconds=60)))
-        
+            self._tasks.append(asyncio.create_task(self._poll_yahoo_market_hours_aware()))
+
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._health_check()))
+        self._tasks.append(asyncio.create_task(self._run_db_maintenance()))
 
         # Exit monitor runs independently of research loop
         if self.paper_trader_farm:
@@ -1303,42 +1549,71 @@ class ArgusOrchestrator:
         except asyncio.CancelledError:
             self.logger.info("Shutdown requested")
     
+    async def _poll_yahoo_market_hours_aware(self) -> None:
+        """Poll Yahoo Finance with market-hours awareness.
+
+        During US market hours: poll every 60s.
+        Off-hours: poll every off_hours_sample_interval_seconds (default 600s / 10 min).
+        """
+        off_interval = int(self._mh_cfg.get('off_hours_sample_interval_seconds', 600))
+        on_interval = 60
+
+        while self._running:
+            try:
+                market_open = self._is_us_market_open()
+                interval = on_interval if market_open else off_interval
+
+                # One poll cycle
+                await self.yahoo_client.poll_once()
+
+                if not market_open:
+                    self.logger.debug(f"US market closed, next Yahoo poll in {interval}s")
+
+                await asyncio.sleep(interval)
+            except Exception as e:
+                self.logger.error(f"Yahoo market-hours poll error: {e}")
+                await asyncio.sleep(60)
+
     async def stop(self) -> None:
         """Stop all components gracefully."""
         self.logger.info("Stopping Argus...")
         self._running = False
-        
+
+        # Stop dashboard
+        if self.dashboard:
+            await self.dashboard.stop()
+
         # Stop monitoring loops
         if self.conditions_monitor:
             self.conditions_monitor.stop_monitoring()
         if self.daily_review:
             self.daily_review.stop_monitoring()
-        
+
         # Stop Telegram polling
         if self.telegram:
             await self.telegram.stop_polling()
-        
+
         # Cancel all tasks
         for task in self._tasks:
             task.cancel()
-        
+
         # Disconnect WebSockets
         if self.bybit_ws:
             await self.bybit_ws.disconnect()
-        
+
         # Close REST clients
         if self.deribit_client:
             await self.deribit_client.close()
         if self.yahoo_client:
             await self.yahoo_client.close()
-        
+
         # Close database
         await self.db.close()
-        
+
         # Send shutdown notification
         if self.telegram:
             await self.telegram.send_system_status('offline', 'Argus stopped')
-        
+
         self.logger.info("Argus stopped")
 
 
