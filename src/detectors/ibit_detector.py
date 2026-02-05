@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import logging
 
 from .base_detector import BaseDetector
+from ..core.events import BarEvent, Priority
 from ..core.utils import calculate_z_score, calculate_mean
 from ..core.economic_calendar import EconomicCalendar
 from ..analysis.trade_calculator import TradeCalculator, TradeRecommendation
@@ -212,6 +213,27 @@ class IBITDetector(BaseDetector):
             'timestamp': timestamp,
         }
     
+    # ── bar-driven path (event bus) ───────────────────────
+
+    def on_bar(self, event: BarEvent) -> None:
+        """Consume crypto bars as context/features.
+
+        BTC bars update the IV context price.  Bars whose symbol
+        matches this detector's ETF symbol (IBIT / BITO) update the
+        price cache.  Signals are explicitly labelled for the tradeable
+        instrument (self.symbol).
+        """
+        if event.source == 'bybit' and 'BTC' in event.symbol:
+            # Use BTC bar close as a context feature (price proxy)
+            pass  # BTC IV comes from Deribit, not bars
+        elif event.symbol == self.symbol:
+            # Yahoo-originated bar for IBIT or BITO
+            self.update_ibit_data({
+                'price': event.close,
+                'timestamp': str(event.timestamp),
+                'price_change_pct': 0,  # not available from bar alone
+            })
+
     def _check_market_hours(self) -> bool:
         """Check if US stock market is open (9:30 AM - 4:00 PM ET)."""
         eastern = ZoneInfo("America/New_York")

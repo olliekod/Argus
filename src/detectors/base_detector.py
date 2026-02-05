@@ -10,20 +10,36 @@ from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 import logging
 
+from ..core.events import (
+    BarEvent,
+    SignalEvent,
+    Priority,
+    TOPIC_MARKET_BARS,
+    TOPIC_SIGNALS,
+)
+
+# Instrument allowlist — only these may appear as SignalEvent.symbol
+TRADEABLE_INSTRUMENTS = frozenset({"IBIT", "BITO"})
+
 
 class BaseDetector(ABC):
     """
     Abstract base class for opportunity detectors.
-    
+
     All detectors must implement:
     - analyze(): Check for opportunities
     - calculate_edge(): Calculate net edge after costs
+
+    Bus integration (optional):
+    - Call ``attach_bus(bus)`` to subscribe to ``market.bars`` and
+      auto-publish ``SignalEvent`` on ``signals.detections``.
+    - Override ``on_bar(event)`` for bar-driven analysis.
     """
-    
+
     def __init__(self, config: Dict[str, Any], db):
         """
         Initialize detector.
-        
+
         Args:
             config: Detector-specific configuration (from thresholds.yaml)
             db: Database instance for logging
@@ -33,10 +49,67 @@ class BaseDetector(ABC):
         self.enabled = config.get('enabled', True)
         self.name = self.__class__.__name__
         self.logger = logging.getLogger(f'argus.detectors.{self.name}')
-        
+
         # Cost assumptions
         self.slippage_bps = config.get('slippage_bps', 5)
         self.fee_bps = config.get('fee_bps', 5)
+
+        # Event bus reference (set by attach_bus)
+        self._event_bus = None
+
+    # ── bus wiring ──────────────────────────────────────────
+
+    def attach_bus(self, bus) -> None:
+        """Subscribe this detector to ``market.bars`` on *bus*."""
+        self._event_bus = bus
+        bus.subscribe(TOPIC_MARKET_BARS, self._bus_on_bar)
+        self.logger.info("Attached to event bus (market.bars)")
+
+    def _bus_on_bar(self, event: BarEvent) -> None:
+        """Internal handler invoked by the bus worker thread."""
+        try:
+            self.on_bar(event)
+        except Exception:
+            self.logger.exception("on_bar error for %s", event.symbol)
+
+    def on_bar(self, event: BarEvent) -> None:
+        """Override in subclass for bar-driven analysis.
+
+        Default implementation is a no-op so detectors that rely
+        exclusively on the existing ``analyze()`` path keep working.
+        """
+
+    def _publish_signal(
+        self,
+        symbol: str,
+        signal_type: str,
+        priority: Priority,
+        data: Dict[str, Any],
+    ) -> None:
+        """Convenience: publish a :class:`SignalEvent` if bus is attached.
+
+        Enforces the instrument allowlist — signals for non-tradeable
+        assets are rejected with a warning.
+        """
+        if symbol not in TRADEABLE_INSTRUMENTS:
+            self.logger.warning(
+                "Signal for non-tradeable %s suppressed (allowlist: %s)",
+                symbol,
+                TRADEABLE_INSTRUMENTS,
+            )
+            return
+        if self._event_bus is None:
+            return
+        import time
+        sig = SignalEvent(
+            detector=self.name,
+            symbol=symbol,
+            signal_type=signal_type,
+            priority=priority,
+            timestamp=time.time(),
+            data=data,
+        )
+        self._event_bus.publish(TOPIC_SIGNALS, sig)
     
     @abstractmethod
     async def analyze(self, market_data: Dict[str, Any]) -> Optional[Dict]:
