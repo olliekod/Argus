@@ -52,6 +52,10 @@ button:hover{background:#1a4a8a}
 <div id="providers">Loading...</div>
 </div>
 <div class="card">
+<h2>Internal</h2>
+<div id="internal">Loading...</div>
+</div>
+<div class="card">
 <h2>P&amp;L Summary</h2>
 <div id="pnl">Loading...</div>
 </div>
@@ -84,10 +88,26 @@ async function load(){
       '<div><span class="label">Boot phases:</span></div>'+
       '<pre>'+(s.boot_phases||'N/A')+'</pre>';
     // Providers
-    let p=d.providers||{};let ph='<table><tr><th>Provider</th><th>Status</th><th>Last Msg</th><th>Reconnects</th></tr>';
-    for(let k in p){let v=p[k];let cls=v.connected?'ok':'err';
-      ph+='<tr><td>'+k+'</td><td class="'+cls+'">'+(v.connected?'Connected':'Disconnected')+'</td><td>'+(v.seconds_since_last_message||'-')+'s</td><td>'+(v.reconnect_attempts||0)+'</td></tr>';}
+    let p=d.providers||{};let ph='<table><tr><th>Provider</th><th>Status</th><th>Age</th><th>Failures</th><th>Latency</th></tr>';
+    for(let k in p){let v=p[k]||{};let status=v.status||(v.connected?'ok':'unknown');
+      let cls=(status==='ok')?'ok':(status==='degraded'?'warn':'err');
+      let age=(v.staleness&&v.staleness.age_seconds!=null)?v.staleness.age_seconds:(v.seconds_since_last_message||'-');
+      let failures=v.consecutive_failures||0;
+      let latency='-';
+      if(v.timing&&v.timing.avg_latency_ms!=null){latency=v.timing.avg_latency_ms.toFixed(1)+'ms';}
+      else if(v.timing&&v.timing.last_latency_ms!=null){latency=v.timing.last_latency_ms.toFixed(1)+'ms';}
+      ph+='<tr><td>'+k+'</td><td class="'+cls+'">'+status+'</td><td>'+age+'</td><td>'+failures+'</td><td>'+latency+'</td></tr>';}
     ph+='</table>';document.getElementById('providers').innerHTML=ph;
+    // Internal
+    let i=d.internal||{};let ih='<table><tr><th>Component</th><th>Status</th><th>Age</th><th>Details</th></tr>';
+    for(let k in i){let v=i[k]||{};let status=v.status||'unknown';
+      let cls=(status==='ok')?'ok':(status==='degraded'?'warn':'err');
+      let age=(v.staleness&&v.staleness.age_seconds!=null)?v.staleness.age_seconds:'-';
+      let detail='-';
+      if(k==='bar_builder'){detail='bars '+(v.extras&&v.extras.bars_emitted_total||0);}
+      if(k==='persistence'){detail='buffer '+(v.extras&&v.extras.bar_buffer_size||0);}
+      ih+='<tr><td>'+k+'</td><td class="'+cls+'">'+status+'</td><td>'+age+'</td><td>'+detail+'</td></tr>';}
+    ih+='</table>';document.getElementById('internal').innerHTML=ih;
     // PnL
     let pnl=d.pnl||{};
     document.getElementById('pnl').innerHTML=
@@ -196,7 +216,17 @@ class ArgusWebDashboard:
             if self._get_status:
                 try:
                     s = await self._get_status()
-                    system.update(s)
+                    internal = s.pop("internal", None) if isinstance(s, dict) else None
+                    bus = s.pop("bus", None) if isinstance(s, dict) else None
+                    db = s.pop("db", None) if isinstance(s, dict) else None
+                    if isinstance(s, dict):
+                        system.update(s)
+                    if internal is not None:
+                        result["internal"] = internal
+                    if bus is not None:
+                        result["bus"] = bus
+                    if db is not None:
+                        result["db"] = db
                 except Exception as e:
                     system['error'] = str(e)
             result['system'] = system

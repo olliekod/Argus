@@ -102,6 +102,15 @@ class BybitWebSocket:
         self._message_count: int = 0
         self._message_count_ts: float = time.time()
         self._message_rate_per_min: float = 0.0
+        self.last_success_ts: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.consecutive_failures: int = 0
+        self.request_count: int = 0
+        self.error_count: int = 0
+        self.last_latency_ms: Optional[float] = None
+        self.avg_latency_ms: Optional[float] = None
+        self.last_close_code: Optional[int] = None
+        self.last_close_reason: Optional[str] = None
 
         # Latest data cache
         self.tickers: Dict[str, Dict] = {}
@@ -147,8 +156,16 @@ class BybitWebSocket:
                     await self._message_loop()
 
             except ConnectionClosed as e:
+                self.last_close_code = e.code
+                self.last_close_reason = e.reason
+                self.last_error = f"closed:{e.code}"
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.warning(f"Bybit WebSocket closed: {e.code} - {e.reason}")
             except Exception as e:
+                self.last_error = str(e)
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.error(f"Bybit WebSocket error: {e}")
 
             self._connected_since = None
@@ -195,18 +212,32 @@ class BybitWebSocket:
                 try:
                     await self._ws.ping()
                 except Exception as e:
+                    self.last_error = f"ping_failed:{e}"
+                    self.error_count += 1
+                    self.consecutive_failures += 1
                     logger.warning(f"Bybit WebSocket ping failed: {e}")
                     break
                 continue
             except ConnectionClosed as e:
+                self.last_close_code = e.code
+                self.last_close_reason = e.reason
+                self.last_error = f"closed:{e.code}"
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.warning(f"Bybit WebSocket closed: {e.code} - {e.reason}")
                 break
             except Exception as e:
+                self.last_error = str(e)
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.error(f"Bybit WebSocket recv error: {e}")
                 break
 
             self.last_message_ts = time.time()
+            self.last_success_ts = self.last_message_ts
             self._message_count += 1
+            self.request_count += 1
+            self.consecutive_failures = 0
             now = time.time()
             if now - self._message_count_ts >= 60:
                 self._message_rate_per_min = self._message_count / max((now - self._message_count_ts) / 60, 1)
@@ -216,8 +247,14 @@ class BybitWebSocket:
                 data = json.loads(message)
                 await self._handle_message(data)
             except json.JSONDecodeError:
+                self.last_error = "invalid_json"
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.warning(f"Invalid JSON received: {message[:100]}")
             except Exception as e:
+                self.last_error = str(e)
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.error(f"Error handling message: {e}")
 
     async def _handle_message(self, data: Dict[str, Any]) -> None:
@@ -341,11 +378,39 @@ class BybitWebSocket:
         since_last_msg = None
         if connected and self.last_message_ts:
             since_last_msg = (now - self.last_message_ts)
-        return {
-            'connected': connected,
-            'seconds_since_last_message': round(since_last_msg, 1) if since_last_msg is not None else None,
-            'reconnect_attempts': self.reconnect_attempts,
-            'connected_since': datetime.fromtimestamp(self._connected_since, tz=timezone.utc).isoformat() if self._connected_since else None,
-            'symbols': len(self.symbols),
-            'message_rate_per_min': round(self._message_rate_per_min, 2),
-        }
+        if not connected:
+            status = "down" if self.last_error else "unknown"
+        elif since_last_msg is not None and since_last_msg > (self._recv_timeout * 2):
+            status = "degraded"
+        else:
+            status = "ok"
+
+        from ..core.status import build_status
+
+        return build_status(
+            name="bybit",
+            type="ws",
+            status=status,
+            last_success_ts=self.last_success_ts,
+            last_error=self.last_error,
+            consecutive_failures=self.consecutive_failures,
+            reconnect_attempts=self.reconnect_attempts,
+            request_count=self.request_count,
+            error_count=self.error_count,
+            avg_latency_ms=self.avg_latency_ms,
+            last_latency_ms=self.last_latency_ms,
+            last_message_ts=self.last_message_ts,
+            age_seconds=round(since_last_msg, 1) if since_last_msg is not None else None,
+            extras={
+                "connected": connected,
+                "connected_since": (
+                    datetime.fromtimestamp(self._connected_since, tz=timezone.utc).isoformat()
+                    if self._connected_since
+                    else None
+                ),
+                "symbols": len(self.symbols),
+                "message_rate_per_min": round(self._message_rate_per_min, 2),
+                "close_code": self.last_close_code,
+                "close_reason": self.last_close_reason,
+            },
+        )

@@ -6,6 +6,7 @@ Fetches IBIT ETF price data for options monitoring.
 """
 
 import asyncio
+import time
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 import aiohttp
@@ -47,6 +48,15 @@ class YahooFinanceClient:
         self._running = False
         self.last_message_ts: Optional[float] = None
         self.reconnect_attempts = 0
+        self.last_success_ts: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.consecutive_failures: int = 0
+        self.request_count: int = 0
+        self.error_count: int = 0
+        self.last_latency_ms: Optional[float] = None
+        self.avg_latency_ms: Optional[float] = None
+        self.last_poll_ts: Optional[float] = None
+        self.last_http_status: Optional[int] = None
 
         # Latest data cache
         self.prices: Dict[str, Dict] = {}
@@ -87,11 +97,23 @@ class YahooFinanceClient:
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         
+        start = time.perf_counter()
+        self.last_poll_ts = time.time()
+        self.request_count += 1
         try:
             async with session.get(url, params=params, headers=headers) as resp:
+                self.last_http_status = resp.status
                 if resp.status == 200:
                     import time
                     self.last_message_ts = time.time()
+                    self.last_success_ts = self.last_message_ts
+                    self.consecutive_failures = 0
+                    self.last_error = None
+                    self.last_latency_ms = (time.perf_counter() - start) * 1000
+                    self.avg_latency_ms = (
+                        self.last_latency_ms if self.avg_latency_ms is None
+                        else (self.last_latency_ms * 0.2) + (self.avg_latency_ms * 0.8)
+                    )
                     data = await resp.json()
                     
                     result = data.get('chart', {}).get('result', [])
@@ -167,10 +189,16 @@ class YahooFinanceClient:
                     
                     return parsed
                 else:
+                    self.error_count += 1
+                    self.consecutive_failures += 1
+                    self.last_error = f"http_{resp.status}"
                     logger.warning(f"Yahoo API error for {symbol}: {resp.status}")
                     return None
                     
         except Exception as e:
+            self.error_count += 1
+            self.consecutive_failures += 1
+            self.last_error = str(e)
             logger.error(f"Yahoo request failed: {e}")
             return None
     
@@ -244,9 +272,32 @@ class YahooFinanceClient:
         import time
         now = time.time()
         age = (now - self.last_message_ts) if self.last_message_ts else None
-        return {
-            'connected': self._session is not None and not self._session.closed,
-            'seconds_since_last_message': round(age, 1) if age is not None else None,
-            'reconnect_attempts': self.reconnect_attempts,
-            'symbols': len(self.symbols),
-        }
+        if self.consecutive_failures > 0:
+            status = "degraded"
+        elif self.last_success_ts:
+            status = "ok"
+        else:
+            status = "unknown"
+
+        from ..core.status import build_status
+
+        return build_status(
+            name="yahoo",
+            type="rest",
+            status=status,
+            last_success_ts=self.last_success_ts,
+            last_error=self.last_error,
+            consecutive_failures=self.consecutive_failures,
+            reconnect_attempts=self.reconnect_attempts,
+            request_count=self.request_count,
+            error_count=self.error_count,
+            avg_latency_ms=round(self.avg_latency_ms, 2) if self.avg_latency_ms is not None else None,
+            last_latency_ms=round(self.last_latency_ms, 2) if self.last_latency_ms is not None else None,
+            last_poll_ts=self.last_poll_ts,
+            age_seconds=round(age, 1) if age is not None else None,
+            extras={
+                "connected": self._session is not None and not self._session.closed,
+                "symbols": len(self.symbols),
+                "last_http_status": self.last_http_status,
+            },
+        )

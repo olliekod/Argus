@@ -19,6 +19,7 @@ import sys
 import time
 from pathlib import Path
 from logging.handlers import RotatingFileHandler
+from typing import Any
 
 try:
     import colorama

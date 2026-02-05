@@ -9,7 +9,7 @@ Provides IV Rank, available strikes, and chain data.
 import asyncio
 import logging
 from datetime import datetime, timedelta
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 from functools import lru_cache
 from zoneinfo import ZoneInfo
 import time
@@ -40,7 +40,32 @@ class IBITOptionsClient:
         self.ticker = yf.Ticker(self.symbol)
         self._cache: Dict[str, Tuple[float, any]] = {}
         self._iv_history: List[float] = []
+        self.last_poll_ts: Optional[float] = None
+        self.last_success_ts: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.consecutive_failures: int = 0
+        self.request_count: int = 0
+        self.error_count: int = 0
+        self.last_latency_ms: Optional[float] = None
+        self.avg_latency_ms: Optional[float] = None
         logger.info(f"{self.symbol} Options Client initialized")
+
+    def _record_request(self, success: bool, latency_ms: float, error: Optional[str] = None) -> None:
+        self.request_count += 1
+        self.last_poll_ts = time.time()
+        self.last_latency_ms = latency_ms
+        self.avg_latency_ms = (
+            latency_ms if self.avg_latency_ms is None
+            else (latency_ms * 0.2) + (self.avg_latency_ms * 0.8)
+        )
+        if success:
+            self.last_success_ts = time.time()
+            self.consecutive_failures = 0
+            self.last_error = None
+        else:
+            self.error_count += 1
+            self.consecutive_failures += 1
+            self.last_error = error
     
     def _get_cached(self, key: str) -> Optional[any]:
         """Get cached value if not expired."""
@@ -59,13 +84,16 @@ class IBITOptionsClient:
         cached = self._get_cached("price")
         if cached:
             return cached
-        
+
+        start = time.perf_counter()
         try:
             info = self.ticker.info
             price = info.get('regularMarketPrice') or info.get('previousClose', 0)
             self._set_cache("price", price)
+            self._record_request(True, (time.perf_counter() - start) * 1000)
             return float(price)
         except Exception as e:
+            self._record_request(False, (time.perf_counter() - start) * 1000, str(e))
             logger.error(f"Error fetching IBIT price: {e}")
             return 0.0
     
@@ -80,12 +108,15 @@ class IBITOptionsClient:
         if cached:
             return cached
         
+        start = time.perf_counter()
         try:
             expirations = list(self.ticker.options)
             self._set_cache("expirations", expirations)
+            self._record_request(True, (time.perf_counter() - start) * 1000)
             logger.debug(f"Found {len(expirations)} IBIT expirations")
             return expirations
         except Exception as e:
+            self._record_request(False, (time.perf_counter() - start) * 1000, str(e))
             logger.error(f"Error fetching expirations: {e}")
             return []
     
@@ -137,12 +168,15 @@ class IBITOptionsClient:
         if cached:
             return cached
         
+        start = time.perf_counter()
         try:
             chain = self.ticker.option_chain(expiration)
             self._set_cache(cache_key, (chain.calls, chain.puts))
+            self._record_request(True, (time.perf_counter() - start) * 1000)
             logger.debug(f"Fetched chain for {expiration}: {len(chain.puts)} puts")
             return chain.calls, chain.puts
         except Exception as e:
+            self._record_request(False, (time.perf_counter() - start) * 1000, str(e))
             logger.error(f"Error fetching chain for {expiration}: {e}")
             return pd.DataFrame(), pd.DataFrame()
     
@@ -353,6 +387,38 @@ class IBITOptionsClient:
             'is_market_hours': is_market_hours,
             'timestamp': now.isoformat(),
         }
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Return health for dashboard."""
+        now = time.time()
+        age = (now - self.last_success_ts) if self.last_success_ts else None
+        if self.consecutive_failures > 0:
+            status = "degraded"
+        elif self.last_success_ts:
+            status = "ok"
+        else:
+            status = "unknown"
+
+        from ..core.status import build_status
+
+        return build_status(
+            name="ibit_options",
+            type="batch",
+            status=status,
+            last_success_ts=self.last_success_ts,
+            last_error=self.last_error,
+            consecutive_failures=self.consecutive_failures,
+            request_count=self.request_count,
+            error_count=self.error_count,
+            avg_latency_ms=round(self.avg_latency_ms, 2) if self.avg_latency_ms is not None else None,
+            last_latency_ms=round(self.last_latency_ms, 2) if self.last_latency_ms is not None else None,
+            last_poll_ts=self.last_poll_ts,
+            age_seconds=round(age, 1) if age is not None else None,
+            extras={
+                "symbol": self.symbol,
+                "cache_keys": len(self._cache),
+            },
+        )
     
     def get_bid_ask_quality(self, expiration: str, strike: float) -> Dict:
         """

@@ -3,45 +3,14 @@ Tests for BarBuilder volume-delta and late-tick logic.
 
 Run with:  python -m pytest tests/test_bar_builder.py -v
 
-These tests load only the core bus/events/bar_builder modules via
-importlib to avoid pulling in heavy transitive dependencies
-(scipy, yfinance, etc.) through the package __init__.py files.
+These tests exercise the core bus/events/bar_builder modules only.
 """
 
-import importlib.util
-import os
-import sys
 import time
 
-_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-
-
-def _load_module(name: str, path: str):
-    """Load a single .py file as a module, skipping __init__.py chains."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    mod = importlib.util.module_from_spec(spec)
-    sys.modules[name] = mod
-    spec.loader.exec_module(mod)
-    return mod
-
-
-# Load only the three modules we need — no __init__.py involved.
-events_mod = _load_module(
-    "src.core.events", os.path.join(_ROOT, "src", "core", "events.py")
-)
-bus_mod = _load_module(
-    "src.core.bus", os.path.join(_ROOT, "src", "core", "bus.py")
-)
-bb_mod = _load_module(
-    "src.core.bar_builder", os.path.join(_ROOT, "src", "core", "bar_builder.py")
-)
-
-EventBus = bus_mod.EventBus
-BarBuilder = bb_mod.BarBuilder
-_minute_floor = bb_mod._minute_floor
-QuoteEvent = events_mod.QuoteEvent
-BarEvent = events_mod.BarEvent
-TOPIC_MARKET_BARS = events_mod.TOPIC_MARKET_BARS
+from src.core.bar_builder import BarBuilder, _minute_floor
+from src.core.bus import EventBus
+from src.core.events import BarEvent, QuoteEvent, TOPIC_MARKET_BARS
 
 
 def _quote(symbol: str, price: float, volume_24h: float, ts: float) -> QuoteEvent:
@@ -192,6 +161,30 @@ class TestLateTick:
         acc = bb._bars["BTC"]
         assert acc.high == 102.0
         assert acc.tick_count == 2
+
+
+class TestStatusCounters:
+    def test_status_updates_on_emit_and_late_tick(self):
+        bus = EventBus()
+        bb = BarBuilder(bus)
+
+        base = 1_700_000_000.0
+        minute0 = _minute_floor(base)
+        minute1 = minute0 + 60
+
+        bb._on_quote(_quote("BTC", 100.0, 500.0, minute0 + 1))
+        bb._on_quote(_quote("BTC", 101.0, 510.0, minute1 + 1))
+
+        # Late tick for the prior minute
+        bb._on_quote(_quote("BTC", 99.0, 520.0, minute0 + 30))
+
+        status = bb.get_status()
+        extras = status["extras"]
+
+        assert extras["bars_emitted_total"] == 1
+        assert extras["bars_emitted_by_symbol"]["BTC"] == 1
+        assert extras["late_ticks_dropped_total"] == 1
+        assert "BTC" in extras["last_bar_ts_by_symbol"]
 
 
 # ═══════════════════════════════════════════════════════════

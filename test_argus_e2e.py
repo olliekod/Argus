@@ -53,6 +53,10 @@ def test_import(module_path: str, name: str):
         return False
 
 
+# Prevent pytest from collecting this helper as a test.
+test_import.__test__ = False
+
+
 async def run_all_tests():
     """Run comprehensive end-to-end tests."""
     print("\n" + "=" * 60)
