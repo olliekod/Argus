@@ -404,6 +404,8 @@ class ArgusOrchestrator:
         self.paper_trader_farm.set_data_sources(
             get_conditions=self.conditions_monitor.get_current_conditions,
         )
+        # Wire Telegram callback for runaway safety alerts
+        self.paper_trader_farm.set_telegram_alert_callback(self._send_paper_notification)
         self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.trader_configs):,} traders")
 
         # Wire up data sources to daily review (after farm is ready)
@@ -877,8 +879,12 @@ class ArgusOrchestrator:
                     spread_width = short_strike - long_strike
                     entry_credit = trade.entry_credit
 
+                    # Guard: skip positions with invalid spread width or credit
+                    if spread_width <= 0 or not entry_credit or entry_credit <= 0:
+                        continue
+
                     if current_price >= short_strike:
-                        otm_pct = (current_price - short_strike) / current_price
+                        otm_pct = (current_price - short_strike) / current_price if current_price > 0 else 0
                         decay_factor = max(0.0, 1.0 - otm_pct * 10)
                         current_value = entry_credit * decay_factor * 0.3
                     elif current_price <= long_strike:
@@ -975,6 +981,9 @@ class ArgusOrchestrator:
 
         Decoupled from the research signal loop so exits still happen even
         if signal evaluation crashes.
+
+        On exception, reports the error to the farm's runaway safety
+        tracker so repeated failures can halt new entries.
         """
         if not self.paper_trader_farm:
             return
@@ -1003,6 +1012,9 @@ class ArgusOrchestrator:
                 self._exit_monitor_last_run = datetime.now(timezone.utc)
             except Exception as e:
                 self.logger.error(f"Exit monitor error: {e}")
+                # Feed error into farm runaway safety tracker
+                if self.paper_trader_farm:
+                    self.paper_trader_farm.record_exit_error()
             await asyncio.sleep(interval)
 
     async def _run_research_farm(self) -> None:

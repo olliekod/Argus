@@ -276,10 +276,13 @@ class PaperTrader:
         entry_credit: float,
         contracts: int,
         market_conditions: Dict,
-    ) -> PaperTrade:
+    ) -> Optional[PaperTrade]:
         """
         Execute a paper trade entry.
-        
+
+        Returns None (instead of raising) if the trade fails final validation,
+        so the farm loop can skip it gracefully.
+
         Args:
             symbol: Ticker symbol
             strikes: Strike prices (e.g., "$48/$44")
@@ -287,11 +290,39 @@ class PaperTrader:
             entry_credit: Credit received per contract
             contracts: Number of contracts
             market_conditions: Snapshot of conditions at entry
-            
+
         Returns:
-            Created paper trade
+            Created paper trade, or None if invalid
         """
+        # ── Final entry-point validation ──────────────────────────────
+        if entry_credit is None or entry_credit <= 0:
+            logger.debug(
+                f"[{self.config.trader_id}] REJECTED entry: "
+                f"invalid entry_credit={entry_credit!r} for {symbol}"
+            )
+            return None
+
+        if contracts is None or contracts <= 0:
+            logger.debug(
+                f"[{self.config.trader_id}] REJECTED entry: "
+                f"invalid contracts={contracts!r} for {symbol}"
+            )
+            return None
+
         normalized_expiry = self._normalize_expiry(expiry)
+        if normalized_expiry is None:
+            logger.debug(
+                f"[{self.config.trader_id}] REJECTED entry: "
+                f"could not normalize expiry={expiry!r} for {symbol}"
+            )
+            return None
+
+        if not strikes or strikes in ('N/A', 'NA'):
+            logger.debug(
+                f"[{self.config.trader_id}] REJECTED entry: "
+                f"invalid strikes={strikes!r} for {symbol}"
+            )
+            return None
 
         trade = PaperTrade(
             id=str(uuid.uuid4()),
@@ -305,25 +336,31 @@ class PaperTrader:
             contracts=contracts,
             market_conditions=market_conditions,
         )
-        
+
         self.open_positions.append(trade)
         self.stats['total_trades'] += 1
-        
+
         logger.info(
             f"[{self.config.trader_id}] ENTRY: {symbol} {strikes} "
             f"exp {normalized_expiry} @ ${entry_credit:.2f} x{contracts}"
         )
-        
+
         return trade
 
     @staticmethod
     def _normalize_expiry(expiry: Optional[str]) -> Optional[str]:
+        """Normalize expiry to YYYY-MM-DD or return None if unparseable."""
         if expiry is None:
             return None
         normalized = str(expiry).strip()
         if not normalized or normalized.upper() in {"N/A", "NA", "NONE", "NULL"}:
             return None
-        return normalized
+        # Validate it's a real date (YYYY-MM-DD)
+        try:
+            datetime.strptime(normalized[:10], "%Y-%m-%d")
+            return normalized[:10]
+        except (ValueError, TypeError):
+            return None
     
     def check_exits(
         self, 
@@ -358,14 +395,33 @@ class PaperTrader:
                 continue
             if trade.id not in current_prices:
                 continue
-            
+
             current_price = current_prices[trade.id]
             entry_credit = trade.entry_credit
-            
+
+            # Guard: if entry_credit is zero/None the position is invalid.
+            # Close it immediately rather than dividing by zero.
+            if not entry_credit or entry_credit <= 0:
+                logger.warning(
+                    f"[{self.config.trader_id}] INVALID trade {trade.id}: "
+                    f"entry_credit={entry_credit!r}, symbol={trade.symbol}, "
+                    f"strikes={trade.strikes}. Closing as invalid_entry_zero_credit."
+                )
+                trade.status = 'closed'
+                trade.close_timestamp = now.isoformat()
+                trade.close_price = current_price
+                trade.realized_pnl = 0.0
+                if trade.market_conditions is None:
+                    trade.market_conditions = {}
+                trade.market_conditions['close_reason'] = 'invalid_entry_zero_credit'
+                self.open_positions.remove(trade)
+                closed.append(trade)
+                continue
+
             # Calculate P&L per contract
             pnl_per = (entry_credit - current_price) * 100
             pnl_pct = (pnl_per / (entry_credit * 100)) * 100
-            
+
             should_close = False
             close_reason = ""
             
