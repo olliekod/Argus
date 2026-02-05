@@ -10,7 +10,12 @@ import time
 
 from src.core.bar_builder import BarBuilder, _minute_floor
 from src.core.bus import EventBus
-from src.core.events import BarEvent, QuoteEvent, TOPIC_MARKET_BARS
+from src.core.events import (
+    BarEvent,
+    MinuteTickEvent,
+    QuoteEvent,
+    TOPIC_MARKET_BARS,
+)
 
 
 def _quote(symbol: str, price: float, volume_24h: float, ts: float) -> QuoteEvent:
@@ -184,7 +189,54 @@ class TestStatusCounters:
         assert extras["bars_emitted_total"] == 1
         assert extras["bars_emitted_by_symbol"]["BTC"] == 1
         assert extras["late_ticks_dropped_total"] == 1
+        assert extras["quotes_received_by_symbol"]["BTC"] == 3
         assert "BTC" in extras["last_bar_ts_by_symbol"]
+
+
+class TestContinuityWithoutSyntheticBars:
+    def test_missing_minutes_do_not_emit_synthetic_bars(self):
+        bus = EventBus()
+        emitted = []
+        bus.subscribe(TOPIC_MARKET_BARS, lambda bar: emitted.append(bar))
+        bb = BarBuilder(bus)
+        bus.start()
+
+        try:
+            base = 1_700_000_000.0
+            minute0 = _minute_floor(base)
+            minute1 = minute0 + 60
+            minute2 = minute0 + 120
+            minute3 = minute0 + 180
+
+            bb._on_quote(_quote("BTC", 100.0, 100.0, minute0 + 5))
+            bb._on_minute_tick(MinuteTickEvent(timestamp=minute1))
+
+            bb._on_quote(_quote("BTC", 110.0, 150.0, minute2 + 5))
+            bb._on_minute_tick(MinuteTickEvent(timestamp=minute3))
+            _drain(bus)
+
+            assert len(emitted) == 2
+            timestamps = [bar.timestamp for bar in emitted]
+            assert minute0 in timestamps
+            assert minute2 in timestamps
+            assert minute1 not in timestamps
+        finally:
+            bus.stop()
+
+    def test_last_bar_ts_updates_on_minute_tick(self):
+        bus = EventBus()
+        bb = BarBuilder(bus)
+
+        base = 1_700_000_000.0
+        minute0 = _minute_floor(base)
+        minute1 = minute0 + 60
+
+        bb._on_quote(_quote("ETH", 200.0, 100.0, minute0 + 5))
+        bb._on_minute_tick(MinuteTickEvent(timestamp=minute1))
+
+        status = bb.get_status()
+        extras = status["extras"]
+        assert extras["last_bar_ts_by_symbol_epoch"]["ETH"] == minute0
 
 
 # ═══════════════════════════════════════════════════════════

@@ -114,6 +114,15 @@ class HeartbeatEvent:
     timestamp: float = field(default_factory=time.time)
 
 
+@dataclass(frozen=True, slots=True)
+class MinuteTickEvent:
+    """UTC minute-boundary tick event.
+
+    Published to: system.minute_tick
+    """
+    timestamp: float = field(default_factory=time.time)
+
+
 # ─── Topic constants ────────────────────────────────────────
 TOPIC_MARKET_QUOTES = "market.quotes"
 TOPIC_MARKET_BARS = "market.bars"
@@ -121,3 +130,4 @@ TOPIC_MARKET_METRICS = "market.metrics"
 TOPIC_SIGNALS = "signals.detections"
 TOPIC_SYSTEM_STATUS = "system.status"
 TOPIC_SYSTEM_HEARTBEAT = "system.heartbeat"
+TOPIC_SYSTEM_MINUTE_TICK = "system.minute_tick"

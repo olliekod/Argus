@@ -34,15 +34,18 @@ from __future__ import annotations
 import logging
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
-from typing import Dict
+from typing import Deque, Dict
 
 from .bus import EventBus
 from .events import (
     BarEvent,
+    MinuteTickEvent,
     QuoteEvent,
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_QUOTES,
+    TOPIC_SYSTEM_MINUTE_TICK,
 )
 
 logger = logging.getLogger("argus.bar_builder")
@@ -96,7 +99,11 @@ class BarBuilder:
         self._last_bar_ts_by_symbol: Dict[str, float] = {}
         self._late_ticks_dropped_total = 0
         self._late_ticks_dropped_by_symbol: Dict[str, int] = {}
+        self._quotes_received_by_symbol: Dict[str, int] = {}
+        self._bars_emitted_window_minutes = 60
+        self._bars_emitted_timestamps_by_symbol: Dict[str, Deque[float]] = {}
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
+        bus.subscribe(TOPIC_SYSTEM_MINUTE_TICK, self._on_minute_tick)
         logger.info("BarBuilder initialised — subscribed to %s", TOPIC_MARKET_QUOTES)
 
     # ── volume delta helper ─────────────────────────────────
@@ -131,6 +138,9 @@ class BarBuilder:
         if price <= 0:
             return
 
+        self._quotes_received_by_symbol[event.symbol] = (
+            self._quotes_received_by_symbol.get(event.symbol, 0) + 1
+        )
         vol_delta = self._volume_delta(event.symbol, event.volume_24h)
 
         with self._lock:
@@ -155,24 +165,7 @@ class BarBuilder:
 
             if minute > acc.ts_open:
                 # New minute — emit the completed bar and start fresh
-                bar = BarEvent(
-                    symbol=event.symbol,
-                    open=acc.open,
-                    high=acc.high,
-                    low=acc.low,
-                    close=acc.close,
-                    volume=acc.volume,
-                    timestamp=acc.ts_open,
-                    source=acc.source,
-                    bar_duration=60,
-                    tick_count=acc.tick_count,
-                )
-                self._bus.publish(TOPIC_MARKET_BARS, bar)
-                self._bars_emitted_total += 1
-                self._bars_emitted_by_symbol[event.symbol] = (
-                    self._bars_emitted_by_symbol.get(event.symbol, 0) + 1
-                )
-                self._last_bar_ts_by_symbol[event.symbol] = acc.ts_open
+                self._emit_bar(event.symbol, acc)
 
                 # Reset accumulator for the new minute
                 self._bars[event.symbol] = _BarAccumulator(
@@ -182,7 +175,45 @@ class BarBuilder:
                 # Same minute — update accumulator
                 acc.update(price, vol_delta)
 
+    def _on_minute_tick(self, event: MinuteTickEvent) -> None:
+        """Flush any bars whose minute has closed at a boundary tick."""
+        tick_minute = _minute_floor(event.timestamp)
+        with self._lock:
+            to_remove = []
+            for symbol, acc in self._bars.items():
+                if tick_minute > acc.ts_open:
+                    self._emit_bar(symbol, acc)
+                    to_remove.append(symbol)
+            for symbol in to_remove:
+                self._bars.pop(symbol, None)
+
     # ── utility ─────────────────────────────────────────────
+
+    def _emit_bar(self, symbol: str, acc: _BarAccumulator) -> BarEvent:
+        bar = BarEvent(
+            symbol=symbol,
+            open=acc.open,
+            high=acc.high,
+            low=acc.low,
+            close=acc.close,
+            volume=acc.volume,
+            timestamp=acc.ts_open,
+            source=acc.source,
+            bar_duration=60,
+            tick_count=acc.tick_count,
+        )
+        self._bus.publish(TOPIC_MARKET_BARS, bar)
+        self._bars_emitted_total += 1
+        self._bars_emitted_by_symbol[symbol] = self._bars_emitted_by_symbol.get(symbol, 0) + 1
+        self._last_bar_ts_by_symbol[symbol] = acc.ts_open
+
+        now = time.time()
+        window_seconds = self._bars_emitted_window_minutes * 60
+        ts_deque = self._bars_emitted_timestamps_by_symbol.setdefault(symbol, deque())
+        ts_deque.append(acc.ts_open)
+        while ts_deque and (now - ts_deque[0]) > window_seconds:
+            ts_deque.popleft()
+        return bar
 
     def flush(self) -> list[BarEvent]:
         """Flush all in-progress bars (e.g. on shutdown).
@@ -192,25 +223,7 @@ class BarBuilder:
         emitted: list[BarEvent] = []
         with self._lock:
             for symbol, acc in self._bars.items():
-                bar = BarEvent(
-                    symbol=symbol,
-                    open=acc.open,
-                    high=acc.high,
-                    low=acc.low,
-                    close=acc.close,
-                    volume=acc.volume,
-                    timestamp=acc.ts_open,
-                    source=acc.source,
-                    bar_duration=60,
-                    tick_count=acc.tick_count,
-                )
-                self._bus.publish(TOPIC_MARKET_BARS, bar)
-                emitted.append(bar)
-                self._bars_emitted_total += 1
-                self._bars_emitted_by_symbol[symbol] = (
-                    self._bars_emitted_by_symbol.get(symbol, 0) + 1
-                )
-                self._last_bar_ts_by_symbol[symbol] = acc.ts_open
+                emitted.append(self._emit_bar(symbol, acc))
             self._bars.clear()
         logger.info("BarBuilder flushed %d partial bars", len(emitted))
         return emitted
@@ -224,6 +237,11 @@ class BarBuilder:
             bars_emitted_by_symbol = dict(self._bars_emitted_by_symbol)
             late_ticks_total = self._late_ticks_dropped_total
             late_ticks_by_symbol = dict(self._late_ticks_dropped_by_symbol)
+            quotes_received_by_symbol = dict(self._quotes_received_by_symbol)
+            bars_emitted_recent_by_symbol = {
+                symbol: sum(1 for ts in timestamps if (now - ts) <= (self._bars_emitted_window_minutes * 60))
+                for symbol, timestamps in self._bars_emitted_timestamps_by_symbol.items()
+            }
 
         ages = {
             symbol: round(now - ts, 1)
@@ -254,12 +272,16 @@ class BarBuilder:
             extras={
                 "bars_emitted_total": bars_emitted_total,
                 "bars_emitted_by_symbol": bars_emitted_by_symbol,
+                "bars_emitted_recent_by_symbol": bars_emitted_recent_by_symbol,
+                "bars_emitted_recent_window_minutes": self._bars_emitted_window_minutes,
                 "last_bar_ts_by_symbol": {
                     symbol: datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
                     for symbol, ts in last_bar_ts.items()
                 },
+                "last_bar_ts_by_symbol_epoch": dict(last_bar_ts),
                 "late_ticks_dropped_total": late_ticks_total,
                 "late_ticks_dropped_by_symbol": late_ticks_by_symbol,
+                "quotes_received_by_symbol": quotes_received_by_symbol,
                 "active_symbols_count": len(active_symbols),
             },
         )
