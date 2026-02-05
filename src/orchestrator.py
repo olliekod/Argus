@@ -24,6 +24,8 @@ from .core.bus import EventBus
 from .core.events import (
     HeartbeatEvent,
     TOPIC_SYSTEM_HEARTBEAT,
+    MinuteTickEvent,
+    TOPIC_SYSTEM_MINUTE_TICK,
 )
 from .core.bar_builder import BarBuilder
 from .core.persistence import PersistenceManager
@@ -1841,6 +1843,7 @@ class ArgusOrchestrator:
 
         # Heartbeat publisher (drives persistence flush boundaries)
         self._tasks.append(asyncio.create_task(self._publish_heartbeats()))
+        self._tasks.append(asyncio.create_task(self._publish_minute_ticks()))
 
         # ── Trading tasks: DISABLED in collector mode ───
         if not is_collector:
@@ -1917,6 +1920,19 @@ class ArgusOrchestrator:
             self.event_bus.publish(
                 TOPIC_SYSTEM_HEARTBEAT,
                 HeartbeatEvent(sequence=seq),
+            )
+
+    async def _publish_minute_ticks(self) -> None:
+        """Emit minute-boundary ticks aligned to UTC minute boundaries."""
+        while self._running:
+            now = time.time()
+            next_minute = (int(now // 60) + 1) * 60
+            await asyncio.sleep(max(0.0, next_minute - now))
+            if not self._running:
+                break
+            self.event_bus.publish(
+                TOPIC_SYSTEM_MINUTE_TICK,
+                MinuteTickEvent(timestamp=next_minute),
             )
 
     async def stop(self) -> None:

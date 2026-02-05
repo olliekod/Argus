@@ -179,6 +179,10 @@ class EventBus:
             }
         return summary
 
+    def is_running(self) -> bool:
+        """Return True if the bus workers are running."""
+        return self._running
+
     # ──── internal ──────────────────────────────────────────
 
     def _worker_loop(self, topic: str) -> None:

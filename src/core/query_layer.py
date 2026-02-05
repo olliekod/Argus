@@ -156,6 +156,41 @@ class QueryLayer:
         if self._persistence and hasattr(self._persistence, "get_status"):
             last_write_ts = internal_status.get("persistence", {}).get("last_success_ts")
 
+        bar_continuity: Dict[str, Any] = {}
+        if "bar_builder" in internal_status:
+            bar_builder_status = internal_status["bar_builder"]
+            extras = bar_builder_status.get("extras", {})
+            last_bar_ts_epoch = extras.get("last_bar_ts_by_symbol_epoch", {}) or {}
+            recent_counts = extras.get("bars_emitted_recent_by_symbol", {}) or {}
+            window_minutes = extras.get("bars_emitted_recent_window_minutes", 60)
+            stale_threshold_seconds = 300
+            now = time.time()
+            running = self._bus.is_running() if hasattr(self._bus, "is_running") else True
+            for symbol, ts in last_bar_ts_epoch.items():
+                if ts is None:
+                    continue
+                bar_age_seconds = round(now - ts, 1)
+                expected_minutes = window_minutes
+                observed_minutes = recent_counts.get(symbol, 0)
+                missing_estimate = max(expected_minutes - observed_minutes, 0) if expected_minutes else None
+                if not running:
+                    state = "stopped"
+                elif bar_age_seconds > stale_threshold_seconds:
+                    state = "stale"
+                else:
+                    state = "fresh"
+                bar_continuity[symbol] = {
+                    "bar_age_seconds": bar_age_seconds,
+                    "missing_bar_estimate": missing_estimate,
+                    "status": state,
+                }
+            bar_builder_status["continuity"] = {
+                "running": running,
+                "stale_threshold_seconds": stale_threshold_seconds,
+                "window_minutes": window_minutes,
+                "symbols": bar_continuity,
+            }
+
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "bus": {
