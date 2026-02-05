@@ -10,7 +10,7 @@ Now with optional GPU acceleration via gpu_engine.
 
 import math
 from dataclasses import dataclass
-from typing import Literal, Optional, Tuple
+from typing import Dict, Literal, Optional, Tuple
 from scipy.stats import norm
 import logging
 

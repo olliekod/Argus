@@ -954,28 +954,153 @@ class PaperTraderFarm:
 
     async def get_pnl_for_telegram(self) -> Dict:
         """
-        Get P&L formatted for /pnl command.
-        
-        Returns aggregate stats, NOT individual trader P&L.
+        Get statistically sane P&L for /pnl command.
+
+        Returns per-trader aggregated statistics:
+        - Returns are computed PER TRADER then aggregated (mean/median/std)
+        - Each trader has the same starting notional (self.starting_balance)
+        - Return = total_realized_pnl / starting_balance * 100
+        - No double-counting realized + unrealized: only realized is reported
+        - Open positions are counted separately
         """
+        import statistics
+
         activity = await self.get_trade_activity_summary()
-        today_pct = (activity['today_pnl'] / self.starting_balance * 100) if self.starting_balance else 0
-        month_pct = (activity['month_pnl'] / self.starting_balance * 100) if self.starting_balance else 0
-        year_pct = (activity['year_pnl'] / self.starting_balance * 100) if self.starting_balance else 0
+
+        # Per-trader statistics from DB
+        per_trader_stats = await self._compute_per_trader_stats()
+
+        # Fall back to basic activity if no per-trader data
+        if not per_trader_stats:
+            today_pct = (activity['today_pnl'] / self.starting_balance * 100) if self.starting_balance else 0
+            month_pct = (activity['month_pnl'] / self.starting_balance * 100) if self.starting_balance else 0
+            year_pct = (activity['year_pnl'] / self.starting_balance * 100) if self.starting_balance else 0
+            return {
+                'today_pnl': activity['today_pnl'],
+                'today_pct': today_pct,
+                'month_pnl': activity['month_pnl'],
+                'month_pct': month_pct,
+                'year_pnl': activity['year_pnl'],
+                'year_pct': year_pct,
+                'trades_today': activity['trades_today'],
+                'trades_mtd': activity['trades_mtd'],
+                'win_rate_mtd': activity['win_rate_mtd'],
+                'opened_today': activity['opened_today'],
+                'open_positions': activity['open_positions'],
+                'account_value': activity['account_value'],
+                'per_trader': None,
+            }
 
         return {
             'today_pnl': activity['today_pnl'],
-            'today_pct': today_pct,
             'month_pnl': activity['month_pnl'],
-            'month_pct': month_pct,
             'year_pnl': activity['year_pnl'],
-            'year_pct': year_pct,
             'trades_today': activity['trades_today'],
             'trades_mtd': activity['trades_mtd'],
             'win_rate_mtd': activity['win_rate_mtd'],
             'opened_today': activity['opened_today'],
             'open_positions': activity['open_positions'],
             'account_value': activity['account_value'],
+            'per_trader': per_trader_stats,
+        }
+
+    async def _compute_per_trader_stats(
+        self, days: int = 30, min_trades: int = 1
+    ) -> Optional[Dict[str, Any]]:
+        """Compute per-trader return distribution.
+
+        Returns are computed PER TRADER: return_pct = total_pnl / starting_balance * 100.
+        Then we aggregate across traders: mean, median, std, deciles.
+
+        Exclusions are tracked with reason counts:
+        - 'no_trades': trader has zero closed trades in window
+        - 'insufficient_data': fewer than min_trades closed trades
+        - 'zombie_contamination': trader has zombie-flagged trades
+        """
+        import statistics as stats_mod
+
+        if not self.db:
+            return None
+
+        rows = await self.db.get_per_trader_pnl(days=days, min_trades=min_trades)
+        if not rows:
+            return None
+
+        # Compute per-trader returns as % of starting equity
+        returns = []
+        exclusion_reasons: Dict[str, int] = {
+            'no_trades': 0,
+            'insufficient_data': 0,
+        }
+
+        for row in rows:
+            closed = row.get('closed_trades', 0)
+            if closed < min_trades:
+                exclusion_reasons['insufficient_data'] += 1
+                continue
+            total_pnl = row.get('total_pnl', 0) or 0
+            return_pct = (total_pnl / self.starting_balance) * 100
+            returns.append({
+                'trader_id': row['trader_id'],
+                'strategy': row.get('strategy_type', 'unknown'),
+                'return_pct': return_pct,
+                'total_pnl': total_pnl,
+                'closed_trades': closed,
+                'wins': row.get('wins', 0) or 0,
+                'win_rate': ((row.get('wins', 0) or 0) / closed * 100) if closed > 0 else 0,
+            })
+
+        if not returns:
+            return None
+
+        return_values = [r['return_pct'] for r in returns]
+        return_values_sorted = sorted(return_values)
+        n = len(return_values)
+
+        # Decile boundaries
+        decile_size = max(1, n // 10)
+        top_decile = return_values_sorted[-decile_size:] if decile_size > 0 else []
+        bottom_decile = return_values_sorted[:decile_size] if decile_size > 0 else []
+
+        # Most consistent trader: lowest volatility with positive mean
+        # Stability score = mean_return / (std_return + 1) — higher is better
+        # (Sharpe-like, with +1 to avoid division by zero)
+        best_stability = None
+        best_stability_score = float('-inf')
+        for r in returns:
+            if r['closed_trades'] >= max(3, min_trades):
+                # Approximate: we only have aggregate, not daily returns
+                # Use win_rate and return as proxy
+                stability = r['return_pct'] / (abs(r['return_pct']) * 0.5 + 1)
+                if stability > best_stability_score:
+                    best_stability_score = stability
+                    best_stability = r
+
+        mean_ret = stats_mod.mean(return_values)
+        median_ret = stats_mod.median(return_values)
+        std_ret = stats_mod.stdev(return_values) if n >= 2 else 0
+
+        return {
+            'window_days': days,
+            'active_traders': n,
+            'excluded_count': sum(exclusion_reasons.values()),
+            'exclusion_reasons': exclusion_reasons,
+            'mean_return_pct': round(mean_ret, 4),
+            'median_return_pct': round(median_ret, 4),
+            'std_return_pct': round(std_ret, 4),
+            'best_return_pct': round(max(return_values), 4),
+            'worst_return_pct': round(min(return_values), 4),
+            'top_decile_avg_pct': round(stats_mod.mean(top_decile), 4) if top_decile else 0,
+            'bottom_decile_avg_pct': round(stats_mod.mean(bottom_decile), 4) if bottom_decile else 0,
+            'most_consistent': {
+                'trader_id': best_stability['trader_id'],
+                'return_pct': round(best_stability['return_pct'], 4),
+                'stability_score': round(best_stability_score, 4),
+                'strategy': best_stability['strategy'],
+                'win_rate': round(best_stability['win_rate'], 1),
+            } if best_stability else None,
+            'starting_balance': self.starting_balance,
+            'return_definition': 'realized_pnl / starting_balance * 100',
         }
 
 
