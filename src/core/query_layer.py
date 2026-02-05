@@ -76,7 +76,15 @@ class QueryLayer:
         connector_health: Dict[str, Any] = {}
         for name, conn in self._connectors.items():
             health = {"status": "unknown"}
-            if hasattr(conn, "get_health"):
+            if hasattr(conn, "get_health_status"):
+                try:
+                    health = conn.get_health_status()
+                    # Add status key for backward compatibility or simple UI checks
+                    if "status" not in health:
+                        health["status"] = "ok" if health.get("connected") else "disconnected"
+                except Exception as exc:
+                    health = {"status": "error", "error": str(exc)}
+            elif hasattr(conn, "get_health"):
                 try:
                     health = conn.get_health()
                 except Exception as exc:
@@ -178,6 +186,7 @@ class QueryLayer:
             "detections",
             "price_snapshots",
             "system_health",
+            "market_metrics",
         ]
         latest = await self._db.get_latest_timestamps(tables_to_check)
 

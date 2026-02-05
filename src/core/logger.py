@@ -91,6 +91,21 @@ class ColoredFormatter(logging.Formatter):
         return super().format(record)
 
 
+class RingBufferHandler(logging.Handler):
+    """Logging handler that appends to a collections.deque (ring buffer)."""
+
+    def __init__(self, buffer: Any):
+        super().__init__()
+        self.buffer = buffer
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            self.buffer.append(msg)
+        except Exception:
+            self.handleError(record)
+
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
@@ -106,6 +121,7 @@ def setup_logger(
     file_level: str = None,
     max_bytes: int = None,
     backup_count: int = None,
+    ring_buffer: Any = None,
 ) -> logging.Logger:
     """
     Set up root Argus logger with console + size-rotated file handlers.
@@ -151,6 +167,16 @@ def setup_logger(
         datefmt='%Y-%m-%d %H:%M:%S',
     ))
     logger.addHandler(file_handler)
+
+    # --- Ring Buffer (for Dashboard) ---
+    if ring_buffer is not None:
+        rb_handler = RingBufferHandler(ring_buffer)
+        rb_handler.setLevel(logging.INFO)
+        rb_handler.setFormatter(logging.Formatter(
+            '%(asctime)s [%(uptime)s] %(levelname)-8s %(name)s  %(message)s',
+            datefmt='%H:%M:%S',
+        ))
+        logger.addHandler(rb_handler)
 
     _ROOT_LOGGER_CONFIGURED = True
     return logger

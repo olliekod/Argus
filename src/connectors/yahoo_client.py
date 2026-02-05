@@ -45,6 +45,8 @@ class YahooFinanceClient:
 
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
+        self.last_message_ts: Optional[float] = None
+        self.reconnect_attempts = 0
 
         # Latest data cache
         self.prices: Dict[str, Dict] = {}
@@ -88,6 +90,8 @@ class YahooFinanceClient:
         try:
             async with session.get(url, params=params, headers=headers) as resp:
                 if resp.status == 200:
+                    import time
+                    self.last_message_ts = time.time()
                     data = await resp.json()
                     
                     result = data.get('chart', {}).get('result', [])
@@ -234,3 +238,15 @@ class YahooFinanceClient:
     def get_ibit_data(self) -> Optional[Dict]:
         """Get IBIT data specifically."""
         return self.prices.get('IBIT')
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Return health for dashboard."""
+        import time
+        now = time.time()
+        age = (now - self.last_message_ts) if self.last_message_ts else None
+        return {
+            'connected': self._session is not None and not self._session.closed,
+            'seconds_since_last_message': round(age, 1) if age is not None else None,
+            'reconnect_attempts': self.reconnect_attempts,
+            'symbols': len(self.symbols),
+        }

@@ -36,8 +36,10 @@ from .bus import EventBus
 from .events import (
     BarEvent,
     HeartbeatEvent,
+    MetricEvent,
     SignalEvent,
     TOPIC_MARKET_BARS,
+    TOPIC_MARKET_METRICS,
     TOPIC_SIGNALS,
     TOPIC_SYSTEM_HEARTBEAT,
 )
@@ -82,6 +84,7 @@ class PersistenceManager:
         bus.subscribe(TOPIC_MARKET_BARS, self._on_bar)
         bus.subscribe(TOPIC_SIGNALS, self._on_signal)
         bus.subscribe(TOPIC_SYSTEM_HEARTBEAT, self._on_heartbeat)
+        bus.subscribe(TOPIC_MARKET_METRICS, self._on_metric)
 
         logger.info("PersistenceManager initialised")
 
@@ -130,6 +133,17 @@ class PersistenceManager:
     def _on_heartbeat(self, event: HeartbeatEvent) -> None:
         """Flush buffered bars on heartbeat boundary."""
         self._do_flush()
+
+    def _on_metric(self, event: MetricEvent) -> None:
+        """Persist market metrics immediately."""
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._write_metric(event), self._loop
+            )
+            # Result check optional for metrics, but helps catch schema errors early
+            future.result(timeout=10.0)
+        except Exception:
+            logger.exception("Failed to persist metric %s", event.metric)
 
     # ── flush logic ─────────────────────────────────────────
 
@@ -203,3 +217,26 @@ class PersistenceManager:
             ),
         )
         logger.debug("Persisted signal: %s %s", event.detector, event.signal_type)
+
+    async def _write_metric(self, event: MetricEvent) -> None:
+        """Generic DB writer for market metrics."""
+        import json
+        ts_iso = datetime.fromtimestamp(event.timestamp, tz=timezone.utc).isoformat()
+        
+        # metadata_json handling
+        meta = None
+        if event.extra:
+            try:
+                meta = json.dumps(event.extra)
+            except (TypeError, ValueError):
+                meta = str(event.extra)
+
+        await self._db.insert_market_metric(
+            timestamp=ts_iso,
+            source=event.source,
+            symbol=event.symbol,
+            metric=event.metric,
+            value=event.value,
+            metadata_json=meta
+        )
+        logger.debug("Persisted metric: %s:%s=%s", event.symbol, event.metric, event.value)

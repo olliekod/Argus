@@ -83,9 +83,12 @@ class ArgusOrchestrator:
         # ── Global mode (read once at boot) ─────────────
         self.mode: str = os.environ.get("ARGUS_MODE", "collector").lower()
 
+        # Recent log lines ring buffer for dashboard (must be before logger setup)
+        self._recent_logs: deque = deque(maxlen=200)
+
         # Setup logging
         log_level = self.config.get('system', {}).get('log_level', 'INFO')
-        setup_logger('argus', level=log_level)
+        setup_logger('argus', level=log_level, ring_buffer=self._recent_logs)
         self.logger = get_logger('orchestrator')
 
         # ── Collector-mode banner ───────────────────────
@@ -196,9 +199,6 @@ class ArgusOrchestrator:
 
         # Market hours config
         self._mh_cfg = self.config.get('market_hours', {})
-
-        # Recent log lines ring buffer for dashboard
-        self._recent_logs: deque = deque(maxlen=200)
 
         self.logger.info("Argus Orchestrator initialized")
     
@@ -1578,22 +1578,26 @@ class ArgusOrchestrator:
         return self._status_snapshot.get('system', {'db_size_mb': 0, 'boot_phases': self._format_boot_phases()})
 
     async def _get_provider_statuses(self) -> Dict[str, Any]:
-        """Provider health for dashboard."""
+        """Provider health for dashboard, dynamically pulling from connectors."""
         result: Dict[str, Any] = {}
-        if self.bybit_ws:
-            result['bybit'] = self.bybit_ws.get_health_status()
-        if self.deribit_client:
-            result['deribit'] = {
-                'connected': True,
-                'seconds_since_last_message': None,
-                'reconnect_attempts': 0,
-            }
-        if self.yahoo_client:
-            result['yahoo'] = {
-                'connected': True,
-                'seconds_since_last_message': None,
-                'reconnect_attempts': 0,
-            }
+        providers = {
+            'bybit': self.bybit_ws,
+            'deribit': self.deribit_client,
+            'yahoo': self.yahoo_client
+        }
+        for name, client in providers.items():
+            if not client:
+                continue
+            if hasattr(client, 'get_health_status'):
+                result[name] = client.get_health_status()
+            elif hasattr(client, 'get_health'):
+                result[name] = client.get_health()
+            else:
+                result[name] = {
+                    'connected': getattr(client, 'is_connected', True),
+                    'seconds_since_last_message': getattr(client, 'last_message_age', None),
+                    'reconnect_attempts': getattr(client, 'reconnect_attempts', 0),
+                }
         return result
 
     async def _compute_pnl_summary(self) -> Dict:
@@ -1625,7 +1629,7 @@ class ArgusOrchestrator:
 
         try:
             if cmd == '/pnl':
-                data = await self._get_pnl_summary()
+                data = await self._compute_pnl_summary()
                 return (
                     f"Today: ${data.get('today_pnl', 0):+.2f}\n"
                     f"MTD: ${data.get('month_pnl', 0):+.2f}\n"
@@ -1634,16 +1638,18 @@ class ArgusOrchestrator:
                     f"Open positions: {data.get('open_positions', 0)}"
                 )
             elif cmd == '/status':
-                data = await self._get_status_summary()
-                return str(data)
+                if self.query_layer:
+                    data = await self.query_layer.status()
+                    return str(data)
+                return "Query layer not initialized"
             elif cmd == '/positions':
-                data = await self._get_positions_summary()
+                data = await self._compute_positions_summary()
                 return "\n".join(
                     f"{p['symbol']} ({p['strategy']}): {p['count']} positions"
                     for p in data
                 ) or "No open positions"
             elif cmd == '/zombies':
-                data = await self._get_zombies()
+                data = self._zombies_snapshot
                 return data.get('report', f"Total zombies: {data.get('total', 0)}")
             elif cmd.startswith('/zombie_clean'):
                 if self.paper_trader_farm:
@@ -1651,7 +1657,7 @@ class ArgusOrchestrator:
                     return f"Closed {n} zombie positions"
                 return "Farm not initialized"
             elif cmd == '/dashboard':
-                data = await self._get_dashboard()
+                data = await self._get_dashboard_system_status()
                 return str(data)
             elif cmd.startswith('/reset_paper'):
                 parts = cmd.split()
@@ -1680,6 +1686,11 @@ class ArgusOrchestrator:
             elif cmd == '/maintenance':
                 stats = await self.db.run_maintenance()
                 return f"Maintenance complete. DB: {stats['db_size_mb']} MB"
+            elif cmd == '/db':
+                if self.query_layer:
+                    data = await self.query_layer.db()
+                    return str(data)
+                return "Query layer not initialized"
             else:
                 return f"Unknown command: {cmd}"
         except Exception as e:

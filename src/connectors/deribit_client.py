@@ -46,6 +46,8 @@ class DeribitClient:
         self._request_count = 0
         self._last_reset = datetime.utcnow()
         self._event_bus = event_bus
+        self.last_message_ts: Optional[float] = None
+        self.reconnect_attempts = 0  # REST doesn't "reconnect", but we track errors
 
         logger.info(f"Deribit client initialized ({'testnet' if testnet else 'mainnet'})")
     
@@ -86,6 +88,9 @@ class DeribitClient:
                 
                 if 'error' in data:
                     logger.warning(f"Deribit API error: {data['error']}")
+                else:
+                    import time
+                    self.last_message_ts = time.time()
                 
                 return data
         except Exception as e:
@@ -370,3 +375,15 @@ class DeribitClient:
                 logger.error(f"Error polling IV: {e}")
             
             await asyncio.sleep(interval_seconds)
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Return health for dashboard."""
+        import time
+        now = time.time()
+        age = (now - self.last_message_ts) if self.last_message_ts else None
+        return {
+            'connected': self._session is not None and not self._session.closed,
+            'seconds_since_last_message': round(age, 1) if age is not None else None,
+            'reconnect_attempts': self.reconnect_attempts,
+            'request_count_min': self._request_count,
+        }

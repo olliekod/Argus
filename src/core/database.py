@@ -375,6 +375,24 @@ class Database:
             "ON signal_events(timestamp)"
         )
 
+        # Generic market metrics (Funding, IV, Correlation, etc.)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS market_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                value REAL,
+                metadata_json TEXT,
+                UNIQUE(timestamp, source, symbol, metric)
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_metrics_query "
+            "ON market_metrics(symbol, metric, timestamp)"
+        )
+
         await self._connection.commit()
 
         logger.debug("Database tables created/verified")
@@ -757,6 +775,27 @@ class Database:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
+    # =========================================================================
+    # Market Metrics Operations
+    # =========================================================================
+
+    async def insert_market_metric(
+        self,
+        timestamp: str,
+        source: str,
+        symbol: str,
+        metric: str,
+        value: float,
+        metadata_json: Optional[str] = None
+    ) -> None:
+        """Insert a generic market metric record (deduplicated)."""
+        await self._connection.execute("""
+            INSERT OR IGNORE INTO market_metrics (
+                timestamp, source, symbol, metric, value, metadata_json
+            ) VALUES (?, ?, ?, ?, ?, ?)
+        """, (timestamp, source, symbol, metric, value, metadata_json))
+        await self._connection.commit()
+
     async def get_latest_timestamps(self, tables: List[str]) -> Dict[str, Optional[str]]:
         """Fetch the most recent timestamp for each table."""
         results: Dict[str, Optional[str]] = {}
@@ -1030,7 +1069,7 @@ class Database:
         tables = [
             'detections', 'funding_rates', 'options_iv', 'liquidations',
             'price_snapshots', 'system_health', 'daily_stats',
-            'market_bars', 'signal_events',
+            'market_bars', 'signal_events', 'market_metrics',
         ]
         # Also check paper_trades if it exists
         try:
