@@ -48,6 +48,15 @@ class DeribitClient:
         self._event_bus = event_bus
         self.last_message_ts: Optional[float] = None
         self.reconnect_attempts = 0  # REST doesn't "reconnect", but we track errors
+        self._request_count_total = 0
+        self.last_success_ts: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.consecutive_failures: int = 0
+        self.error_count: int = 0
+        self.last_latency_ms: Optional[float] = None
+        self.avg_latency_ms: Optional[float] = None
+        self.last_poll_ts: Optional[float] = None
+        self.last_http_status: Optional[int] = None
 
         logger.info(f"Deribit client initialized ({'testnet' if testnet else 'mainnet'})")
     
@@ -81,19 +90,38 @@ class DeribitClient:
         
         session = await self._get_session()
         url = f"{self.base_url}/public/{method}"
+        start = asyncio.get_running_loop().time()
+        self.last_poll_ts = datetime.utcnow().timestamp()
+        self._request_count_total += 1
         
         try:
             async with session.get(url, params=params) as resp:
+                self.last_http_status = resp.status
                 data = await resp.json()
                 
                 if 'error' in data:
+                    self.last_error = str(data.get('error'))
+                    self.error_count += 1
+                    self.consecutive_failures += 1
                     logger.warning(f"Deribit API error: {data['error']}")
                 else:
                     import time
                     self.last_message_ts = time.time()
+                    self.last_success_ts = self.last_message_ts
+                    self.consecutive_failures = 0
+                    self.last_error = None
                 
+                latency_ms = (asyncio.get_running_loop().time() - start) * 1000
+                self.last_latency_ms = latency_ms
+                self.avg_latency_ms = (
+                    latency_ms if self.avg_latency_ms is None
+                    else (latency_ms * 0.2) + (self.avg_latency_ms * 0.8)
+                )
                 return data
         except Exception as e:
+            self.last_error = str(e)
+            self.error_count += 1
+            self.consecutive_failures += 1
             logger.error(f"Deribit request failed: {e}")
             return {'error': str(e)}
     
@@ -381,9 +409,32 @@ class DeribitClient:
         import time
         now = time.time()
         age = (now - self.last_message_ts) if self.last_message_ts else None
-        return {
-            'connected': self._session is not None and not self._session.closed,
-            'seconds_since_last_message': round(age, 1) if age is not None else None,
-            'reconnect_attempts': self.reconnect_attempts,
-            'request_count_min': self._request_count,
-        }
+        if self.consecutive_failures > 0:
+            status = "degraded"
+        elif self.last_success_ts:
+            status = "ok"
+        else:
+            status = "unknown"
+
+        from ..core.status import build_status
+
+        return build_status(
+            name="deribit",
+            type="rest",
+            status=status,
+            last_success_ts=self.last_success_ts,
+            last_error=self.last_error,
+            consecutive_failures=self.consecutive_failures,
+            reconnect_attempts=self.reconnect_attempts,
+            request_count=self._request_count_total,
+            error_count=self.error_count,
+            avg_latency_ms=round(self.avg_latency_ms, 2) if self.avg_latency_ms is not None else None,
+            last_latency_ms=round(self.last_latency_ms, 2) if self.last_latency_ms is not None else None,
+            last_poll_ts=self.last_poll_ts,
+            age_seconds=round(age, 1) if age is not None else None,
+            extras={
+                "connected": self._session is not None and not self._session.closed,
+                "rate_limit_remaining": max(self._rate_limit - self._request_count, 0),
+                "last_http_status": self.last_http_status,
+            },
+        )

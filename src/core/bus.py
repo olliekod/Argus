@@ -64,6 +64,7 @@ class EventBus:
         self._running = False
         self._lock = threading.Lock()
         self._stats: Dict[str, Dict[str, int]] = {}
+        self._queue_peak: Dict[str, int] = {}
 
     # ──── public API ────────────────────────────────────────
 
@@ -84,7 +85,10 @@ class EventBus:
                     "processed": 0,
                     "dropped": 0,
                     "errors": 0,
+                    "last_worker_lag_ms": None,
+                    "avg_worker_lag_ms": None,
                 }
+                self._queue_peak[topic] = 0
             self._subscribers[topic].append(handler)
         logger.debug("subscribed %s to %s", handler.__qualname__, topic)
 
@@ -100,6 +104,9 @@ class EventBus:
             return  # no subscribers for this topic
         was_full = len(q) == q.maxlen
         q.append(event)
+        depth = len(q)
+        if depth > self._queue_peak.get(topic, 0):
+            self._queue_peak[topic] = depth
         if was_full:
             self._stats[topic]["dropped"] += 1
         self._stats[topic]["published"] += 1
@@ -156,6 +163,22 @@ class EventBus:
         """Current number of events waiting in each topic queue."""
         return {topic: len(q) for topic, q in self._queues.items()}
 
+    def get_status_summary(self) -> Dict[str, Any]:
+        """Return enriched per-topic status metrics for /status."""
+        summary: Dict[str, Any] = {}
+        for topic, stats in self._stats.items():
+            summary[topic] = {
+                "events_published": stats.get("published", 0),
+                "handler_calls_processed": stats.get("processed", 0),
+                "dropped_events": stats.get("dropped", 0),
+                "worker_errors": stats.get("errors", 0),
+                "queue_depth": len(self._queues.get(topic, [])),
+                "peak_depth": self._queue_peak.get(topic, 0),
+                "last_worker_lag_ms": stats.get("last_worker_lag_ms"),
+                "avg_worker_lag_ms": stats.get("avg_worker_lag_ms"),
+            }
+        return summary
+
     # ──── internal ──────────────────────────────────────────
 
     def _worker_loop(self, topic: str) -> None:
@@ -186,6 +209,15 @@ class EventBus:
                         logger.debug("worker %s exiting", topic)
                         return
                     continue
+
+                if hasattr(item, "receive_time"):
+                    lag_ms = (time.time() - getattr(item, "receive_time")) * 1000
+                    stats["last_worker_lag_ms"] = round(lag_ms, 2)
+                    prev = stats.get("avg_worker_lag_ms")
+                    if prev is None:
+                        stats["avg_worker_lag_ms"] = round(lag_ms, 2)
+                    else:
+                        stats["avg_worker_lag_ms"] = round((lag_ms * 0.2) + (prev * 0.8), 2)
 
                 for handler in handlers:
                     try:

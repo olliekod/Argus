@@ -9,6 +9,10 @@ Tests the new Phase 6 components:
 - Economic Calendar (blackouts)
 """
 
+import pytest
+
+pytest.skip("Manual integration script (not for automated pytest runs).", allow_module_level=True)
+
 import asyncio
 import sys
 from pathlib import Path

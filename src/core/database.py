@@ -1096,6 +1096,11 @@ class Database:
             'row_counts': row_counts,
         }
 
+    def get_size_mb(self) -> float:
+        """Return DB size in MB without row scans (fast)."""
+        db_size = os.path.getsize(str(self.db_path)) if self.db_path.exists() else 0
+        return round(db_size / (1024 * 1024), 1)
+
     async def reset_paper_epoch(self, starting_equity: float, scope: str = 'all', reason: str = 'manual_reset') -> str:
         """Start a new paper equity epoch. Old data remains but is excluded from current metrics."""
         epoch_start = datetime.utcnow().isoformat()

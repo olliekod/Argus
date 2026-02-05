@@ -267,6 +267,8 @@ class ArgusOrchestrator:
                 "deribit": self.deribit_client,
                 "yahoo": self.yahoo_client,
             },
+            bar_builder=self.bar_builder,
+            persistence=self.persistence,
         )
         self._phase("query_layer_init")
 
@@ -1507,6 +1509,21 @@ class ArgusOrchestrator:
             except Exception as e:
                 self.logger.warning(f"Status snapshot providers error: {e}")
                 snapshot['providers'] = {'error': str(e)}
+            try:
+                if self.query_layer:
+                    status_v2 = await self.query_layer.status()
+                    snapshot['internal'] = status_v2.get('internal', {})
+                    snapshot['bus'] = status_v2.get('bus', {})
+                    snapshot['db'] = status_v2.get('db', {})
+                else:
+                    snapshot['internal'] = {}
+                    snapshot['bus'] = {}
+                    snapshot['db'] = {}
+            except Exception as e:
+                self.logger.warning(f"Status snapshot internal error: {e}")
+                snapshot['internal'] = {}
+                snapshot['bus'] = {}
+                snapshot['db'] = {}
 
             try:
                 snapshot['pnl'] = await self._compute_pnl_summary()
@@ -1573,9 +1590,20 @@ class ArgusOrchestrator:
         """System status for the dashboard /api/status endpoint."""
         cached = self._get_snapshot_section('system')
         if cached:
-            return cached
+            extra = {
+                "internal": self._get_snapshot_section("internal") or {},
+                "bus": self._get_snapshot_section("bus") or {},
+                "db": self._get_snapshot_section("db") or {},
+            }
+            return {**cached, **extra}
         await self._refresh_status_snapshot(force=True)
-        return self._status_snapshot.get('system', {'db_size_mb': 0, 'boot_phases': self._format_boot_phases()})
+        system = self._status_snapshot.get('system', {'db_size_mb': 0, 'boot_phases': self._format_boot_phases()})
+        extra = {
+            "internal": self._status_snapshot.get("internal", {}),
+            "bus": self._status_snapshot.get("bus", {}),
+            "db": self._status_snapshot.get("db", {}),
+        }
+        return {**system, **extra}
 
     async def _get_provider_statuses(self) -> Dict[str, Any]:
         """Provider health for dashboard, dynamically pulling from connectors."""
@@ -1583,21 +1611,44 @@ class ArgusOrchestrator:
         providers = {
             'bybit': self.bybit_ws,
             'deribit': self.deribit_client,
-            'yahoo': self.yahoo_client
+            'yahoo': self.yahoo_client,
+            'binance': None,
+            'okx': None,
+            'coinglass': None,
+            'coinbase': None,
+            'ibit_options': None,
         }
+        provider_types = {
+            'bybit': 'ws',
+            'binance': 'ws',
+            'deribit': 'rest',
+            'yahoo': 'rest',
+            'okx': 'rest',
+            'coinglass': 'rest',
+            'coinbase': 'rest',
+            'ibit_options': 'batch',
+        }
+        from .core.status import build_status
         for name, client in providers.items():
             if not client:
+                result[name] = build_status(
+                    name=name,
+                    type=provider_types.get(name, 'rest'),
+                    status='unknown',
+                    last_error='not_configured',
+                    extras={'configured': False},
+                )
                 continue
             if hasattr(client, 'get_health_status'):
                 result[name] = client.get_health_status()
             elif hasattr(client, 'get_health'):
                 result[name] = client.get_health()
             else:
-                result[name] = {
-                    'connected': getattr(client, 'is_connected', True),
-                    'seconds_since_last_message': getattr(client, 'last_message_age', None),
-                    'reconnect_attempts': getattr(client, 'reconnect_attempts', 0),
-                }
+                result[name] = build_status(
+                    name=name,
+                    type=provider_types.get(name, 'rest'),
+                    status='ok' if getattr(client, 'is_connected', True) else 'down',
+                )
         return result
 
     async def _compute_pnl_summary(self) -> Dict:

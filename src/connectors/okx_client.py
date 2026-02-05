@@ -52,6 +52,17 @@ class OKXClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._rate_limit = 5  # requests per second
         self._last_request_time = 0
+        self.last_message_ts: Optional[float] = None
+        self.last_success_ts: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.consecutive_failures: int = 0
+        self.reconnect_attempts: int = 0
+        self.request_count: int = 0
+        self.error_count: int = 0
+        self.last_latency_ms: Optional[float] = None
+        self.avg_latency_ms: Optional[float] = None
+        self.last_poll_ts: Optional[float] = None
+        self.last_http_status: Optional[int] = None
         
         logger.info("OKX client initialized")
     
@@ -93,6 +104,9 @@ class OKXClient:
         
         session = await self._get_session()
         url = f"{self.BASE_URL}{path}"
+        start = asyncio.get_running_loop().time()
+        self.last_poll_ts = time.time()
+        self.request_count += 1
         
         headers = {
             "Content-Type": "application/json",
@@ -111,13 +125,32 @@ class OKXClient:
         
         try:
             async with session.request(method, url, params=params, headers=headers) as resp:
+                self.last_http_status = resp.status
                 data = await resp.json()
                 
                 if data.get('code') != '0':
+                    self.last_error = str(data.get('msg'))
+                    self.error_count += 1
+                    self.consecutive_failures += 1
                     logger.warning(f"OKX API error: {data.get('msg')}")
+                else:
+                    self.last_message_ts = time.time()
+                    self.last_success_ts = self.last_message_ts
+                    self.consecutive_failures = 0
+                    self.last_error = None
+
+                latency_ms = (asyncio.get_running_loop().time() - start) * 1000
+                self.last_latency_ms = latency_ms
+                self.avg_latency_ms = (
+                    latency_ms if self.avg_latency_ms is None
+                    else (latency_ms * 0.2) + (self.avg_latency_ms * 0.8)
+                )
                 
                 return data
         except Exception as e:
+            self.last_error = str(e)
+            self.error_count += 1
+            self.consecutive_failures += 1
             logger.error(f"OKX request failed: {e}")
             return {'code': '-1', 'msg': str(e), 'data': []}
     
@@ -297,3 +330,36 @@ class OKXClient:
                     logger.error(f"Error polling {symbol}: {e}")
             
             await asyncio.sleep(interval_seconds)
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Return health for dashboard."""
+        now = time.time()
+        age = (now - self.last_message_ts) if self.last_message_ts else None
+        if self.consecutive_failures > 0:
+            status = "degraded"
+        elif self.last_success_ts:
+            status = "ok"
+        else:
+            status = "unknown"
+
+        from ..core.status import build_status
+
+        return build_status(
+            name="okx",
+            type="rest",
+            status=status,
+            last_success_ts=self.last_success_ts,
+            last_error=self.last_error,
+            consecutive_failures=self.consecutive_failures,
+            reconnect_attempts=self.reconnect_attempts,
+            request_count=self.request_count,
+            error_count=self.error_count,
+            avg_latency_ms=round(self.avg_latency_ms, 2) if self.avg_latency_ms is not None else None,
+            last_latency_ms=round(self.last_latency_ms, 2) if self.last_latency_ms is not None else None,
+            last_poll_ts=self.last_poll_ts,
+            age_seconds=round(age, 1) if age is not None else None,
+            extras={
+                "connected": self._session is not None and not self._session.closed,
+                "last_http_status": self.last_http_status,
+            },
+        )

@@ -6,6 +6,10 @@ Sends sample messages to verify Telegram is working.
 Run: python scripts/test_telegram.py
 """
 
+import pytest
+
+pytest.skip("Manual integration script (not for automated pytest runs).", allow_module_level=True)
+
 import sys
 import asyncio
 from pathlib import Path

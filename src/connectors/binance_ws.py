@@ -18,6 +18,23 @@ from ..core.logger import get_connector_logger
 logger = get_connector_logger('binance')
 
 
+def _ws_is_open(ws) -> bool:
+    """Check if a websocket connection is open across websockets versions."""
+    if ws is None:
+        return False
+    if hasattr(ws, 'closed'):
+        return not ws.closed
+    if hasattr(ws, 'open'):
+        return ws.open
+    if hasattr(ws, 'state'):
+        try:
+            from websockets.protocol import State
+            return ws.state == State.OPEN
+        except (ImportError, AttributeError):
+            pass
+    return False
+
+
 class BinanceWebSocket:
     """
     Binance WebSocket client for spot market data.
@@ -52,7 +69,18 @@ class BinanceWebSocket:
         self._ws: Optional[websockets.WebSocketClientProtocol] = None
         self._running = False
         self._reconnect_delay = 5
-        
+        self._connected_since: Optional[float] = None
+        self.last_message_ts: Optional[float] = None
+        self.last_success_ts: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.consecutive_failures: int = 0
+        self.reconnect_attempts: int = 0
+        self.request_count: int = 0
+        self.error_count: int = 0
+        self.last_latency_ms: Optional[float] = None
+        self.avg_latency_ms: Optional[float] = None
+        self.last_close_code: Optional[int] = None
+
         # Latest data cache
         self.tickers: Dict[str, Dict] = {}
         
@@ -88,6 +116,7 @@ class BinanceWebSocket:
                 ) as ws:
                     self._ws = ws
                     retry_count = 0
+                    self._connected_since = time.time()
                     
                     logger.info("Binance WebSocket connected")
                     
@@ -95,12 +124,20 @@ class BinanceWebSocket:
                     await self._message_loop()
                     
             except ConnectionClosed as e:
+                self.last_close_code = e.code
+                self.last_error = f"closed:{e.code}"
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.warning(f"Binance WebSocket closed: {e.code}")
             except Exception as e:
+                self.last_error = str(e)
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.error(f"Binance WebSocket error: {e}")
             
             if self._running:
                 retry_count += 1
+                self.reconnect_attempts += 1
                 delay = min(self._reconnect_delay * (2 ** min(retry_count, 5)), 300)
                 delay += (time.time() % 1)
                 logger.info(f"Reconnecting in {delay:.1f}s")
@@ -122,11 +159,21 @@ class BinanceWebSocket:
         
         async for message in self._ws:
             try:
+                self.last_message_ts = time.time()
+                self.last_success_ts = self.last_message_ts
+                self.request_count += 1
+                self.consecutive_failures = 0
                 data = json.loads(message)
                 await self._handle_message(data)
             except json.JSONDecodeError:
+                self.last_error = "invalid_json"
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.warning(f"Invalid JSON: {message[:100]}")
             except Exception as e:
+                self.last_error = str(e)
+                self.error_count += 1
+                self.consecutive_failures += 1
                 logger.error(f"Error handling message: {e}")
     
     async def _handle_message(self, data: Dict[str, Any]) -> None:
@@ -185,7 +232,46 @@ class BinanceWebSocket:
         ticker = self.get_ticker(symbol)
         return ticker['last_price'] if ticker else None
     
-    @property
     def is_connected(self) -> bool:
         """Check if WebSocket is connected."""
-        return self._ws is not None and self._ws.open
+        return _ws_is_open(self._ws)
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Return health for dashboard."""
+        now = time.time()
+        connected = self.is_connected()
+        age = (now - self.last_message_ts) if self.last_message_ts else None
+        if not connected:
+            status = "down" if self.last_error else "unknown"
+        elif age is not None and age > 120:
+            status = "degraded"
+        else:
+            status = "ok"
+
+        from ..core.status import build_status
+
+        return build_status(
+            name="binance",
+            type="ws",
+            status=status,
+            last_success_ts=self.last_success_ts,
+            last_error=self.last_error,
+            consecutive_failures=self.consecutive_failures,
+            reconnect_attempts=self.reconnect_attempts,
+            request_count=self.request_count,
+            error_count=self.error_count,
+            avg_latency_ms=self.avg_latency_ms,
+            last_latency_ms=self.last_latency_ms,
+            last_message_ts=self.last_message_ts,
+            age_seconds=round(age, 1) if age is not None else None,
+            extras={
+                "connected": connected,
+                "connected_since": (
+                    datetime.fromtimestamp(self._connected_since).isoformat()
+                    if self._connected_since
+                    else None
+                ),
+                "symbols": len(self.symbols),
+                "close_code": self.last_close_code,
+            },
+        )

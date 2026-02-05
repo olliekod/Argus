@@ -54,11 +54,26 @@ class QueryLayer:
         db: Any,
         detectors: Optional[Dict[str, Any]] = None,
         connectors: Optional[Dict[str, Any]] = None,
+        bar_builder: Optional[Any] = None,
+        persistence: Optional[Any] = None,
+        provider_names: Optional[List[str]] = None,
     ) -> None:
         self._bus = bus
         self._db = db
         self._detectors = detectors or {}
         self._connectors = connectors or {}
+        self._bar_builder = bar_builder
+        self._persistence = persistence
+        self._provider_names = provider_names or [
+            "bybit",
+            "deribit",
+            "yahoo",
+            "binance",
+            "okx",
+            "coinglass",
+            "coinbase",
+            "ibit_options",
+        ]
 
     # ── /status ─────────────────────────────────────────────
 
@@ -67,40 +82,92 @@ class QueryLayer:
 
         Returns a dict with:
         - ``bus``: per-topic queue depth and publish/process stats
-        - ``connectors``: per-connector health snapshot
-        - ``db``: connection status
+        - ``providers``: per-connector health snapshot
+        - ``internal``: BarBuilder/Persistence status
+        - ``db``: connection status and size
         """
-        bus_stats = self._bus.get_stats()
-        queue_depths = self._bus.get_queue_depths()
+        bus_stats = self._bus.get_status_summary()
 
         connector_health: Dict[str, Any] = {}
-        for name, conn in self._connectors.items():
-            health = {"status": "unknown"}
-            if hasattr(conn, "get_health_status"):
+        provider_types = {
+            "bybit": "ws",
+            "binance": "ws",
+            "deribit": "rest",
+            "yahoo": "rest",
+            "okx": "rest",
+            "coinglass": "rest",
+            "coinbase": "rest",
+            "ibit_options": "batch",
+        }
+        from .status import build_status
+        provider_names = list(dict.fromkeys(self._provider_names + list(self._connectors.keys())))
+        for name in provider_names:
+            conn = self._connectors.get(name)
+            health: Dict[str, Any]
+            if conn is None:
+                health = build_status(
+                    name=name,
+                    type=provider_types.get(name, "rest"),
+                    status="unknown",
+                    last_error="not_configured",
+                    extras={"configured": False},
+                )
+            elif hasattr(conn, "get_health_status"):
                 try:
                     health = conn.get_health_status()
-                    # Add status key for backward compatibility or simple UI checks
-                    if "status" not in health:
-                        health["status"] = "ok" if health.get("connected") else "disconnected"
                 except Exception as exc:
-                    health = {"status": "error", "error": str(exc)}
+                    health = build_status(
+                        name=name,
+                        type=provider_types.get(name, "rest"),
+                        status="unknown",
+                        last_error=str(exc),
+                    )
             elif hasattr(conn, "get_health"):
                 try:
                     health = conn.get_health()
                 except Exception as exc:
-                    health = {"status": "error", "error": str(exc)}
+                    health = build_status(
+                        name=name,
+                        type=provider_types.get(name, "rest"),
+                        status="unknown",
+                        last_error=str(exc),
+                    )
             elif hasattr(conn, "is_connected"):
-                health = {"status": "ok" if conn.is_connected else "disconnected"}
+                health = build_status(
+                    name=name,
+                    type=provider_types.get(name, "rest"),
+                    status="ok" if conn.is_connected else "down",
+                )
+            else:
+                health = build_status(
+                    name=name,
+                    type=provider_types.get(name, "rest"),
+                    status="unknown",
+                )
             connector_health[name] = health
+
+        internal_status: Dict[str, Any] = {}
+        if self._bar_builder and hasattr(self._bar_builder, "get_status"):
+            internal_status["bar_builder"] = self._bar_builder.get_status()
+        if self._persistence and hasattr(self._persistence, "get_status"):
+            internal_status["persistence"] = self._persistence.get_status()
+
+        last_write_ts = None
+        if self._persistence and hasattr(self._persistence, "get_status"):
+            last_write_ts = internal_status.get("persistence", {}).get("last_success_ts")
 
         return {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "bus": {
-                "queue_depths": queue_depths,
                 "stats": bus_stats,
             },
-            "connectors": connector_health,
-            "db": {"connected": self._db._connection is not None},
+            "providers": connector_health,
+            "internal": internal_status,
+            "db": {
+                "connected": self._db._connection is not None,
+                "db_size_mb": self._db.get_size_mb(),
+                "last_write_ts": last_write_ts,
+            },
         }
 
     # ── /market ─────────────────────────────────────────────

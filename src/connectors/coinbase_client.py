@@ -7,6 +7,7 @@ Replaces Binance WebSocket which blocks US IPs.
 """
 
 import asyncio
+import time
 from datetime import datetime
 from typing import Any, Callable, Dict, List, Optional
 import aiohttp
@@ -44,6 +45,17 @@ class CoinbaseClient:
         
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
+        self.last_message_ts: Optional[float] = None
+        self.last_success_ts: Optional[float] = None
+        self.last_error: Optional[str] = None
+        self.consecutive_failures: int = 0
+        self.reconnect_attempts: int = 0
+        self.request_count: int = 0
+        self.error_count: int = 0
+        self.last_latency_ms: Optional[float] = None
+        self.avg_latency_ms: Optional[float] = None
+        self.last_poll_ts: Optional[float] = None
+        self.last_http_status: Optional[int] = None
         
         # Latest data cache
         self.tickers: Dict[str, Dict] = {}
@@ -86,8 +98,12 @@ class CoinbaseClient:
         session = await self._get_session()
         url = f"{self.EXCHANGE_URL}/products/{symbol}/ticker"
         
+        start = asyncio.get_running_loop().time()
+        self.last_poll_ts = datetime.utcnow().timestamp()
+        self.request_count += 1
         try:
             async with session.get(url) as resp:
+                self.last_http_status = resp.status
                 if resp.status == 200:
                     data = await resp.json()
                     
@@ -100,12 +116,28 @@ class CoinbaseClient:
                         'ask_price': float(data.get('ask', 0)),
                         'volume_24h': float(data.get('volume', 0)),
                     }
+                    self.last_message_ts = time.time()
+                    self.last_success_ts = self.last_message_ts
+                    self.consecutive_failures = 0
+                    self.last_error = None
+                    latency_ms = (asyncio.get_running_loop().time() - start) * 1000
+                    self.last_latency_ms = latency_ms
+                    self.avg_latency_ms = (
+                        latency_ms if self.avg_latency_ms is None
+                        else (latency_ms * 0.2) + (self.avg_latency_ms * 0.8)
+                    )
                     
                     return parsed
                 else:
+                    self.error_count += 1
+                    self.consecutive_failures += 1
+                    self.last_error = f"http_{resp.status}"
                     logger.warning(f"Coinbase API error for {symbol}: {resp.status}")
                     return None
         except Exception as e:
+            self.error_count += 1
+            self.consecutive_failures += 1
+            self.last_error = str(e)
             logger.error(f"Coinbase request failed: {e}")
             return None
     
@@ -165,3 +197,37 @@ class CoinbaseClient:
     def is_connected(self) -> bool:
         """Check if client is running."""
         return self._running
+
+    def get_health_status(self) -> Dict[str, Any]:
+        """Return health for dashboard."""
+        now = time.time()
+        age = (now - self.last_message_ts) if self.last_message_ts else None
+        if self.consecutive_failures > 0:
+            status = "degraded"
+        elif self.last_success_ts:
+            status = "ok"
+        else:
+            status = "unknown"
+
+        from ..core.status import build_status
+
+        return build_status(
+            name="coinbase",
+            type="rest",
+            status=status,
+            last_success_ts=self.last_success_ts,
+            last_error=self.last_error,
+            consecutive_failures=self.consecutive_failures,
+            reconnect_attempts=self.reconnect_attempts,
+            request_count=self.request_count,
+            error_count=self.error_count,
+            avg_latency_ms=round(self.avg_latency_ms, 2) if self.avg_latency_ms is not None else None,
+            last_latency_ms=round(self.last_latency_ms, 2) if self.last_latency_ms is not None else None,
+            last_poll_ts=self.last_poll_ts,
+            age_seconds=round(age, 1) if age is not None else None,
+            extras={
+                "connected": self._session is not None and not self._session.closed,
+                "symbols": len(self.symbols),
+                "last_http_status": self.last_http_status,
+            },
+        )

@@ -33,6 +33,8 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
+from datetime import datetime, timezone
 from typing import Dict
 
 from .bus import EventBus
@@ -89,6 +91,11 @@ class BarBuilder:
         self._bars: Dict[str, _BarAccumulator] = {}   # symbol → accumulator
         self._last_cum_vol: Dict[str, float] = {}      # symbol → last cumulative volume_24h
         self._lock = threading.Lock()
+        self._bars_emitted_total = 0
+        self._bars_emitted_by_symbol: Dict[str, int] = {}
+        self._last_bar_ts_by_symbol: Dict[str, float] = {}
+        self._late_ticks_dropped_total = 0
+        self._late_ticks_dropped_by_symbol: Dict[str, int] = {}
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
         logger.info("BarBuilder initialised — subscribed to %s", TOPIC_MARKET_QUOTES)
 
@@ -140,6 +147,10 @@ class BarBuilder:
             # Discard ticks older than the active bar window.
             # Once a bar is emitted it must never change.
             if minute < acc.ts_open:
+                self._late_ticks_dropped_total += 1
+                self._late_ticks_dropped_by_symbol[event.symbol] = (
+                    self._late_ticks_dropped_by_symbol.get(event.symbol, 0) + 1
+                )
                 return
 
             if minute > acc.ts_open:
@@ -157,6 +168,11 @@ class BarBuilder:
                     tick_count=acc.tick_count,
                 )
                 self._bus.publish(TOPIC_MARKET_BARS, bar)
+                self._bars_emitted_total += 1
+                self._bars_emitted_by_symbol[event.symbol] = (
+                    self._bars_emitted_by_symbol.get(event.symbol, 0) + 1
+                )
+                self._last_bar_ts_by_symbol[event.symbol] = acc.ts_open
 
                 # Reset accumulator for the new minute
                 self._bars[event.symbol] = _BarAccumulator(
@@ -190,6 +206,60 @@ class BarBuilder:
                 )
                 self._bus.publish(TOPIC_MARKET_BARS, bar)
                 emitted.append(bar)
+                self._bars_emitted_total += 1
+                self._bars_emitted_by_symbol[symbol] = (
+                    self._bars_emitted_by_symbol.get(symbol, 0) + 1
+                )
+                self._last_bar_ts_by_symbol[symbol] = acc.ts_open
             self._bars.clear()
         logger.info("BarBuilder flushed %d partial bars", len(emitted))
         return emitted
+
+    def get_status(self) -> Dict[str, object]:
+        now = time.time()
+        with self._lock:
+            last_bar_ts = dict(self._last_bar_ts_by_symbol)
+            active_symbols = list(self._bars.keys())
+            bars_emitted_total = self._bars_emitted_total
+            bars_emitted_by_symbol = dict(self._bars_emitted_by_symbol)
+            late_ticks_total = self._late_ticks_dropped_total
+            late_ticks_by_symbol = dict(self._late_ticks_dropped_by_symbol)
+
+        ages = {
+            symbol: round(now - ts, 1)
+            for symbol, ts in last_bar_ts.items()
+            if ts is not None
+        }
+        max_age = max(ages.values()) if ages else None
+
+        if not last_bar_ts:
+            status = "unknown"
+        elif max_age is not None and max_age > 300:
+            status = "degraded"
+        else:
+            status = "ok"
+
+        from .status import build_status
+
+        return build_status(
+            name="bar_builder",
+            type="internal",
+            status=status,
+            last_success_ts=max(last_bar_ts.values()) if last_bar_ts else None,
+            consecutive_failures=0,
+            request_count=bars_emitted_total,
+            error_count=late_ticks_total,
+            last_message_ts=max(last_bar_ts.values()) if last_bar_ts else None,
+            age_seconds=max_age,
+            extras={
+                "bars_emitted_total": bars_emitted_total,
+                "bars_emitted_by_symbol": bars_emitted_by_symbol,
+                "last_bar_ts_by_symbol": {
+                    symbol: datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
+                    for symbol, ts in last_bar_ts.items()
+                },
+                "late_ticks_dropped_total": late_ticks_total,
+                "late_ticks_dropped_by_symbol": late_ticks_by_symbol,
+                "active_symbols_count": len(active_symbols),
+            },
+        )
