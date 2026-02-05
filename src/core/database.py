@@ -354,7 +354,10 @@ class Database:
         """
         detection_data = detection.get('detection_data')
         if isinstance(detection_data, dict):
-            detection_data = json.dumps(detection_data)
+            try:
+                detection_data = json.dumps(detection_data)
+            except TypeError:
+                detection_data = json.dumps(detection_data, default=str)
         
         cursor = await self._connection.execute("""
             INSERT INTO detections (
@@ -743,13 +746,23 @@ class Database:
         row = await cursor.fetchone()
         return dict(row) if row else None
 
-    async def get_per_trader_pnl(self, days: int = 30, min_trades: int = 1) -> List[Dict[str, Any]]:
+    async def get_per_trader_pnl(
+        self,
+        days: int = 30,
+        min_trades: int = 1,
+        epoch_start: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
         """Get per-trader realized PnL statistics for /pnl analytics.
 
         Computes per-trader return as realized_pnl / starting_equity.
         Each trader starts with the same notional ($5000), so return = total_pnl / 5000.
         """
-        cursor = await self._connection.execute("""
+        params: List[Any] = [f"-{days} days", min_trades]
+        epoch_clause = ""
+        if epoch_start:
+            epoch_clause = " AND timestamp >= ?"
+            params.insert(1, epoch_start)
+        cursor = await self._connection.execute(f"""
             SELECT
                 trader_id,
                 strategy_type,
@@ -764,9 +777,10 @@ class Database:
                 MAX(realized_pnl) as best_trade
             FROM paper_trades
             WHERE timestamp >= datetime('now', ?)
+            {epoch_clause}
             GROUP BY trader_id, strategy_type
             HAVING closed_trades >= ?
-        """, (f"-{days} days", min_trades))
+        """, tuple(params))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
 
@@ -1001,14 +1015,16 @@ class Database:
             'row_counts': row_counts,
         }
 
-    async def reset_paper_epoch(self, starting_equity: float, scope: str = 'all', reason: str = 'manual_reset') -> None:
+    async def reset_paper_epoch(self, starting_equity: float, scope: str = 'all', reason: str = 'manual_reset') -> str:
         """Start a new paper equity epoch. Old data remains but is excluded from current metrics."""
+        epoch_start = datetime.utcnow().isoformat()
         await self._connection.execute("""
             INSERT INTO paper_equity_epochs (epoch_start, starting_equity, reason, scope)
             VALUES (?, ?, ?, ?)
-        """, (datetime.utcnow().isoformat(), starting_equity, reason, scope))
+        """, (epoch_start, starting_equity, reason, scope))
         await self._connection.commit()
         logger.info(f"New paper equity epoch started: equity=${starting_equity}, scope={scope}, reason={reason}")
+        return epoch_start
 
     async def get_current_epoch_start(self) -> Optional[str]:
         """Get the start timestamp of the current paper equity epoch."""

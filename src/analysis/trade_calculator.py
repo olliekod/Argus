@@ -7,6 +7,7 @@ Includes dynamic position sizing based on Probability of Profit.
 """
 
 import logging
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -119,6 +120,7 @@ class TradeCalculator:
         self.symbol = symbol.upper()
         self.options_client = IBITOptionsClient(symbol=symbol)
         self.greeks_engine = GreeksEngine()
+        self._last_spread_warning_ts: float = 0.0
         
         logger.info(f"{symbol} Trade Calculator initialized (account: ${account_size:,.0f})")
     
@@ -236,7 +238,10 @@ class TradeCalculator:
         )
         
         if not spread_data:
-            logger.warning("Could not find suitable spread")
+            now = time.time()
+            if now - self._last_spread_warning_ts > 60:
+                logger.warning("Could not find suitable spread")
+                self._last_spread_warning_ts = now
             return None
         
         short_strike = spread_data['short_strike']

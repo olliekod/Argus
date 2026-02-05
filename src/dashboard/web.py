@@ -178,58 +178,83 @@ class ArgusWebDashboard:
         return web.Response(text=_HTML, content_type='text/html')
 
     async def _handle_status(self, request):
-        result = {}
+        start = time.perf_counter()
+        status_code = 200
 
-        # System info
-        from ..core.logger import uptime_seconds, _uptime
-        system = {'uptime': _uptime(), 'boot_phases': self._boot_phases}
-        if self._get_status:
+        def _ensure_json_safe(payload: Dict[str, Any]) -> Dict[str, Any]:
             try:
-                s = await self._get_status()
-                system.update(s)
-            except Exception as e:
-                system['error'] = str(e)
-        result['system'] = system
+                json.dumps(payload)
+                return payload
+            except TypeError:
+                return json.loads(json.dumps(payload, default=str))
 
-        # Providers
-        if self._get_providers:
-            try:
-                result['providers'] = await self._get_providers()
-            except Exception as e:
-                result['providers'] = {'error': str(e)}
+        result: Dict[str, Any] = {}
+        try:
+            # System info
+            from ..core.logger import _uptime
+            system = {'uptime': _uptime(), 'boot_phases': self._boot_phases}
+            if self._get_status:
+                try:
+                    s = await self._get_status()
+                    system.update(s)
+                except Exception as e:
+                    system['error'] = str(e)
+            result['system'] = system
 
-        # PnL
-        if self._get_pnl:
-            try:
-                result['pnl'] = await self._get_pnl()
-            except Exception as e:
-                result['pnl'] = {'error': str(e)}
+            # Providers
+            if self._get_providers:
+                try:
+                    result['providers'] = await self._get_providers()
+                except Exception as e:
+                    result['providers'] = {'error': str(e)}
 
-        # Farm
-        if self._get_farm_status:
-            try:
-                result['farm'] = await self._get_farm_status()
-            except Exception as e:
-                result['farm'] = {'error': str(e)}
+            # PnL
+            if self._get_pnl:
+                try:
+                    result['pnl'] = await self._get_pnl()
+                except Exception as e:
+                    result['pnl'] = {'error': str(e)}
 
-        # Recent logs
-        if self._get_recent_logs:
-            try:
-                result['recent_logs'] = await self._get_recent_logs()
-            except Exception as e:
-                result['recent_logs'] = str(e)
+            # Farm
+            if self._get_farm_status:
+                try:
+                    result['farm'] = await self._get_farm_status()
+                except Exception as e:
+                    result['farm'] = {'error': str(e)}
 
-        return web.json_response(result)
+            # Recent logs
+            if self._get_recent_logs:
+                try:
+                    result['recent_logs'] = await self._get_recent_logs()
+                except Exception as e:
+                    result['recent_logs'] = str(e)
+        except Exception as e:
+            logger.error(f"/api/status error: {e}")
+            result = {'error': str(e)}
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"/api/status {status_code} in {duration_ms:.1f}ms")
+
+        return web.json_response(_ensure_json_safe(result), status=status_code)
 
     async def _handle_command(self, request):
+        start = time.perf_counter()
+        status_code = 200
         try:
             data = await request.json()
             cmd = data.get('command', '').strip()
             if not cmd:
-                return web.json_response({'error': 'No command provided'})
-            if self._run_command:
+                response = {'error': 'No command provided'}
+            elif self._run_command:
                 result = await self._run_command(cmd)
-                return web.json_response({'result': result})
-            return web.json_response({'error': 'Command handler not configured'})
+                response = {'result': result}
+            else:
+                response = {'error': 'Command handler not configured'}
         except Exception as e:
-            return web.json_response({'error': str(e)})
+            logger.error(f"/api/command error: {e}")
+            response = {'error': str(e)}
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"/api/command {status_code} in {duration_ms:.1f}ms")
+
+        return web.json_response(response, status=status_code)
