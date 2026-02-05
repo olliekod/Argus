@@ -8,6 +8,7 @@ Detects sudden volatility expansion or compression.
 from typing import Any, Dict, List, Optional
 
 from .base_detector import BaseDetector
+from ..core.events import BarEvent
 from ..core.utils import calculate_volatility
 
 
@@ -161,6 +162,12 @@ class VolatilityDetector(BaseDetector):
         """Get current volatility regime for a symbol."""
         return self._current_regime.get(symbol, 'unknown')
     
+    # ── bar-driven path (via event bus) ───────────────────
+
+    def on_bar(self, event: BarEvent) -> None:
+        """Ingest a 1-minute bar as a price update for vol calculation."""
+        self.update_price(event.symbol, event.close, str(event.timestamp))
+
     def get_volatility(self, symbol: str) -> Dict[str, float]:
         """Get current volatility readings."""
         history = self._price_history.get(symbol, [])

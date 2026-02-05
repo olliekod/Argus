@@ -16,6 +16,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from ..core.logger import get_connector_logger
+from ..core.events import QuoteEvent, TOPIC_MARKET_QUOTES
 
 logger = get_connector_logger('bybit')
 
@@ -70,6 +71,7 @@ class BybitWebSocket:
         on_ticker: Optional[Callable] = None,
         on_funding: Optional[Callable] = None,
         on_orderbook: Optional[Callable] = None,
+        event_bus=None,
     ):
         self.url = self.TESTNET_URL if testnet else self.MAINNET_URL
         self.symbols = [self._normalize_symbol(s) for s in symbols]
@@ -78,6 +80,9 @@ class BybitWebSocket:
         self.on_ticker = on_ticker
         self.on_funding = on_funding
         self.on_orderbook = on_orderbook
+
+        # Event bus (optional — publishes QuoteEvents when set)
+        self._event_bus = event_bus
 
         # Connection state
         self._ws = None
@@ -273,6 +278,28 @@ class BybitWebSocket:
                         self.on_funding(self.funding_rates[symbol])
                 except Exception as e:
                     logger.error(f"Funding callback error: {e}")
+
+            # Publish QuoteEvent to the event bus
+            if self._event_bus is not None:
+                try:
+                    bid = parsed.get('bid_price', 0.0)
+                    ask = parsed.get('ask_price', 0.0)
+                    mid = (bid + ask) / 2 if (bid and ask) else parsed['last_price']
+                    quote = QuoteEvent(
+                        symbol=symbol,
+                        bid=bid,
+                        ask=ask,
+                        mid=mid,
+                        last=parsed['last_price'],
+                        timestamp=time.time(),
+                        source='bybit',
+                        volume_24h=parsed.get('volume_24h', 0.0),
+                        funding_rate=parsed.get('funding_rate', 0.0),
+                        open_interest=parsed.get('open_interest', 0.0),
+                    )
+                    self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
+                except Exception as e:
+                    logger.error(f"QuoteEvent publish error: {e}")
         except Exception as e:
             logger.error(f"Error parsing ticker: {e}")
 

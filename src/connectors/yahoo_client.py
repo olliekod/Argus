@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, Optional
 import aiohttp
 
 from ..core.logger import get_connector_logger
+from ..core.events import QuoteEvent, TOPIC_MARKET_QUOTES
 
 logger = get_connector_logger('yahoo')
 
@@ -28,23 +29,26 @@ class YahooFinanceClient:
         self,
         symbols: list = None,
         on_update: Optional[Callable] = None,
+        event_bus=None,
     ):
         """
         Initialize Yahoo Finance client.
-        
+
         Args:
             symbols: List of stock/ETF symbols (default: ['IBIT'])
             on_update: Callback for price updates
+            event_bus: Optional EventBus instance for publishing QuoteEvents
         """
         self.symbols = symbols or ['IBIT']
         self.on_update = on_update
-        
+        self._event_bus = event_bus
+
         self._session: Optional[aiohttp.ClientSession] = None
         self._running = False
-        
+
         # Latest data cache
         self.prices: Dict[str, Dict] = {}
-        
+
         logger.info(f"Yahoo Finance client initialized for {self.symbols}")
     
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -168,6 +172,7 @@ class YahooFinanceClient:
     
     async def poll_once(self) -> None:
         """Run a single poll cycle (all symbols once)."""
+        import time as _time
         for symbol in self.symbols:
             try:
                 data = await self.get_quote(symbol)
@@ -181,6 +186,24 @@ class YahooFinanceClient:
                                 self.on_update(data)
                         except Exception as e:
                             logger.error(f"Update callback error: {e}")
+
+                    # Publish QuoteEvent to event bus
+                    if self._event_bus is not None:
+                        try:
+                            price = data.get('price', 0)
+                            quote = QuoteEvent(
+                                symbol=symbol,
+                                bid=price,
+                                ask=price,
+                                mid=price,
+                                last=price,
+                                timestamp=_time.time(),
+                                source='yahoo',
+                                volume_24h=float(data.get('volume', 0) or 0),
+                            )
+                            self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
+                        except Exception as e:
+                            logger.error(f"QuoteEvent publish error: {e}")
             except Exception as e:
                 logger.error(f"Yahoo poll_once error for {symbol}: {e}")
             await asyncio.sleep(1)

@@ -1,8 +1,10 @@
 """
-Argus Market Monitor - Main Orchestrator
-=========================================
+Argus Market Monitor - Module Loader / Orchestrator
+====================================================
 
-Coordinates all connectors, detectors, and alerts.
+Coordinates all connectors, detectors, and alerts via a central
+Pub/Sub event bus.  Reads ``ARGUS_MODE`` once at boot to decide
+between **collector** (default — observe only) and **live** modes.
 """
 
 import asyncio
@@ -18,6 +20,13 @@ from typing import Any, Dict, List, Optional
 from .core.config import load_all_config, validate_secrets, get_secret
 from .core.database import Database
 from .core.logger import setup_logger, get_logger, uptime_seconds
+from .core.bus import EventBus
+from .core.events import (
+    HeartbeatEvent,
+    TOPIC_SYSTEM_HEARTBEAT,
+)
+from .core.bar_builder import BarBuilder
+from .core.persistence import PersistenceManager
 from .core.gap_risk_tracker import GapRiskTracker
 from .core.reddit_monitor import RedditMonitor
 from .core.conditions_monitor import ConditionsMonitor
@@ -31,7 +40,21 @@ from .alerts.telegram_bot import TelegramBot
 from .analysis.daily_review import DailyReview
 from .analysis.uniformity_monitor import run_uniformity_check
 from .trading.paper_trader_farm import PaperTraderFarm
+from .core.query_layer import QueryLayer
 from .dashboard.web import ArgusWebDashboard
+
+
+class CollectorModeViolation(RuntimeError):
+    """Raised when trade-execution code is invoked in collector mode."""
+
+
+def _guard_collector_mode(mode: str):
+    """Fail-fast if any module attempts trade execution in collector mode."""
+    if mode == "collector":
+        raise CollectorModeViolation(
+            "Trade execution attempted while ARGUS_MODE=collector. "
+            "Set ARGUS_MODE=live to enable trading."
+        )
 
 
 
@@ -49,30 +72,52 @@ class ArgusOrchestrator:
     def __init__(self, config_dir: str = "config"):
         """
         Initialize Argus.
-        
+
         Args:
             config_dir: Path to config directory
         """
         # Load configuration
         self.config = load_all_config(config_dir)
         self.secrets = self.config.get('secrets', {})
-        
+
+        # ── Global mode (read once at boot) ─────────────
+        self.mode: str = os.environ.get("ARGUS_MODE", "collector").lower()
+
         # Setup logging
         log_level = self.config.get('system', {}).get('log_level', 'INFO')
         setup_logger('argus', level=log_level)
         self.logger = get_logger('orchestrator')
-        
+
+        # ── Collector-mode banner ───────────────────────
+        if self.mode == "collector":
+            banner = (
+                "\n"
+                "╔══════════════════════════════════════════╗\n"
+                "║  TRADING DISABLED  (COLLECTOR MODE)      ║\n"
+                "║  Set ARGUS_MODE=live to enable trading.   ║\n"
+                "╚══════════════════════════════════════════╝"
+            )
+            self.logger.warning(banner)
+        else:
+            self.logger.info(f"ARGUS_MODE = {self.mode}")
+
         # Validate secrets
         issues = validate_secrets(self.secrets)
         if issues:
             self.logger.warning("Configuration issues:")
             for issue in issues:
                 self.logger.warning(f"  - {issue}")
-        
+
         # Initialize database
         db_path = Path(self.config.get('system', {}).get('database_path', 'data/argus.db'))
         self.db = Database(str(db_path))
-        
+
+        # ── Event bus + modules ─────────────────────────
+        self.event_bus = EventBus()
+        self.bar_builder: Optional[BarBuilder] = None
+        self.persistence: Optional[PersistenceManager] = None
+        self.query_layer: Optional[QueryLayer] = None
+
         # Get symbols to monitor
         self.symbols = self.config.get('symbols', {}).get('monitored', [
             'BTC/USDT:USDT', 'ETH/USDT:USDT', 'SOL/USDT:USDT',
@@ -181,11 +226,18 @@ class ArgusOrchestrator:
         # Phase 1: Config (already done in __init__)
         self._phase("config_loaded")
 
-        # Phase 2: Database
+        # Phase 2: Database (full schema created on connect)
         await self.db.connect()
         self._phase("db_connected")
 
-        # Phase 3: Connectors
+        # Phase 2b: Event bus modules
+        loop = asyncio.get_running_loop()
+        self.bar_builder = BarBuilder(self.event_bus)
+        self.persistence = PersistenceManager(self.event_bus, self.db, loop)
+        self.persistence.start()
+        self._phase("event_bus_wired")
+
+        # Phase 3: Connectors (with event bus)
         await self._setup_connectors()
         self._phase("connectors_init")
 
@@ -194,15 +246,33 @@ class ArgusOrchestrator:
         self._phase("telegram_init")
 
         # Phase 5: Providers (gap risk, conditions, farm, review)
+        # In collector mode, skip paper traders and exit monitors
         await self._setup_off_hours_monitoring()
         self._phase("providers_init")
 
         # Phase 6: Wire callbacks
         self._wire_telegram_callbacks()
 
-        # Phase 7: Detectors
+        # Phase 7: Detectors (with bus attachment)
         await self._setup_detectors()
         self._phase("detectors_init")
+
+        # Phase 7b: Query layer (unified command interface)
+        self.query_layer = QueryLayer(
+            bus=self.event_bus,
+            db=self.db,
+            detectors=self.detectors,
+            connectors={
+                "bybit": self.bybit_ws,
+                "deribit": self.deribit_client,
+                "yahoo": self.yahoo_client,
+            },
+        )
+        self._phase("query_layer_init")
+
+        # Phase 7c: Start the event bus (all subscriptions registered)
+        self.event_bus.start()
+        self._phase("event_bus_started")
 
         # Phase 8: Zombie cleanup (skip full-table scan, use targeted query)
         await self._cleanup_zombie_positions()
@@ -246,42 +316,47 @@ class ArgusOrchestrator:
         self.logger.info("Setup complete!")
     
     async def _setup_connectors(self) -> None:
-        """Initialize exchange connectors."""
+        """Initialize exchange connectors (with event bus wiring)."""
         # Bybit WebSocket (public - no auth needed)
         bybit_symbols = [s for s in self.symbols]
         self.bybit_ws = BybitWebSocket(
             symbols=bybit_symbols,
             on_ticker=self._on_bybit_ticker,
             on_funding=self._on_funding_update,
+            event_bus=self.event_bus,
         )
         self.logger.info(f"Bybit WS configured for {len(bybit_symbols)} symbols")
-        
+
         # Deribit REST client (public - no auth needed)
         # Use mainnet for real data
-        self.deribit_client = DeribitClient(testnet=False)
+        self.deribit_client = DeribitClient(testnet=False, event_bus=self.event_bus)
         self.logger.info("Deribit client configured (mainnet)")
-        
+
         # Yahoo Finance for IBIT ETF
         self.yahoo_client = YahooFinanceClient(
             symbols=['IBIT', 'BITO'],
             on_update=self._on_yahoo_update,
+            event_bus=self.event_bus,
         )
         self.logger.info("Yahoo Finance client configured for IBIT/BITO")
         
     async def _setup_detectors(self) -> None:
-        """Initialize all detectors."""
+        """Initialize all detectors and attach to event bus."""
         thresholds = self.config.get('thresholds', {})
-        
+        is_collector = self.mode == "collector"
+
         # Options IV detector (BTC options on Deribit - for research)
         iv_config = thresholds.get('options_iv', {})
         if iv_config.get('enabled', True):
             self.detectors['options_iv'] = OptionsIVDetector(iv_config, self.db)
-        
+            self.detectors['options_iv'].attach_bus(self.event_bus)
+
         # Volatility detector
         vol_config = thresholds.get('volatility', {})
         if vol_config.get('enabled', True):
             self.detectors['volatility'] = VolatilityDetector(vol_config, self.db)
-        
+            self.detectors['volatility'].attach_bus(self.event_bus)
+
         # IBIT options detector (actionable for Robinhood)
         ibit_config = thresholds.get('ibit', {
             'enabled': True,
@@ -292,14 +367,15 @@ class ArgusOrchestrator:
         })
         if ibit_config.get('enabled', True):
             self.detectors['ibit'] = IBITDetector(ibit_config, self.db, symbol='IBIT')
+            self.detectors['ibit'].attach_bus(self.event_bus)
             # Wire up Telegram for paper trade notifications
             self.detectors['ibit'].set_telegram_callback(self._send_paper_notification)
-            # Wire up farm if available
-            if self.paper_trader_farm:
+            # Wire up farm if available and NOT in collector mode
+            if self.paper_trader_farm and not is_collector:
                 self.detectors['ibit'].set_paper_trader_farm(self.paper_trader_farm)
-            if self.research_enabled:
+            if self.research_enabled or is_collector:
                 self.detectors['ibit'].paper_trading_enabled = False
-        
+
         # BITO options detector (same strategy, more opportunities)
         bito_config = thresholds.get('bito', {
             'enabled': True,
@@ -310,14 +386,18 @@ class ArgusOrchestrator:
         })
         if bito_config.get('enabled', True):
             self.detectors['bito'] = IBITDetector(bito_config, self.db, symbol='BITO')
+            self.detectors['bito'].attach_bus(self.event_bus)
             self.detectors['bito'].set_telegram_callback(self._send_paper_notification)
-            # Wire up farm if available
-            if self.paper_trader_farm:
+            # Wire up farm if available and NOT in collector mode
+            if self.paper_trader_farm and not is_collector:
                 self.detectors['bito'].set_paper_trader_farm(self.paper_trader_farm)
-            if self.research_enabled:
+            if self.research_enabled or is_collector:
                 self.detectors['bito'].paper_trading_enabled = False
-        
-        self.logger.info(f"Initialized {len(self.detectors)} detectors")
+
+        if is_collector:
+            self.logger.info("Collector mode: paper trading DISABLED for all detectors")
+
+        self.logger.info(f"Initialized {len(self.detectors)} detectors (bus-attached)")
     
     async def _setup_telegram(self) -> None:
         """Initialize Telegram bot."""
@@ -1681,13 +1761,14 @@ class ArgusOrchestrator:
     async def run(self) -> None:
         """Start all components and run main loop."""
         self._running = True
-        
-        self.logger.info("Starting Argus...")
-        
+        is_collector = self.mode == "collector"
+
+        self.logger.info("Starting Argus (mode=%s)...", self.mode)
+
         # Start WebSocket connections
         if self.bybit_ws:
             self._tasks.append(asyncio.create_task(self.bybit_ws.connect()))
-        
+
         # Start polling tasks (with market-hours gating for equities)
         if self.yahoo_client:
             self._tasks.append(asyncio.create_task(self._poll_yahoo_market_hours_aware()))
@@ -1696,12 +1777,19 @@ class ArgusOrchestrator:
         self._tasks.append(asyncio.create_task(self._health_check()))
         self._tasks.append(asyncio.create_task(self._run_db_maintenance()))
 
-        # Exit monitor runs independently of research loop
-        if self.paper_trader_farm:
-            self._tasks.append(asyncio.create_task(self._run_exit_monitor()))
+        # Heartbeat publisher (drives persistence flush boundaries)
+        self._tasks.append(asyncio.create_task(self._publish_heartbeats()))
 
-        if self.research_enabled:
-            self._tasks.append(asyncio.create_task(self._run_research_farm()))
+        # ── Trading tasks: DISABLED in collector mode ───
+        if not is_collector:
+            # Exit monitor runs independently of research loop
+            if self.paper_trader_farm:
+                self._tasks.append(asyncio.create_task(self._run_exit_monitor()))
+
+            if self.research_enabled:
+                self._tasks.append(asyncio.create_task(self._run_research_farm()))
+        else:
+            self.logger.info("Collector mode: exit monitor and research farm SKIPPED")
 
         # Market session monitor (open/close notifications)
         self._tasks.append(asyncio.create_task(self._run_market_session_monitor()))
@@ -1713,17 +1801,17 @@ class ArgusOrchestrator:
         # Start conditions monitoring (synthesis layer)
         if self.conditions_monitor:
             self._tasks.append(asyncio.create_task(self.conditions_monitor.start_monitoring()))
-        
+
         # Start daily review monitoring (4 PM summary)
         if self.daily_review:
             self._tasks.append(asyncio.create_task(self.daily_review.start_monitoring()))
-        
+
         # Start Telegram two-way polling
         if self.telegram:
             await self.telegram.start_polling()
-        
+
         self.logger.info("Argus is running! Press Ctrl+C to stop.")
-        
+
         # Wait for all tasks
         try:
             await asyncio.gather(*self._tasks, return_exceptions=True)
@@ -1755,10 +1843,35 @@ class ArgusOrchestrator:
                 self.logger.error(f"Yahoo market-hours poll error: {e}")
                 await asyncio.sleep(60)
 
+    # ── Heartbeat publisher ───────────────────────────────
+
+    async def _publish_heartbeats(self) -> None:
+        """Emit :class:`HeartbeatEvent` every 60 s to drive persistence flushes."""
+        seq = 0
+        interval = self.config.get('monitoring', {}).get('heartbeat_interval', 60)
+        while self._running:
+            await asyncio.sleep(interval)
+            seq += 1
+            self.event_bus.publish(
+                TOPIC_SYSTEM_HEARTBEAT,
+                HeartbeatEvent(sequence=seq),
+            )
+
     async def stop(self) -> None:
         """Stop all components gracefully."""
         self.logger.info("Stopping Argus...")
         self._running = False
+
+        # Flush bar builder partial bars → bus → persistence
+        if self.bar_builder:
+            self.bar_builder.flush()
+
+        # Flush persistence buffer (writes remaining bars to DB)
+        if self.persistence:
+            self.persistence.shutdown()
+
+        # Stop event bus workers
+        self.event_bus.stop()
 
         # Stop dashboard
         if self.dashboard:

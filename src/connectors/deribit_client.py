@@ -12,6 +12,7 @@ from typing import Any, Dict, List, Optional
 import aiohttp
 
 from ..core.logger import get_connector_logger
+from ..core.events import QuoteEvent, TOPIC_MARKET_QUOTES
 
 logger = get_connector_logger('deribit')
 
@@ -31,19 +32,21 @@ class DeribitClient:
     MAINNET_URL = "https://www.deribit.com/api/v2"
     TESTNET_URL = "https://test.deribit.com/api/v2"
     
-    def __init__(self, testnet: bool = True):
+    def __init__(self, testnet: bool = True, event_bus=None):
         """
         Initialize Deribit client.
-        
+
         Args:
             testnet: Use testnet endpoint (recommended for testing)
+            event_bus: Optional EventBus for publishing QuoteEvents
         """
         self.base_url = self.TESTNET_URL if testnet else self.MAINNET_URL
         self._session: Optional[aiohttp.ClientSession] = None
         self._rate_limit = 20  # public rate limit: 20/min unauthenticated
         self._request_count = 0
         self._last_reset = datetime.utcnow()
-        
+        self._event_bus = event_bus
+
         logger.info(f"Deribit client initialized ({'testnet' if testnet else 'mainnet'})")
     
     async def _get_session(self) -> aiohttp.ClientSession:
@@ -298,7 +301,7 @@ class DeribitClient:
         atm_iv_values = [o['mark_iv'] for o in atm_options[:4] if o['mark_iv']]
         avg_atm_iv = sum(atm_iv_values) / len(atm_iv_values) if atm_iv_values else None
         
-        return {
+        result = {
             'currency': currency,
             'index_price': index_price,
             'atm_iv': avg_atm_iv,
@@ -307,6 +310,26 @@ class DeribitClient:
             'sample_size': len(atm_iv_values),
             'timestamp': datetime.utcnow().isoformat(),
         }
+
+        # Publish QuoteEvent for the underlying index
+        if self._event_bus is not None:
+            import time as _time
+            try:
+                quote = QuoteEvent(
+                    symbol=f"{currency}-INDEX",
+                    bid=index_price,
+                    ask=index_price,
+                    mid=index_price,
+                    last=index_price,
+                    timestamp=_time.time(),
+                    source='deribit',
+                    extra={'atm_iv': avg_atm_iv, 'sample_size': len(atm_iv_values)},
+                )
+                self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
+            except Exception as e:
+                logger.error(f"QuoteEvent publish error: {e}")
+
+        return result
     
     async def poll_options_iv(
         self,

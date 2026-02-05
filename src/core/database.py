@@ -334,6 +334,47 @@ class Database:
                 scope TEXT DEFAULT 'all'
             )
         """)
+
+        # ── Event-bus tables ──────────────────────────────
+
+        # 1-minute OHLCV bars (from BarBuilder → PersistenceManager)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS market_bars (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                source TEXT NOT NULL,
+                open REAL NOT NULL,
+                high REAL NOT NULL,
+                low REAL NOT NULL,
+                close REAL NOT NULL,
+                volume REAL,
+                tick_count INTEGER DEFAULT 0,
+                UNIQUE(timestamp, symbol, source)
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bars_ts_sym "
+            "ON market_bars(timestamp, symbol)"
+        )
+
+        # Signal events (from detectors → PersistenceManager)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS signal_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                detector TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                priority INTEGER DEFAULT 0,
+                data TEXT
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_ev_ts "
+            "ON signal_events(timestamp)"
+        )
+
         await self._connection.commit()
 
         logger.debug("Database tables created/verified")
@@ -989,6 +1030,7 @@ class Database:
         tables = [
             'detections', 'funding_rates', 'options_iv', 'liquidations',
             'price_snapshots', 'system_health', 'daily_stats',
+            'market_bars', 'signal_events',
         ]
         # Also check paper_trades if it exists
         try:
