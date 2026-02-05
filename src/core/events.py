@@ -22,9 +22,11 @@ class Priority(IntEnum):
 
 @dataclass(frozen=True, slots=True)
 class QuoteEvent:
-    """Real-time quote from a connector.
+    """Real-time price quote from a connector.
 
     Published to: market.quotes
+    Contains price-related fields only.  Non-price metrics
+    (IV, funding, open interest) belong in :class:`MetricEvent`.
     """
     symbol: str
     bid: float
@@ -34,8 +36,22 @@ class QuoteEvent:
     timestamp: float          # exchange epoch seconds (UTC)
     source: str               # 'bybit', 'deribit', 'yahoo'
     volume_24h: float = 0.0
-    funding_rate: float = 0.0
-    open_interest: float = 0.0
+    receive_time: float = field(default_factory=time.time)
+
+
+@dataclass(frozen=True, slots=True)
+class MetricEvent:
+    """Non-price market metric from a connector.
+
+    Published to: market.metrics
+    Carries funding rates, open interest, IV, or other
+    auxiliary data that should not pollute the price path.
+    """
+    symbol: str
+    metric: str               # 'funding_rate', 'open_interest', 'atm_iv', …
+    value: float
+    timestamp: float
+    source: str
     extra: Dict[str, Any] = field(default_factory=dict)
     receive_time: float = field(default_factory=time.time)
 
@@ -101,6 +117,7 @@ class HeartbeatEvent:
 # ─── Topic constants ────────────────────────────────────────
 TOPIC_MARKET_QUOTES = "market.quotes"
 TOPIC_MARKET_BARS = "market.bars"
+TOPIC_MARKET_METRICS = "market.metrics"
 TOPIC_SIGNALS = "signals.detections"
 TOPIC_SYSTEM_STATUS = "system.status"
 TOPIC_SYSTEM_HEARTBEAT = "system.heartbeat"

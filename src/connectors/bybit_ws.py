@@ -16,7 +16,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from ..core.logger import get_connector_logger
-from ..core.events import QuoteEvent, TOPIC_MARKET_QUOTES
+from ..core.events import QuoteEvent, MetricEvent, TOPIC_MARKET_QUOTES, TOPIC_MARKET_METRICS
 
 logger = get_connector_logger('bybit')
 
@@ -279,25 +279,38 @@ class BybitWebSocket:
                 except Exception as e:
                     logger.error(f"Funding callback error: {e}")
 
-            # Publish QuoteEvent to the event bus
+            # Publish QuoteEvent to the event bus (price-only)
             if self._event_bus is not None:
                 try:
                     bid = parsed.get('bid_price', 0.0)
                     ask = parsed.get('ask_price', 0.0)
                     mid = (bid + ask) / 2 if (bid and ask) else parsed['last_price']
+                    now = time.time()
                     quote = QuoteEvent(
                         symbol=symbol,
                         bid=bid,
                         ask=ask,
                         mid=mid,
                         last=parsed['last_price'],
-                        timestamp=time.time(),
+                        timestamp=now,
                         source='bybit',
                         volume_24h=parsed.get('volume_24h', 0.0),
-                        funding_rate=parsed.get('funding_rate', 0.0),
-                        open_interest=parsed.get('open_interest', 0.0),
                     )
                     self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
+
+                    # Publish non-price metrics separately
+                    fr = parsed.get('funding_rate', 0.0)
+                    if fr:
+                        self._event_bus.publish(TOPIC_MARKET_METRICS, MetricEvent(
+                            symbol=symbol, metric='funding_rate',
+                            value=fr, timestamp=now, source='bybit',
+                        ))
+                    oi = parsed.get('open_interest', 0.0)
+                    if oi:
+                        self._event_bus.publish(TOPIC_MARKET_METRICS, MetricEvent(
+                            symbol=symbol, metric='open_interest',
+                            value=oi, timestamp=now, source='bybit',
+                        ))
                 except Exception as e:
                     logger.error(f"QuoteEvent publish error: {e}")
         except Exception as e:

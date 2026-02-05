@@ -1,0 +1,211 @@
+"""
+Tests for BarBuilder volume-delta and late-tick logic.
+
+Run with:  python -m pytest tests/test_bar_builder.py -v
+
+These tests load only the core bus/events/bar_builder modules via
+importlib to avoid pulling in heavy transitive dependencies
+(scipy, yfinance, etc.) through the package __init__.py files.
+"""
+
+import importlib.util
+import os
+import sys
+import time
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _load_module(name: str, path: str):
+    """Load a single .py file as a module, skipping __init__.py chains."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = mod
+    spec.loader.exec_module(mod)
+    return mod
+
+
+# Load only the three modules we need — no __init__.py involved.
+events_mod = _load_module(
+    "src.core.events", os.path.join(_ROOT, "src", "core", "events.py")
+)
+bus_mod = _load_module(
+    "src.core.bus", os.path.join(_ROOT, "src", "core", "bus.py")
+)
+bb_mod = _load_module(
+    "src.core.bar_builder", os.path.join(_ROOT, "src", "core", "bar_builder.py")
+)
+
+EventBus = bus_mod.EventBus
+BarBuilder = bb_mod.BarBuilder
+_minute_floor = bb_mod._minute_floor
+QuoteEvent = events_mod.QuoteEvent
+BarEvent = events_mod.BarEvent
+TOPIC_MARKET_BARS = events_mod.TOPIC_MARKET_BARS
+
+
+def _quote(symbol: str, price: float, volume_24h: float, ts: float) -> QuoteEvent:
+    """Helper to build a QuoteEvent with explicit timestamp."""
+    return QuoteEvent(
+        symbol=symbol,
+        bid=price - 0.01,
+        ask=price + 0.01,
+        mid=price,
+        last=price,
+        timestamp=ts,
+        source="test",
+        volume_24h=volume_24h,
+    )
+
+
+def _drain(bus, timeout=0.5):
+    """Wait until all bus queues are empty or timeout elapses."""
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        depths = bus.get_queue_depths()
+        if all(d == 0 for d in depths.values()):
+            return
+        time.sleep(0.01)
+
+
+# ═══════════════════════════════════════════════════════════
+#  Bug #1 — Volume delta
+# ═══════════════════════════════════════════════════════════
+
+
+class TestVolumeDelta:
+    """Verify that cumulative volume_24h is correctly converted to delta."""
+
+    def test_first_tick_has_zero_volume(self):
+        bus = EventBus()
+        bb = BarBuilder(bus)
+        delta = bb._volume_delta("SYM", 1_000_000.0)
+        assert delta == 0.0, "First tick should yield zero (no prior reference)"
+
+    def test_normal_delta(self):
+        bus = EventBus()
+        bb = BarBuilder(bus)
+        bb._volume_delta("SYM", 1_000.0)
+        delta = bb._volume_delta("SYM", 1_050.0)
+        assert delta == 50.0
+
+    def test_exchange_reset_yields_zero(self):
+        bus = EventBus()
+        bb = BarBuilder(bus)
+        bb._volume_delta("SYM", 5_000.0)
+        delta = bb._volume_delta("SYM", 100.0)  # rollover
+        assert delta == 0.0, "Negative delta (reset) must be treated as zero"
+
+    def test_bar_volume_accumulates_deltas_not_cumulative(self):
+        """End-to-end: 4 ticks in one minute.
+
+        cum_vol sequence: 1000, 1020, 1045, 1100
+        deltas:              0,   20,   25,   55  → bar.volume = 100
+        """
+        bus = EventBus()
+        emitted = []
+        bus.subscribe(TOPIC_MARKET_BARS, lambda bar: emitted.append(bar))
+        bb = BarBuilder(bus)
+        bus.start()
+
+        try:
+            base = 1_700_000_000.0
+            minute0 = _minute_floor(base)
+            minute1 = minute0 + 60
+
+            bb._on_quote(_quote("BTC", 100.0, 1000.0, minute0 + 1))
+            bb._on_quote(_quote("BTC", 101.0, 1020.0, minute0 + 15))
+            bb._on_quote(_quote("BTC", 99.0,  1045.0, minute0 + 30))
+            bb._on_quote(_quote("BTC", 102.0, 1100.0, minute0 + 50))
+
+            # Trigger bar close
+            bb._on_quote(_quote("BTC", 103.0, 1120.0, minute1 + 1))
+            _drain(bus)
+
+            assert len(emitted) == 1
+            bar = emitted[0]
+            assert bar.open == 100.0
+            assert bar.high == 102.0
+            assert bar.low == 99.0
+            assert bar.close == 102.0
+            assert bar.tick_count == 4
+            assert bar.volume == 100.0, (
+                f"Bar volume should be sum of deltas (100), got {bar.volume}"
+            )
+        finally:
+            bus.stop()
+
+
+# ═══════════════════════════════════════════════════════════
+#  Bug #2 — Late-tick bar corruption
+# ═══════════════════════════════════════════════════════════
+
+
+class TestLateTick:
+    """Verify that ticks older than the active bar are discarded."""
+
+    def test_late_tick_is_discarded(self):
+        bus = EventBus()
+        emitted = []
+        bus.subscribe(TOPIC_MARKET_BARS, lambda bar: emitted.append(bar))
+        bb = BarBuilder(bus)
+        bus.start()
+
+        try:
+            base = 1_700_000_000.0
+            minute0 = _minute_floor(base)
+            minute1 = minute0 + 60
+
+            bb._on_quote(_quote("BTC", 100.0, 500.0, minute0 + 5))
+            bb._on_quote(_quote("BTC", 105.0, 520.0, minute1 + 5))
+            _drain(bus)
+
+            assert len(emitted) == 1
+            closed_bar = emitted[0]
+
+            # Late tick for minute0 — must be silently dropped
+            bb._on_quote(_quote("BTC", 50.0, 530.0, minute0 + 30))
+            _drain(bus)
+
+            # Closed bar is a frozen dataclass — structurally immutable
+            assert closed_bar.close == 100.0
+            assert closed_bar.low == 100.0
+
+            # Active bar for minute1 must not be contaminated
+            acc = bb._bars.get("BTC")
+            assert acc is not None
+            assert acc.ts_open == minute1
+            assert acc.low == 105.0, "Late tick must not alter the active bar"
+        finally:
+            bus.stop()
+
+    def test_same_minute_tick_accepted(self):
+        bus = EventBus()
+        bb = BarBuilder(bus)
+
+        base = 1_700_000_000.0
+        minute0 = _minute_floor(base)
+
+        bb._on_quote(_quote("BTC", 100.0, 500.0, minute0 + 1))
+        bb._on_quote(_quote("BTC", 102.0, 510.0, minute0 + 30))
+
+        acc = bb._bars["BTC"]
+        assert acc.high == 102.0
+        assert acc.tick_count == 2
+
+
+# ═══════════════════════════════════════════════════════════
+#  Minute-floor utility
+# ═══════════════════════════════════════════════════════════
+
+
+class TestMinuteFloor:
+    def test_exact_boundary(self):
+        assert _minute_floor(1_700_000_000.0) == 1_700_000_000.0 - (1_700_000_000 % 60)
+
+    def test_mid_minute(self):
+        ts = 1_700_000_030.5
+        floored = _minute_floor(ts)
+        assert floored % 60 == 0
+        assert floored <= ts
+        assert floored + 60 > ts

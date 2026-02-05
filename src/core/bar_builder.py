@@ -13,15 +13,27 @@ Rules
   (e.g. 12:03:00.000 – 12:03:59.999 → bar timestamp 12:03:00).
 * When a new minute begins, the completed bar is published to
   ``market.bars`` via the event bus.
+
+Volume handling
+---------------
+``QuoteEvent.volume_24h`` is **cumulative** exchange volume.  Summing
+it directly would inflate bar volume by orders of magnitude.  Instead
+we track the last-seen cumulative value per symbol and only add the
+*delta* (current − previous).  A negative delta (exchange reset /
+rollover) is treated as zero to avoid corrupting the bar.
+
+Late-tick policy
+----------------
+A tick whose minute-floor falls **before** the active bar's open
+timestamp is silently discarded.  Once a bar is emitted it is
+immutable.
 """
 
 from __future__ import annotations
 
 import logging
-import math
 import threading
-import time
-from typing import Dict, Optional
+from typing import Dict
 
 from .bus import EventBus
 from .events import (
@@ -39,21 +51,21 @@ class _BarAccumulator:
 
     __slots__ = ("open", "high", "low", "close", "volume", "ts_open", "source", "tick_count")
 
-    def __init__(self, price: float, volume: float, ts_open: float, source: str) -> None:
+    def __init__(self, price: float, volume_delta: float, ts_open: float, source: str) -> None:
         self.open = price
         self.high = price
         self.low = price
         self.close = price
-        self.volume = volume
+        self.volume = volume_delta
         self.ts_open = ts_open
         self.source = source
         self.tick_count = 1
 
-    def update(self, price: float, volume: float) -> None:
+    def update(self, price: float, volume_delta: float) -> None:
         self.high = max(self.high, price)
         self.low = min(self.low, price)
         self.close = price
-        self.volume += volume
+        self.volume += volume_delta
         self.tick_count += 1
 
 
@@ -74,10 +86,32 @@ class BarBuilder:
 
     def __init__(self, bus: EventBus) -> None:
         self._bus = bus
-        self._bars: Dict[str, _BarAccumulator] = {}  # symbol → accumulator
+        self._bars: Dict[str, _BarAccumulator] = {}   # symbol → accumulator
+        self._last_cum_vol: Dict[str, float] = {}      # symbol → last cumulative volume_24h
         self._lock = threading.Lock()
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
         logger.info("BarBuilder initialised — subscribed to %s", TOPIC_MARKET_QUOTES)
+
+    # ── volume delta helper ─────────────────────────────────
+
+    def _volume_delta(self, symbol: str, cum_vol: float) -> float:
+        """Compute the volume delta since last tick for *symbol*.
+
+        * First tick for a symbol → delta = 0 (no prior reference).
+        * Negative delta (exchange reset / rollover) → 0.
+        * Otherwise → ``cum_vol - last_cum_vol``.
+        """
+        prev = self._last_cum_vol.get(symbol)
+        self._last_cum_vol[symbol] = cum_vol
+
+        if prev is None:
+            return 0.0
+
+        delta = cum_vol - prev
+        if delta < 0:
+            # Exchange reset / rollover — ignore this tick's volume
+            return 0.0
+        return delta
 
     # ── handler (called from the bus worker thread) ─────────
 
@@ -90,16 +124,22 @@ class BarBuilder:
         if price <= 0:
             return
 
-        volume = event.volume_24h  # cumulative; delta not available
+        vol_delta = self._volume_delta(event.symbol, event.volume_24h)
 
         with self._lock:
             acc = self._bars.get(event.symbol)
 
             if acc is None:
-                # First tick for this symbol
+                # First tick for this symbol — start a new bar
                 self._bars[event.symbol] = _BarAccumulator(
-                    price, volume, minute, event.source
+                    price, vol_delta, minute, event.source
                 )
+                return
+
+            # ── Late-tick guard ─────────────────────────────
+            # Discard ticks older than the active bar window.
+            # Once a bar is emitted it must never change.
+            if minute < acc.ts_open:
                 return
 
             if minute > acc.ts_open:
@@ -120,10 +160,11 @@ class BarBuilder:
 
                 # Reset accumulator for the new minute
                 self._bars[event.symbol] = _BarAccumulator(
-                    price, volume, minute, event.source
+                    price, vol_delta, minute, event.source
                 )
             else:
-                acc.update(price, volume)
+                # Same minute — update accumulator
+                acc.update(price, vol_delta)
 
     # ── utility ─────────────────────────────────────────────
 
