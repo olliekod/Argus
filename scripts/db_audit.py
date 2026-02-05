@@ -1,249 +1,260 @@
-"""
-Argus Database Audit
-====================
-
-Audit database freshness and bar continuity without fabricating data.
-"""
-
-from __future__ import annotations
-
-import argparse
-import json
-import os
 import sqlite3
+import os
 import time
-from collections import defaultdict
-from datetime import datetime, timedelta, timezone
-from typing import Dict, Iterable, List, Optional, Tuple
-from zoneinfo import ZoneInfo
+from datetime import datetime, timezone, timedelta
+from pathlib import Path
+from typing import Dict, List, Any, Optional
 
+DB_PATH = "data/argus.db"
 
-ET = ZoneInfo("America/New_York")
+def format_table(headers: List[str], rows: List[List[Any]]) -> str:
+    """Pretty-print a table to console."""
+    if not rows:
+        return "No data found."
+    
+    # Calculate column widths
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, val in enumerate(row):
+            widths[i] = max(widths[i], len(str(val)))
+    
+    # Format header
+    header_str = " | ".join(h.ljust(widths[i]) for i, h in enumerate(headers))
+    sep_str = "-+-".join("-" * w for w in widths)
+    
+    output = [header_str, sep_str]
+    for row in rows:
+        output.append(" | ".join(str(val).ljust(widths[i]) for i, val in enumerate(row)))
+    
+    return "\n".join(output)
 
-
-def _parse_ts(ts: str) -> Optional[datetime]:
-    if not ts:
-        return None
+def parse_iso(ts_str: str) -> datetime:
+    """Safe parse of ISO timestamp, handling various formats."""
+    # SQLite might store with/without Z or +00:00 or as naive string
     try:
-        ts_norm = ts.replace("Z", "+00:00")
-        return datetime.fromisoformat(ts_norm)
+        t_str = ts_str
+        if t_str.endswith('Z'):
+            t_str = t_str[:-1] + '+00:00'
+        
+        # Handle cases where microsecond precision varies or space vs T
+        t_str = t_str.replace(' ', 'T')
+        
+        dt = datetime.fromisoformat(t_str)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
     except ValueError:
-        return None
+        # Last ditch effort: try to parse and force UTC
+        try:
+            from dateutil import parser
+            return parser.isoparse(ts_str).replace(tzinfo=timezone.utc)
+        except (ImportError, ValueError):
+            # If dateutil is missing or also fails, try a manual split
+            try:
+                dt = datetime.fromisoformat(ts_str.split('.')[0])
+                return dt.replace(tzinfo=timezone.utc)
+            except:
+                raise ValueError(f"Could not parse timestamp: {ts_str}")
 
-
-def _format_age(seconds: Optional[float]) -> str:
-    if seconds is None:
-        return "n/a"
-    return str(timedelta(seconds=int(seconds)))
-
-
-def _is_market_minute(dt_utc: datetime) -> bool:
-    if dt_utc.tzinfo is None:
-        dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-    dt_et = dt_utc.astimezone(ET)
-    if dt_et.weekday() >= 5:
-        return False
-    market_open = dt_et.replace(hour=9, minute=30, second=0, microsecond=0)
-    market_close = dt_et.replace(hour=16, minute=0, second=0, microsecond=0)
-    return market_open <= dt_et < market_close
-
-
-def _classify_symbol(symbol: str, equities_override: Iterable[str]) -> str:
-    symbol_upper = symbol.upper()
-    override = {sym.upper() for sym in equities_override}
-    if symbol_upper in override:
-        return "equity"
-    if symbol_upper.endswith(("USDT", "USD", "PERP")):
-        return "crypto"
-    if symbol_upper.isalpha() and len(symbol_upper) <= 5:
-        return "equity"
-    return "crypto"
-
-
-def _load_status_snapshot(path: Optional[str]) -> Tuple[Optional[Dict[str, object]], bool]:
-    if not path:
-        return None, False
-    if not os.path.exists(path):
-        return None, False
-    try:
-        with open(path, "r", encoding="utf-8") as handle:
-            data = json.load(handle)
-    except (OSError, json.JSONDecodeError):
-        return None, False
-    try:
-        mtime = os.path.getmtime(path)
-    except OSError:
-        return data, False
-    age_seconds = max(0.0, time.time() - mtime)
-    return data, age_seconds <= 120
-
-
-def _get_table_timestamp(conn: sqlite3.Connection, table: str) -> Optional[datetime]:
-    cursor = conn.execute(f"PRAGMA table_info({table})")
-    columns = [row[1] for row in cursor.fetchall()]
-    if "timestamp" not in columns:
-        return None
-    cursor = conn.execute(f"SELECT MAX(timestamp) FROM {table}")
-    row = cursor.fetchone()
-    if row and row[0]:
-        return _parse_ts(row[0])
-    return None
-
-
-def _load_bar_rows(
-    conn: sqlite3.Connection,
-    lookback_hours: int,
-    symbols: Optional[List[str]] = None,
-) -> Dict[str, List[datetime]]:
-    since = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-    params = [since.isoformat()]
-    symbol_filter = ""
-    if symbols:
-        placeholders = ",".join("?" for _ in symbols)
-        symbol_filter = f"AND symbol IN ({placeholders})"
-        params.extend(symbols)
-    query = f"""
-        SELECT symbol, timestamp
-        FROM market_bars
-        WHERE timestamp >= ?
-        {symbol_filter}
-        ORDER BY symbol, timestamp
-    """
-    rows = conn.execute(query, params).fetchall()
-    data: Dict[str, List[datetime]] = defaultdict(list)
-    for symbol, ts in rows:
-        dt = _parse_ts(ts)
-        if dt:
-            data[symbol].append(dt)
-    return data
-
-
-def _find_missing_ranges(
-    timestamps: List[datetime],
-    symbol_type: str,
-    max_ranges: int = 10,
-) -> List[Tuple[datetime, datetime]]:
-    missing: List[Tuple[datetime, datetime]] = []
-    if len(timestamps) < 2:
-        return missing
-    for prev, nxt in zip(timestamps, timestamps[1:]):
-        gap_seconds = (nxt - prev).total_seconds()
-        if gap_seconds <= 60:
+def get_duration_info(conn: sqlite3.Connection) -> Dict[str, Any]:
+    """Calculate the total duration of data in the DB across all tables."""
+    tables = ["market_bars", "market_metrics", "detections"]
+    min_ts = None
+    max_ts = None
+    
+    for table in tables:
+        try:
+            row = conn.execute(f"SELECT min(timestamp), max(timestamp) FROM {table}").fetchone()
+            if row and row[0]:
+                t_min = parse_iso(row[0])
+                t_max = parse_iso(row[1])
+                if min_ts is None or t_min < min_ts: min_ts = t_min
+                if max_ts is None or t_max > max_ts: max_ts = t_max
+        except sqlite3.OperationalError:
             continue
-        missing_start = prev + timedelta(minutes=1)
-        missing_end = nxt - timedelta(minutes=1)
-        if symbol_type == "crypto":
-            missing.append((missing_start, missing_end))
-        else:
-            current = missing_start
-            range_start: Optional[datetime] = None
-            while current <= missing_end:
-                if _is_market_minute(current):
-                    if range_start is None:
-                        range_start = current
-                else:
-                    if range_start is not None:
-                        missing.append((range_start, current - timedelta(minutes=1)))
-                        range_start = None
-                current += timedelta(minutes=1)
-            if range_start is not None:
-                missing.append((range_start, missing_end))
-        if len(missing) >= max_ranges:
-            return missing[:max_ranges]
-    return missing[:max_ranges]
+            
+    if not min_ts or not max_ts:
+        return {"hours": 0, "minutes": 0, "seconds": 0, "total_seconds": 0}
+        
+    delta = max_ts - min_ts
+    total_sec = delta.total_seconds()
+    return {
+        "hours": total_sec / 3600,
+        "minutes": total_sec / 60,
+        "seconds": total_sec,
+        "total_seconds": total_sec,
+        "start": min_ts,
+        "end": max_ts
+    }
 
+def audit_bars(conn: sqlite3.Connection):
+    """Analyze bar continuity and gaps."""
+    print("\n>>> 1. Bar Continuity Analysis")
+    rows = conn.execute("SELECT DISTINCT symbol FROM market_bars").fetchall()
+    symbols = [r[0] for r in rows]
+    
+    table_rows = []
+    gap_reports = []
+    
+    for sym in symbols:
+        data = conn.execute(
+            "SELECT timestamp FROM market_bars WHERE symbol = ? ORDER BY timestamp ASC", 
+            (sym,)
+        ).fetchall()
+        
+        if not data: continue
+        
+        timestamps = [parse_iso(r[0]) for r in data]
+        first, last = timestamps[0], timestamps[-1]
+        
+        # Expected count based on 1-min intervals
+        duration_min = int((last - first).total_seconds() / 60) + 1
+        actual_count = len(timestamps)
+        missing = duration_min - actual_count
+        
+        # Find gaps
+        max_gap = 0
+        gaps_found = 0
+        for i in range(1, len(timestamps)):
+            diff = (timestamps[i] - timestamps[i-1]).total_seconds() / 60
+            if diff > 1.1: # More than 1 minute (buffer for floating point)
+                gaps_found += 1
+                max_gap = max(max_gap, int(diff - 1))
+        
+        table_rows.append([
+            sym, actual_count, duration_min, missing, f"{max_gap}m"
+        ])
+        
+        if missing > 0:
+            gap_reports.append(f"  [!] {sym}: {missing} missing bars. Largest gap: {max_gap} mins.")
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Audit Argus database continuity.")
-    parser.add_argument("--db", default="data/argus.db", help="Path to Argus SQLite DB.")
-    parser.add_argument("--lookback-hours", type=int, default=24, help="Lookback window for continuity.")
-    parser.add_argument("--symbols", help="Comma-separated symbol filter.")
-    parser.add_argument("--equities", help="Comma-separated equity symbols override.")
-    parser.add_argument("--status-json", help="Optional path to status snapshot JSON.")
-    args = parser.parse_args()
+    print(format_table(["Symbol", "Actual", "Expected", "Missing", "Max Gap"], table_rows))
+    if gap_reports:
+        print("\nGap Details:")
+        for report in gap_reports:
+            print(report)
 
-    db_path = args.db
-    if not os.path.exists(db_path):
-        raise SystemExit(f"Database not found: {db_path}")
+def audit_metrics(conn: sqlite3.Connection, duration: Dict[str, Any]):
+    """Analyze metric ingestion rates."""
+    print("\n>>> 2. Metric Ingestion Cadence")
+    sql = """
+        SELECT metric, source, symbol, count(*) as count 
+        FROM market_metrics 
+        GROUP BY 1, 2, 3 
+        ORDER BY count DESC
+    """
+    rows = conn.execute(sql).fetchall()
+    
+    table_rows = []
+    total_rows = 0
+    hrs = max(duration["hours"], 0.01) # Avoid div by zero
+    
+    for r in rows:
+        rate = r['count'] / hrs
+        total_rows += r['count']
+        table_rows.append([
+            r['metric'], r['source'], r['symbol'], r['count'], f"{rate:.1f}/hr"
+        ])
+        
+    print(format_table(["Metric", "Src", "Sym", "Count", "Rate"], table_rows))
+    print(f"\nTotal metrics: {total_rows} ({total_rows / hrs:.1f}/hr average)")
 
-    symbols = [s.strip() for s in args.symbols.split(",")] if args.symbols else None
-    equities_override = [s.strip() for s in args.equities.split(",")] if args.equities else []
+def audit_detections(conn: sqlite3.Connection, duration: Dict[str, Any]):
+    """Analyze detection volume."""
+    print("\n>>> 3. Signal Detection Analysis")
+    sql = """
+        SELECT opportunity_type, asset, count(*) as count 
+        FROM detections 
+        GROUP BY 1, 2 
+        ORDER BY count DESC
+    """
+    try:
+        rows = conn.execute(sql).fetchall()
+        table_rows = []
+        mins = max(duration["minutes"], 0.01)
+        
+        for r in rows:
+            rate = r['count'] / mins
+            table_rows.append([
+                r['opportunity_type'], r['asset'], r['count'], f"{rate:.2f}/min"
+            ])
+            
+        print(format_table(["Type", "Asset", "Count", "Rate"], table_rows))
+    except sqlite3.OperationalError as e:
+        print(f"Skipping detections: {e}")
 
-    status_snapshot, is_running = _load_status_snapshot(args.status_json)
+def audit_storage(db_path: str, duration: Dict[str, Any]):
+    """Analyze DB size and growth projections."""
+    print("\n>>> 4. Storage & Growth Diagnostics")
+    size_bytes = os.path.getsize(db_path)
+    size_mb = size_bytes / (1024 * 1024)
+    
+    hrs = max(duration["hours"], 0.01)
+    rate_mb = size_mb / hrs
+    
+    print(f"Current Size: {size_mb:.2f} MB")
+    print(f"Growth Rate:  {rate_mb:.2f} MB/hour")
+    print(f"Projected 24h: {(size_mb + rate_mb * 24):.2f} MB")
+    print(f"Projected 7d:  {(size_mb + rate_mb * 24 * 7):.2f} MB")
 
-    conn = sqlite3.connect(db_path)
+def audit_freshness(conn: sqlite3.Connection):
+    """Check newest timestamps for data staleness."""
+    print("\n>>> 5. Data Freshness (Age)")
+    tables = ["price_snapshots", "market_bars", "market_metrics", "detections", "system_health"]
+    now = datetime.now(timezone.utc)
+    
+    table_rows = []
+    for table in tables:
+        try:
+            row = conn.execute(f"SELECT max(timestamp) FROM {table}").fetchone()
+            if row and row[0]:
+                ts = parse_iso(row[0])
+                age = (now - ts).total_seconds()
+                
+                status = "OK"
+                if age > 300: status = "STALE (>5m)"
+                if age > 3600: status = "DEAD (>1h)"
+                
+                age_str = f"{int(age // 60)}m {int(age % 60)}s" if age > 60 else f"{int(age)}s"
+                table_rows.append([table, ts.strftime("%H:%M:%S"), age_str, status])
+            else:
+                table_rows.append([table, "N/A", "-", "EMPTY"])
+        except sqlite3.OperationalError:
+            continue
+
+    print(format_table(["Table", "Newest", "Age", "Status"], table_rows))
+
+def run_audit():
+    if not os.path.exists(DB_PATH):
+        print(f"Error: Database file not found at {DB_PATH}")
+        return
+
+    print("=" * 70)
+    print(f"ARGUS SOAK TEST AUDIT - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 70)
+
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
 
-    print("=" * 72)
-    print("ARGUS DB AUDIT")
-    print("=" * 72)
-    print(f"DB: {db_path}")
-    print(f"Lookback: {args.lookback_hours}h")
-    if symbols:
-        print(f"Symbols filter: {', '.join(symbols)}")
-    if equities_override:
-        print(f"Equities override: {', '.join(equities_override)}")
-    if args.status_json:
-        print(f"Status snapshot: {args.status_json}")
-        print(f"Argus running: {'yes' if is_running else 'no'}")
-    print()
-
-    print("TABLE FRESHNESS")
-    cursor = conn.execute("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-    tables = [row[0] for row in cursor.fetchall()]
-    for table in tables:
-        last_ts = _get_table_timestamp(conn, table)
-        if last_ts:
-            age_seconds = (datetime.now(timezone.utc) - last_ts.replace(tzinfo=timezone.utc)).total_seconds()
-            age_text = _format_age(age_seconds)
-            if not is_running:
-                status = f"{age_text} (Argus not running)"
-            else:
-                status = "STALE" if age_seconds > 300 else "OK"
-                status = f"{status} — age {age_text}"
-            print(f"  {table:<24} {status}")
-        else:
-            print(f"  {table:<24} n/a (no timestamp)")
-
-    print()
-    print("BAR CONTINUITY")
-    bars = _load_bar_rows(conn, args.lookback_hours, symbols)
-    if not bars:
-        print("  No market_bars found in lookback window.")
-    else:
-        for symbol, timestamps in bars.items():
-            symbol_type = _classify_symbol(symbol, equities_override)
-            missing_ranges = _find_missing_ranges(timestamps, symbol_type)
-            print(f"  {symbol} ({symbol_type})")
-            if missing_ranges:
-                for start, end in missing_ranges[:10]:
-                    print(f"    missing: {start.isoformat()} -> {end.isoformat()}")
-            else:
-                print("    missing: none")
-
-    if status_snapshot:
-        print()
-        print("DB COUNTS VS BAR BUILDER COUNTERS")
-        bar_builder = status_snapshot.get("internal", {}).get("bar_builder", {})
-        extras = bar_builder.get("extras", {}) if isinstance(bar_builder, dict) else {}
-        runtime_counts = extras.get("bars_emitted_by_symbol", {})
-        if runtime_counts:
-            for symbol, runtime_count in runtime_counts.items():
-                row = conn.execute(
-                    "SELECT COUNT(*) FROM market_bars WHERE symbol = ?",
-                    (symbol,),
-                ).fetchone()
-                db_count = row[0] if row else 0
-                print(f"  {symbol:<10} db={db_count:<8} runtime={runtime_count}")
-        else:
-            print("  No runtime bar builder counters found in snapshot.")
-    else:
-        print()
-        print("DB COUNTS VS BAR BUILDER COUNTERS")
-        print("  Status snapshot not provided; skipping runtime comparison.")
-
-    conn.close()
-
+    try:
+        duration = get_duration_info(conn)
+        if duration["total_seconds"] > 0:
+            print(f"Data Span: {duration['total_seconds']/3600:.2f} hours")
+            print(f"Range:     {duration['start'].strftime('%H:%M:%S')} -> {duration['end'].strftime('%H:%M:%S')} UTC")
+        
+        audit_bars(conn)
+        audit_metrics(conn, duration)
+        audit_detections(conn, duration)
+        audit_storage(DB_PATH, duration)
+        audit_freshness(conn)
+        
+    except Exception as e:
+        import traceback
+        print(f"Fatal audit error: {e}")
+        traceback.print_exc()
+    finally:
+        conn.close()
+        print("\n" + "=" * 70)
 
 if __name__ == "__main__":
-    main()
+    run_audit()

@@ -1744,6 +1744,27 @@ class ArgusOrchestrator:
                     data = await self.query_layer.db()
                     return str(data)
                 return "Query layer not initialized"
+            elif cmd.startswith('/sql '):
+                query = cmd[5:].strip()
+                if not query:
+                    return "Usage: /sql [SELECT ...]"
+                try:
+                    rows = await self.db.fetch_all(query)
+                    if not rows:
+                        return "No rows returned."
+                    
+                    # Convert objects to readable strings
+                    lines = []
+                    headers = rows[0].keys()
+                    lines.append(" | ".join(headers))
+                    lines.append("-" * 40)
+                    for r in rows[:50]:  # Limit to 50 rows for display
+                        lines.append(" | ".join(str(r[k]) for k in headers))
+                    if len(rows) > 50:
+                        lines.append(f"... and {len(rows)-50} more")
+                    return "\n".join(lines)
+                except Exception as e:
+                    return f"SQL Error: {e}"
             else:
                 return f"Unknown command: {cmd}"
         except Exception as e:
