@@ -1,0 +1,406 @@
+Here is the console output, note repetition and patterns and bad practices:
+
+PS C:\Users\Oliver\Desktop\Desktop\Projects\argus> python main.py
+19:15:14 │ INFO │ argus.orchestrator │ Argus Orchestrator initialized
+19:15:14 │ INFO │ argus.orchestrator │ Setting up Argus components...
+19:15:14 │ INFO │ argus.connectors.bybit │ Bybit WebSocket initialized for 5 symbols
+19:15:14 │ INFO │ argus.orchestrator │ Bybit WS configured for 5 symbols
+19:15:14 │ INFO │ argus.connectors.deribit │ Deribit client initialized (mainnet)
+19:15:14 │ INFO │ argus.orchestrator │ Deribit client configured (mainnet)
+19:15:14 │ INFO │ argus.connectors.yahoo │ Yahoo Finance client initialized for ['IBIT', 'BITO']
+19:15:14 │ INFO │ argus.orchestrator │ Yahoo Finance client configured for IBIT/BITO
+19:15:15 │ INFO │ argus.alerts │ Telegram bot initialized (two-way enabled)
+19:15:15 │ INFO │ argus.alerts │ Telegram bot connected: @Argus_market_monitor_bot
+19:15:15 │ INFO │ argus.orchestrator │ Telegram bot connected successfully
+19:15:15 │ INFO │ argus.orchestrator │ Gap Risk Tracker initialized
+19:15:15 │ INFO │ argus.orchestrator │ Reddit Monitor not configured - sentiment tracking disabled
+19:15:15 │ INFO │ argus.orchestrator │ Conditions Monitor initialized
+19:21:53 │ INFO │ argus.orchestrator │ Paper Trader Farm initialized with 15,552,000 traders
+19:21:53 │ INFO │ argus.orchestrator │ Daily Review initialized
+19:21:53 │ INFO │ argus.detectors.OptionsIVDetector │ OptionsIVDetector initialized: IV threshold=80%, cooldown=4h, alerts_enabled=False
+19:21:53 │ INFO │ argus.detectors.VolatilityDetector │ VolatilityDetector initialized: expansion>2.0x, compression<0.5x
+19:21:53 │ INFO │ argus.detectors.IBITDetector │ IBITDetector initialized: BTC IV >25%, IBIT drop >0.5%, IV Rank >25%
+19:21:53 │ INFO │ argus.detectors.IBITDetector │ BITODetector initialized: BTC IV >25%, BITO drop >0.5%, IV Rank >25%
+19:21:53 │ INFO │ argus.orchestrator │ Initialized 4 detectors
+19:21:53 │ INFO │ argus.orchestrator │ Found 171,059 zombie positions from previous runs, marking as expired
+19:21:53 │ ERROR │ argus.orchestrator │ Failed to cleanup zombie positions: no such column: close_reason
+19:21:54 │ INFO │ argus.orchestrator │ Setup complete!
+19:21:54 │ INFO │ argus.orchestrator │ Starting Argus...
+19:21:54 │ INFO │ argus.connectors.bybit │ Connecting to Bybit WebSocket: wss://stream.bybit.com/v5/public/linear
+19:21:54 │ INFO │ argus.connectors.yahoo │ Starting Yahoo Finance polling (60s interval)
+19:21:54 │ INFO │ argus.orchestrator │ Health check: {'bybit_connected': False, 'detectors_active': 4, 'timestamp': '2026-02-05T00:21:54.613622+00:00'}
+19:21:55 │ INFO │ argus.alerts │ Telegram bot polling started
+19:21:55 │ INFO │ argus.orchestrator │ Argus is running! Press Ctrl+C to stop.
+19:21:55 │ INFO │ argus.connectors.bybit │ Bybit WebSocket connected
+19:22:57 │ ERROR │ argus.connectors.yahoo │ Update callback error: Object of type TradeRecommendation is not JSON serializable
+Could not find suitable spread
+19:23:05 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:23:33 │ INFO │ argus.orchestrator │ Exit monitor: 241920 trades closed
+Could not find suitable spread
+19:24:07 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:24:42 │ INFO │ argus.orchestrator │ Exit monitor: 241920 trades closed
+Could not find suitable spread
+19:25:09 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:25:53 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:26:12 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+19:26:58 │ ERROR │ argus.orchestrator │ Health check error: 'ClientConnection' object has no attribute 'open'
+19:27:09 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+19:27:09 │ WARNING │ argus.connectors.bybit │ Bybit WebSocket closed: 1006 -
+19:27:09 │ INFO │ argus.connectors.bybit │ Reconnecting in 11.0s (attempt 1)
+Could not find suitable spread
+Could not find suitable spread
+19:27:14 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+19:27:20 │ INFO │ argus.connectors.bybit │ Connecting to Bybit WebSocket: wss://stream.bybit.com/v5/public/linear
+19:27:21 │ INFO │ argus.connectors.bybit │ Bybit WebSocket connected
+Could not find suitable spread
+19:28:18 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:28:48 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:29:20 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:29:57 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:30:22 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:31:09 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:31:25 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+19:31:58 │ ERROR │ argus.orchestrator │ Health check error: 'ClientConnection' object has no attribute 'open'
+Could not find suitable spread
+19:32:20 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:32:27 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:33:17 │ WARNING │ argus.uniformity_monitor │ UNIFORMITY ALERT [all] expiry: Bug-like convergence: HHI=1.000, modal=2026-02-11 at 100% (319680/319680)
+Could not find suitable spread
+19:33:29 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+19:33:34 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:34:32 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+19:34:48 │ INFO │ argus.detectors.VolatilityDetector │ Detection logged: volatility - BTCUSDT - Edge: 0.0 bps
+Could not find suitable spread
+19:35:00 │ INFO │ argus.detectors.VolatilityDetector │ Detection logged: volatility - BTCUSDT - Edge: 0.0 bps
+19:35:15 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:35:34 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:36:09 │ INFO │ argus.detectors.VolatilityDetector │ Detection logged: volatility - ETHUSDT - Edge: 0.0 bps
+19:36:09 │ INFO │ argus.detectors.VolatilityDetector │ Detection logged: volatility - ETHUSDT - Edge: 0.0 bps
+19:36:09 │ INFO │ argus.detectors.VolatilityDetector │ Detection logged: volatility - ETHUSDT - Edge: 0.0 bps
+19:36:09 │ INFO │ argus.detectors.VolatilityDetector │ Detection logged: volatility - ETHUSDT - Edge: 0.0 bps
+19:36:25 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:36:36 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+19:36:58 │ ERROR │ argus.orchestrator │ Health check error: 'ClientConnection' object has no attribute 'open'
+Could not find suitable spread
+19:37:38 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:37:39 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+Could not find suitable spread
+19:38:41 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+19:38:48 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:39:44 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:40:05 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:40:51 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:41:21 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:41:54 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+19:41:58 │ ERROR │ argus.orchestrator │ Health check error: 'ClientConnection' object has no attribute 'open'
+Could not find suitable spread
+19:42:32 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:42:56 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:43:48 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:43:58 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:44:59 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:45:01 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:45:54 │ WARNING │ argus.uniformity_monitor │ UNIFORMITY ALERT [all] expiry: Bug-like convergence: HHI=1.000, modal=2026-02-11 at 100% (319680/319680)
+Could not find suitable spread
+19:46:03 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+19:46:14 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+19:47:02 │ ERROR │ argus.orchestrator │ Health check error: 'ClientConnection' object has no attribute 'open'
+Could not find suitable spread
+19:47:05 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:47:30 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:48:08 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:48:45 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:49:10 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:49:57 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+Could not find suitable spread
+19:50:12 │ WARNING │ argus.detectors.IBITDetector │ Trade calculator could not generate recommendation
+Could not find suitable spread
+19:51:11 │ INFO │ argus.orchestrator │ Exit monitor: 216000 trades closed
+
+HERE IS THE TELEGRAM OUTPUT:
+
+Argus, [2/4/2026 7:21 PM]
+🚀 Argus Master Engine Online
+Time: 19:21:53 EST
+
+✅ Detectors: 4
+✅ GPU Engine: Enabled (CUDA)
+✅ Farm: 15,552,000 configurations loaded
+
+Monitoring active for IBIT, BITO, and Crypto markets.
+
+Argus, [2/4/2026 7:22 PM]
+📊 DAILY REVIEW — Feb 04, 2026
+
+PAPER TRADING:
+🟢 Today: $+128834729.18 (+2576694.6%)
+Opened: 3933897 | Closed: 3907910
+🟢 Month-to-Date: $+128834729.18 (+2576694.6%)
+Trades: 3907910 | Win rate: 100%
+🟢 Year-to-Date: $+128834729.18 (+2576694.6%)
+Trades: 3907910 | Win rate: 100%
+
+💰 Account value: $128,839,729.18
+
+OPEN POSITIONS: 171059
+
+📈 IV REGIME FORECAST:
+IV at 64% is elevated. Good conditions for premium selling.
+💡 Elevated IV typically persists 3-5 days before normalizing.
+
+CONDITIONS:
+➖ Score: 4/10 (neutral)
+📈 BTC IV: 64%
+⚠️ Gap risk: MINIMAL
+
+End of day review • Next review tomorrow 4 PM ET
+
+🖥️ GPU Engine Status:
+Device: NVIDIA GeForce RTX 4080
+Memory: 0.5GB / 17.2GB
+Batch Engine: Active (Optimized for 400K traders)
+
+Oliver Meihls, [2/4/2026 7:25 PM]
+/help
+
+Argus, [2/4/2026 7:25 PM]
+Argus Commands
+
+/dashboard — System health at a glance
+/positions — Open positions + top unrealized P&L
+/pnl — Per-trader P&L stats (mean/median/std/deciles)
+/signals — IBIT/BITO signal conditions
+/status — Conditions score + data freshness
+/zombies — Detect stale/orphaned positions
+/follow — Show followed (best) traders
+/help — This message
+
+Automatic Notifications:
+Market open (9:30 AM ET)
+Market close (4:00 PM ET) + daily summary
+Follow-list trade alerts (when followed traders enter)
+System error alerts (if loops crash)
+
+Trade Confirmation:
+Reply yes or no after a Tier 1 alert
+
+Oliver Meihls, [2/4/2026 7:25 PM]
+/dashboard
+
+Argus, [2/4/2026 7:25 PM]
+Argus Dashboard
+Uptime: 0h 10m | Market: 🔴 CLOSED
+🟢 All Systems Operational
+
+Tasks:
+✅ Research Loop (33s ago)
+✅ Exit Monitor (5s ago)
+✅ Health Check (4m ago)
+
+Data Feeds:
+✅ Detections (16m ago)
+✅ Options IV (20s ago)
+✅ Prices (2s ago)
+✅ Health (4m ago)
+
+Farm:
+Configs: 15,552,000
+Active traders: 25,920
+Open positions: 77,760
+Today opened/closed/expired: 777,600/699,840/0
+
+Conditions: 4/10 NEUTRAL
+
+Oliver Meihls, [2/4/2026 7:26 PM]
+/positions
+
+Argus, [2/4/2026 7:26 PM]
+Open Positions (77,760 total)
+
+By Strategy:
+IBIT straddle_sell: 77,760 @ 42.0C/42.0P
+
+Oliver Meihls, [2/4/2026 7:26 PM]
+/pnl
+
+Oliver Meihls, [2/4/2026 7:26 PM]
+/signals
+
+Argus, [2/4/2026 7:26 PM]
+💰 P&L Summary
+
+Aggregate (all traders):
+🟢 Today: $+147989123.18
+🟢 MTD: $+147989123.18
+🟢 YTD: $+147989123.18
+
+Opened today: 4711497
+Closed today: 4607750
+MTD closed: 4607750
+Win rate (MTD): 100%
+Open positions: 248819
+
+Per-Trader Returns (30d):
+Return = realized PnL / $5000
+Traders: 284,178
+Mean: +10.42%
+Median: +1.44%
+Std Dev: 39.18%
+Best: +597.16%
+Worst: +0.24%
+
+Deciles:
+Top 10% avg: +86.30%
+Bottom 10% avg: +0.34%
+
+Most Consistent:
+PT-000107 (iron_condor)
+Return: +597.16% | Win: 100% | Score: 1.99
+
+Paper account: $147994123.18
+
+Argus, [2/4/2026 7:26 PM]
+🧪 IBIT/BITO Signal Checklist
+
+IBIT
+• BTC IV: 63.9% (≥ 25% → ✅)
+• IBIT Change: -17.70% (≤ -0.5% → ✅)
+• Combined Score: 18.98 (≥ 1.0 → ✅)
+• IV Rank: 75.2% (≥ 25 → ✅)
+• Alert Cooldown: 1.94h (live alerts only, farm unaffected)
+• Data Ready: ✅
+
+BITO
+• BTC IV: 63.9% (≥ 25% → ✅)
+• BITO Change: -17.75% (≤ -0.5% → ✅)
+• Combined Score: 19.02 (≥ 1.0 → ✅)
+• IV Rank: 78.8% (≥ 25 → ✅)
+• Alert Cooldown: ✅ none
+• Data Ready: ✅
+
+Oliver Meihls, [2/4/2026 7:28 PM]
+/status
+
+Argus, [2/4/2026 7:28 PM]
+🌡️ CONDITIONS: 4/10 (NEUTRAL)
+
+• BTC IV: 64%
+• Funding: +0.010%
+• Market: 🔴 CLOSED
+• Market Time: 19:28:39 EST
+• Updated: 2026-02-04 19:21:54 EST
+
+🧭 Data Freshness
+✅ Detections: 2026-02-04 19:09:07 EST (19m ago)
+✅ Options IV: 2026-02-04 19:28:23 EST (15s ago)
+✅ Prices: 2026-02-04 19:28:23 EST (16s ago)
+✅ Health: 2026-02-04 19:21:56 EST (6m ago)
+
+Oliver Meihls, [2/4/2026 7:28 PM]
+/zombies
+
+Argus, [2/4/2026 7:28 PM]
+🧟 Zombie Positions Detected: 33512
+
+PT-000206 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+PT-000235 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+PT-000244 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+PT-000872 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+PT-001330 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+PT-001483 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+PT-001666 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+PT-001839 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+PT-001948 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+PT-001976 | IBIT 40.0/37.0 | Opened 56h ago | Expiry: 2026-02-09
+... and 33502 more
+
+Zombies are auto-cleaned on restart and by /zombies
+
+Oliver Meihls, [2/4/2026 7:29 PM]
+/follow
+
+Argus, [2/4/2026 7:29 PM]
+No followed traders yet.
+Run python -m scripts.select_best_trader to select.
+
+Oliver Meihls, [2/4/2026 7:29 PM]
+/help
+
+Argus, [2/4/2026 7:29 PM]
+Argus Commands
+
+/dashboard — System health at a glance
+/positions — Open positions + top unrealized P&L
+/pnl — Per-trader P&L stats (mean/median/std/deciles)
+/signals — IBIT/BITO signal conditions
+/status — Conditions score + data freshness
+/zombies — Detect stale/orphaned positions
+/follow — Show followed (best) traders
+/help — This message
+
+Automatic Notifications:
+Market open (9:30 AM ET)
+Market close (4:00 PM ET) + daily summary
+Follow-list trade alerts (when followed traders enter)
+System error alerts (if loops crash)
+
+Trade Confirmation:
+Reply yes or no after a Tier 1 alert
+
+Argus, [2/4/2026 7:33 PM]
+⚠️ Uniformity Alert
+UNIFORMITY ALERTS (1):
+expiry: HHI=1.000, modal=2026-02-11 (100%), unique=1/319680
+Reason: Bug-like convergence: HHI=1.000, modal=2026-02-11 at 100% (319680/319680)
+
+Variable summary:
+strikes: HHI=0.259 entropy=1.97 modal=32% unique=4 [ok]
+expiry: HHI=1.000 entropy=0.00 modal=100% unique=1 [ALERT]
+entry_credit: HHI=0.259 entropy=1.97 modal=32% unique=4 [ok]
+contracts: HHI=0.191 entropy=2.48 modal=25% unique=6 [ok]
+
+Argus, [2/4/2026 7:45 PM]
+⚠️ Uniformity Alert
+UNIFORMITY ALERTS (1):
+expiry: HHI=1.000, modal=2026-02-11 (100%), unique=1/319680
+Reason: Bug-like convergence: HHI=1.000, modal=2026-02-11 at 100% (319680/319680)
+
+Variable summary:
+strikes: HHI=0.259 entropy=1.97 modal=32% unique=4 [ok]
+expiry: HHI=1.000 entropy=0.00 modal=100% unique=1 [ALERT]
+entry_credit: HHI=0.259 entropy=1.97 modal=32% unique=4 [ok]
+contracts: HHI=0.191 entropy=2.48 modal=25% unique=6 [ok]
