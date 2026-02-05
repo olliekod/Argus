@@ -15,6 +15,8 @@ from enum import Enum
 import json
 import uuid
 
+from .collector_guard import guard_collector_mode
+
 logger = logging.getLogger(__name__)
 
 
@@ -294,6 +296,8 @@ class PaperTrader:
         Returns:
             Created paper trade, or None if invalid
         """
+        guard_collector_mode()
+
         # ── Final entry-point validation ──────────────────────────────
         if entry_credit is None or entry_credit <= 0:
             logger.debug(

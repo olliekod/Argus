@@ -29,6 +29,9 @@ def _quote(symbol: str, price: float, volume_24h: float, ts: float) -> QuoteEven
         timestamp=ts,
         source="test",
         volume_24h=volume_24h,
+        source_ts=ts,
+        event_ts=ts,
+        receive_time=ts,
     )
 
 
@@ -191,6 +194,79 @@ class TestStatusCounters:
         assert extras["late_ticks_dropped_total"] == 1
         assert extras["quotes_received_by_symbol"]["BTC"] == 3
         assert "BTC" in extras["last_bar_ts_by_symbol"]
+
+
+class TestSourceTimestampPolicy:
+    def test_rejects_missing_source_ts(self):
+        bus = EventBus()
+        emitted = []
+        bus.subscribe(TOPIC_MARKET_BARS, lambda bar: emitted.append(bar))
+        bb = BarBuilder(bus)
+        bus.start()
+
+        try:
+            base = 1_700_000_000.0
+            minute0 = _minute_floor(base)
+
+            bad_quote = QuoteEvent(
+                symbol="BTC",
+                bid=99.0,
+                ask=101.0,
+                mid=100.0,
+                last=100.0,
+                timestamp=minute0 + 1,
+                source="test",
+                volume_24h=1000.0,
+                source_ts=0.0,
+                event_ts=minute0 + 1,
+                receive_time=minute0 + 1,
+            )
+            bb._on_quote(bad_quote)
+            _drain(bus)
+
+            assert not emitted
+            status = bb.get_status()
+            extras = status["extras"]
+            assert extras["quotes_rejected_total"] == 1
+            assert extras["quotes_rejected_by_symbol"]["BTC"] == 1
+        finally:
+            bus.stop()
+
+
+class TestLateTickReset:
+    def test_late_ticks_reset_between_bars(self):
+        bus = EventBus()
+        emitted = []
+        bus.subscribe(TOPIC_MARKET_BARS, lambda bar: emitted.append(bar))
+        bb = BarBuilder(bus)
+        bus.start()
+
+        try:
+            base = 1_700_000_000.0
+            minute0 = _minute_floor(base)
+            minute1 = minute0 + 60
+            minute2 = minute0 + 120
+            minute3 = minute0 + 180
+
+            bb._on_quote(_quote("BTC", 100.0, 1000.0, minute0 + 1))
+            bb._on_quote(_quote("BTC", 101.0, 1010.0, minute1 + 1))
+            _drain(bus)
+
+            bb._on_quote(_quote("BTC", 50.0, 1020.0, minute0 + 30))
+            bb._on_quote(_quote("BTC", 102.0, 1030.0, minute2 + 1))
+            _drain(bus)
+
+            bb._on_quote(_quote("BTC", 40.0, 1040.0, minute1 + 30))
+            bb._on_quote(_quote("BTC", 103.0, 1050.0, minute3 + 1))
+            _drain(bus)
+
+            bar1 = next(b for b in emitted if b.timestamp == minute1)
+            bar2 = next(b for b in emitted if b.timestamp == minute2)
+
+            assert bar1.late_ticks_dropped == 1
+            assert bar2.late_ticks_dropped == 1
+        finally:
+            bus.stop()
 
 
 class TestContinuityWithoutSyntheticBars:

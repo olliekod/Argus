@@ -19,6 +19,7 @@ import json
 
 from .paper_trader import PaperTrader, TraderConfig, PaperTrade, StrategyType
 from .trader_config_generator import generate_all_configs, get_config_summary
+from .collector_guard import guard_collector_mode
 from ..core.economic_calendar import EconomicCalendar
 
 logger = logging.getLogger(__name__)
@@ -358,6 +359,8 @@ class PaperTraderFarm:
             List of trades that were entered
         """
         import time as _time
+
+        guard_collector_mode()
 
         # ── Hard tradeable-universe gate ──────────────────────────────
         if symbol.upper() not in TRADEABLE_UNDERLYINGS:

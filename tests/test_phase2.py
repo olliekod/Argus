@@ -30,7 +30,7 @@ from src.core.events import (
     SCHEMA_VERSION,
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_METRICS,
-    TOPIC_SIGNALS_REGIME,
+    TOPIC_SIGNALS,
     TOPIC_SYSTEM_COMPONENT_HEARTBEAT,
 )
 from src.core.feature_builder import FeatureBuilder
@@ -371,7 +371,7 @@ class TestRegimeDetector:
     def test_regime_transition_on_data(self):
         bus = EventBus()
         regime_events = []
-        bus.subscribe(TOPIC_SIGNALS_REGIME, lambda e: regime_events.append(e))
+        bus.subscribe(TOPIC_SIGNALS, lambda e: regime_events.append(e))
         rd = RegimeDetector(bus)
         bus.start()
         try:
@@ -391,13 +391,14 @@ class TestRegimeDetector:
             regime = rd.get_current_regime("BTC")
             assert regime != UNKNOWN, f"Expected a classified regime, got {regime}"
             assert len(regime_events) >= 1
+            assert regime_events[-1].signal_type == "regime_change"
         finally:
             bus.stop()
 
     def test_crash_detection(self):
         bus = EventBus()
         regime_events = []
-        bus.subscribe(TOPIC_SIGNALS_REGIME, lambda e: regime_events.append(e))
+        bus.subscribe(TOPIC_SIGNALS, lambda e: regime_events.append(e))
         rd = RegimeDetector(bus)
         bus.start()
         try:
@@ -440,9 +441,10 @@ class TestPolymarketWatchlist:
     def test_volume_filter(self):
         # Import directly using importlib.util to avoid triggering __init__.py
         import importlib.util, sys
+        from pathlib import Path
         spec = importlib.util.spec_from_file_location(
             "polymarket_watchlist",
-            "/home/user/Argus/src/connectors/polymarket_watchlist.py",
+            str(Path(__file__).resolve().parents[1] / "src/connectors/polymarket_watchlist.py"),
         )
         watchlist_mod = importlib.util.module_from_spec(spec)
         sys.modules["polymarket_watchlist"] = watchlist_mod
@@ -476,9 +478,10 @@ class TestPolymarketWatchlist:
 
     def test_keyword_filter(self):
         import importlib.util, sys
+        from pathlib import Path
         spec = importlib.util.spec_from_file_location(
             "polymarket_watchlist",
-            "/home/user/Argus/src/connectors/polymarket_watchlist.py",
+            str(Path(__file__).resolve().parents[1] / "src/connectors/polymarket_watchlist.py"),
         )
         watchlist_mod = importlib.util.module_from_spec(spec)
         sys.modules["polymarket_watchlist"] = watchlist_mod

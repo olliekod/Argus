@@ -35,6 +35,7 @@ import threading
 import time
 from collections import deque
 from datetime import datetime, timezone
+from queue import Empty, Full, Queue
 from typing import Any, Dict, List, Optional
 
 from .bus import EventBus
@@ -55,6 +56,8 @@ logger = logging.getLogger("argus.persistence")
 
 # How often the bar-batch writer flushes (seconds)
 _FLUSH_INTERVAL = 1.0
+_WRITE_QUEUE_MAXSIZE = 10_000
+_WRITE_STOP = object()
 
 
 class PersistenceManager:
@@ -85,6 +88,8 @@ class PersistenceManager:
         self._bar_buffer: deque[BarEvent] = deque(maxlen=100_000)
         self._bar_lock = threading.Lock()
         self._flush_thread: Optional[threading.Thread] = None
+        self._write_thread: Optional[threading.Thread] = None
+        self._write_queue: Queue = Queue(maxsize=_WRITE_QUEUE_MAXSIZE)
         self._running = False
         self._status_lock = threading.Lock()
         self._last_flush_ts: Optional[float] = None
@@ -98,6 +103,9 @@ class PersistenceManager:
         self._signals_writes_total: int = 0
         self._consecutive_failures: int = 0
         self._start_time = time.time()
+        self._signals_dropped_total: int = 0
+        self._metrics_dropped_total: int = 0
+        self._heartbeats_dropped_total: int = 0
 
         # Lag tracking (Stream 2.1)
         self._last_persist_lag_ms: Optional[float] = None
@@ -123,6 +131,12 @@ class PersistenceManager:
             daemon=True,
         )
         self._flush_thread.start()
+        self._write_thread = threading.Thread(
+            target=self._write_loop,
+            name="persistence-writes",
+            daemon=True,
+        )
+        self._write_thread.start()
         logger.info("PersistenceManager flush thread started")
 
     def shutdown(self) -> None:
@@ -133,8 +147,14 @@ class PersistenceManager:
         self._running = False
         # Final flush
         self._do_flush()
+        try:
+            self._write_queue.put_nowait(_WRITE_STOP)
+        except Exception:
+            pass
         if self._flush_thread and self._flush_thread.is_alive():
             self._flush_thread.join(timeout=5.0)
+        if self._write_thread and self._write_thread.is_alive():
+            self._write_thread.join(timeout=5.0)
         logger.info("PersistenceManager shut down (all bars flushed)")
 
     # ── handlers (run on bus worker threads) ────────────────
@@ -146,17 +166,7 @@ class PersistenceManager:
 
     def _on_signal(self, event: SignalEvent) -> None:
         """Persist signal immediately (no batching)."""
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._write_signal(event), self._loop
-            )
-            future.result(timeout=10.0)
-        except Exception:
-            with self._status_lock:
-                self._db_write_errors += 1
-                self._consecutive_failures += 1
-                self._last_error = "signal_write_failed"
-            logger.exception("Failed to persist signal event %s", event.detector)
+        self._enqueue_write("signal", event)
 
     def _on_heartbeat(self, event: HeartbeatEvent) -> None:
         """Flush buffered bars on heartbeat boundary."""
@@ -164,28 +174,11 @@ class PersistenceManager:
 
     def _on_metric(self, event: MetricEvent) -> None:
         """Persist market metrics immediately."""
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._write_metric(event), self._loop
-            )
-            # Result check optional for metrics, but helps catch schema errors early
-            future.result(timeout=10.0)
-        except Exception:
-            with self._status_lock:
-                self._db_write_errors += 1
-                self._consecutive_failures += 1
-                self._last_error = "metric_write_failed"
-            logger.exception("Failed to persist metric %s", event.metric)
+        self._enqueue_write("metric", event)
 
     def _on_component_heartbeat(self, event: ComponentHeartbeatEvent) -> None:
         """Persist structured component heartbeats."""
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._write_component_heartbeat(event), self._loop
-            )
-            future.result(timeout=10.0)
-        except Exception:
-            logger.debug("Failed to persist component heartbeat for %s", event.component)
+        self._enqueue_write("heartbeat", event)
 
     # ── flush logic ─────────────────────────────────────────
 
@@ -194,6 +187,50 @@ class PersistenceManager:
         while self._running:
             time.sleep(_FLUSH_INTERVAL)
             self._do_flush()
+
+    def _write_loop(self) -> None:
+        """Background thread: serialize async DB writes for signals/metrics/heartbeats."""
+        while self._running or not self._write_queue.empty():
+            try:
+                item = self._write_queue.get(timeout=0.5)
+            except Empty:
+                continue
+            if item is _WRITE_STOP:
+                return
+            kind, event = item
+            try:
+                if kind == "signal":
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._write_signal(event), self._loop
+                    )
+                elif kind == "metric":
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._write_metric(event), self._loop
+                    )
+                else:
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._write_component_heartbeat(event), self._loop
+                    )
+                future.result(timeout=10.0)
+            except Exception:
+                with self._status_lock:
+                    self._db_write_errors += 1
+                    self._consecutive_failures += 1
+                    self._last_error = f"{kind}_write_failed"
+                logger.exception("Failed to persist %s event", kind)
+
+    def _enqueue_write(self, kind: str, event: Any) -> None:
+        try:
+            self._write_queue.put_nowait((kind, event))
+        except Full:
+            with self._status_lock:
+                if kind == "signal":
+                    self._signals_dropped_total += 1
+                elif kind == "metric":
+                    self._metrics_dropped_total += 1
+                else:
+                    self._heartbeats_dropped_total += 1
+            logger.debug("Dropping %s write due to full queue", kind)
 
     def _do_flush(self) -> None:
         """Drain the bar buffer and write to DB."""
@@ -383,6 +420,10 @@ class PersistenceManager:
                 "bars_writes_total": self._bars_writes_total,
                 "metrics_writes_total": self._metrics_writes_total,
                 "signals_writes_total": self._signals_writes_total,
+                "signals_dropped_total": self._signals_dropped_total,
+                "metrics_dropped_total": self._metrics_dropped_total,
+                "heartbeats_dropped_total": self._heartbeats_dropped_total,
+                "write_queue_depth": self._write_queue.qsize(),
                 "persist_lag_ema_ms": round(self._persist_lag_ema, 1) if self._persist_lag_ema else None,
             },
         )
@@ -405,6 +446,9 @@ class PersistenceManager:
             consecutive_failures = self._consecutive_failures
             persist_lag_ms = self._last_persist_lag_ms
             persist_lag_ema = self._persist_lag_ema
+            signals_dropped_total = self._signals_dropped_total
+            metrics_dropped_total = self._metrics_dropped_total
+            heartbeats_dropped_total = self._heartbeats_dropped_total
 
         now = time.time()
         age_seconds = (now - last_write_ts) if last_write_ts else None
@@ -439,6 +483,10 @@ class PersistenceManager:
                 "metrics_writes_total": metrics_writes_total,
                 "bars_writes_total": bars_writes_total,
                 "signals_writes_total": signals_writes_total,
+                "signals_dropped_total": signals_dropped_total,
+                "metrics_dropped_total": metrics_dropped_total,
+                "heartbeats_dropped_total": heartbeats_dropped_total,
+                "write_queue_depth": self._write_queue.qsize(),
                 "persist_lag_ms": round(persist_lag_ms, 1) if persist_lag_ms is not None else None,
                 "persist_lag_ema_ms": round(persist_lag_ema, 1) if persist_lag_ema is not None else None,
             },
