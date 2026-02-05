@@ -105,7 +105,7 @@ class PaperTrade:
     
     timestamp: str
     strikes: str                   # e.g., "$48/$44"
-    expiry: str                    # e.g., "2026-02-21"
+    expiry: Optional[str]          # e.g., "2026-02-21"
     
     entry_credit: float            # Credit received
     contracts: int
@@ -272,7 +272,7 @@ class PaperTrader:
         self,
         symbol: str,
         strikes: str,
-        expiry: str,
+        expiry: Optional[str],
         entry_credit: float,
         contracts: int,
         market_conditions: Dict,
@@ -291,6 +291,8 @@ class PaperTrader:
         Returns:
             Created paper trade
         """
+        normalized_expiry = self._normalize_expiry(expiry)
+
         trade = PaperTrade(
             id=str(uuid.uuid4()),
             trader_id=self.config.trader_id,
@@ -298,7 +300,7 @@ class PaperTrader:
             symbol=symbol,
             timestamp=datetime.now(timezone.utc).isoformat(),
             strikes=strikes,
-            expiry=expiry,
+            expiry=normalized_expiry,
             entry_credit=entry_credit,
             contracts=contracts,
             market_conditions=market_conditions,
@@ -309,10 +311,19 @@ class PaperTrader:
         
         logger.info(
             f"[{self.config.trader_id}] ENTRY: {symbol} {strikes} "
-            f"exp {expiry} @ ${entry_credit:.2f} x{contracts}"
+            f"exp {normalized_expiry} @ ${entry_credit:.2f} x{contracts}"
         )
         
         return trade
+
+    @staticmethod
+    def _normalize_expiry(expiry: Optional[str]) -> Optional[str]:
+        if expiry is None:
+            return None
+        normalized = str(expiry).strip()
+        if not normalized or normalized.upper() in {"N/A", "NA", "NONE", "NULL"}:
+            return None
+        return normalized
     
     def check_exits(
         self, 

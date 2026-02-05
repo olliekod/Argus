@@ -1190,7 +1190,12 @@ class PaperTraderFarm:
             WHERE status = 'open'
               AND (
                   (expiry IS NOT NULL AND expiry < date('now', ?))
-                  OR (expiry IS NULL AND timestamp < datetime('now', ?))
+                  OR (
+                      (expiry IS NULL
+                       OR TRIM(expiry) = ''
+                       OR UPPER(expiry) IN ('N/A', 'NA', 'NONE', 'NULL'))
+                      AND timestamp < datetime('now', ?)
+                  )
               )
             ORDER BY timestamp ASC
         """, (f"-{grace_days} days", f"-{stale_days} days"))
@@ -1198,7 +1203,11 @@ class PaperTraderFarm:
         zombies = []
         for row in rows:
             r = dict(row)
-            if r.get('expiry') and r['expiry'] < datetime.now().strftime('%Y-%m-%d'):
+            expiry_value = (r.get('expiry') or '').strip()
+            expiry_is_missing = not expiry_value or expiry_value.upper() in {
+                'N/A', 'NA', 'NONE', 'NULL'
+            }
+            if not expiry_is_missing and expiry_value < datetime.now().strftime('%Y-%m-%d'):
                 r['zombie_reason'] = 'expired_past_grace'
             else:
                 r['zombie_reason'] = 'stale_no_expiry'
