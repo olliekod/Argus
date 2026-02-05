@@ -27,6 +27,22 @@ Late-tick policy
 A tick whose minute-floor falls **before** the active bar's open
 timestamp is silently discarded.  Once a bar is emitted it is
 immutable.
+
+Bar invariants (Stream 1.1)
+---------------------------
+Before publishing, bars are validated against OHLCV invariants:
+* high >= max(open, close)
+* low  <= min(open, close)
+* volume >= 0
+On violation the bar is repaired, a warning is logged, and a
+``bar_invariant_violations`` counter is incremented.
+
+Close reasons
+-------------
+Every bar carries a deterministic ``close_reason``:
+* ``NEW_TICK``       — a tick for a later minute closed the prior bar
+* ``MINUTE_TICK``    — ``system.minute_tick`` triggered close
+* ``SHUTDOWN_FLUSH`` — graceful shutdown flushed in-progress bars
 """
 
 from __future__ import annotations
@@ -41,11 +57,14 @@ from typing import Deque, Dict
 from .bus import EventBus
 from .events import (
     BarEvent,
+    CloseReason,
+    ComponentHeartbeatEvent,
     MinuteTickEvent,
     QuoteEvent,
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_QUOTES,
     TOPIC_SYSTEM_MINUTE_TICK,
+    TOPIC_SYSTEM_COMPONENT_HEARTBEAT,
 )
 
 logger = logging.getLogger("argus.bar_builder")
@@ -54,9 +73,14 @@ logger = logging.getLogger("argus.bar_builder")
 class _BarAccumulator:
     """Mutable accumulator for a single in-progress bar."""
 
-    __slots__ = ("open", "high", "low", "close", "volume", "ts_open", "source", "tick_count")
+    __slots__ = (
+        "open", "high", "low", "close", "volume",
+        "ts_open", "source", "tick_count",
+        "first_source_ts", "last_source_ts",
+    )
 
-    def __init__(self, price: float, volume_delta: float, ts_open: float, source: str) -> None:
+    def __init__(self, price: float, volume_delta: float, ts_open: float,
+                 source: str, source_ts: float = 0.0) -> None:
         self.open = price
         self.high = price
         self.low = price
@@ -65,13 +89,22 @@ class _BarAccumulator:
         self.ts_open = ts_open
         self.source = source
         self.tick_count = 1
+        self.first_source_ts = source_ts if source_ts > 0 else ts_open
+        self.last_source_ts = source_ts if source_ts > 0 else ts_open
 
-    def update(self, price: float, volume_delta: float) -> None:
+    def update(self, price: float, volume_delta: float,
+               source_ts: float = 0.0) -> None:
         self.high = max(self.high, price)
         self.low = min(self.low, price)
         self.close = price
         self.volume += volume_delta
         self.tick_count += 1
+        ts = source_ts if source_ts > 0 else 0.0
+        if ts > 0:
+            if ts < self.first_source_ts or self.first_source_ts <= 0:
+                self.first_source_ts = ts
+            if ts > self.last_source_ts:
+                self.last_source_ts = ts
 
 
 def _minute_floor(epoch: float) -> float:
@@ -102,6 +135,8 @@ class BarBuilder:
         self._quotes_received_by_symbol: Dict[str, int] = {}
         self._bars_emitted_window_minutes = 60
         self._bars_emitted_timestamps_by_symbol: Dict[str, Deque[float]] = {}
+        self._bar_invariant_violations = 0
+        self._start_time = time.time()
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
         bus.subscribe(TOPIC_SYSTEM_MINUTE_TICK, self._on_minute_tick)
         logger.info("BarBuilder initialised — subscribed to %s", TOPIC_MARKET_QUOTES)
@@ -138,6 +173,8 @@ class BarBuilder:
         if price <= 0:
             return
 
+        source_ts = getattr(event, 'source_ts', 0.0) or event.timestamp
+
         self._quotes_received_by_symbol[event.symbol] = (
             self._quotes_received_by_symbol.get(event.symbol, 0) + 1
         )
@@ -149,7 +186,7 @@ class BarBuilder:
             if acc is None:
                 # First tick for this symbol — start a new bar
                 self._bars[event.symbol] = _BarAccumulator(
-                    price, vol_delta, minute, event.source
+                    price, vol_delta, minute, event.source, source_ts
                 )
                 return
 
@@ -165,15 +202,15 @@ class BarBuilder:
 
             if minute > acc.ts_open:
                 # New minute — emit the completed bar and start fresh
-                self._emit_bar(event.symbol, acc)
+                self._emit_bar(event.symbol, acc, CloseReason.NEW_TICK)
 
                 # Reset accumulator for the new minute
                 self._bars[event.symbol] = _BarAccumulator(
-                    price, vol_delta, minute, event.source
+                    price, vol_delta, minute, event.source, source_ts
                 )
             else:
                 # Same minute — update accumulator
-                acc.update(price, vol_delta)
+                acc.update(price, vol_delta, source_ts)
 
     def _on_minute_tick(self, event: MinuteTickEvent) -> None:
         """Flush any bars whose minute has closed at a boundary tick."""
@@ -182,14 +219,62 @@ class BarBuilder:
             to_remove = []
             for symbol, acc in self._bars.items():
                 if tick_minute > acc.ts_open:
-                    self._emit_bar(symbol, acc)
+                    self._emit_bar(symbol, acc, CloseReason.MINUTE_TICK)
                     to_remove.append(symbol)
             for symbol in to_remove:
                 self._bars.pop(symbol, None)
 
+    # ── bar invariant enforcement ─────────────────────────
+
+    def _enforce_invariants(self, acc: _BarAccumulator) -> bool:
+        """Validate and repair OHLCV invariants. Returns True if bar was valid."""
+        valid = True
+
+        # high must be >= max(open, close)
+        expected_high = max(acc.open, acc.close)
+        if acc.high < expected_high:
+            logger.warning(
+                "Bar invariant violation: high (%.6f) < max(open, close) (%.6f), repairing",
+                acc.high, expected_high,
+            )
+            acc.high = expected_high
+            valid = False
+
+        # low must be <= min(open, close)
+        expected_low = min(acc.open, acc.close)
+        if acc.low > expected_low:
+            logger.warning(
+                "Bar invariant violation: low (%.6f) > min(open, close) (%.6f), repairing",
+                acc.low, expected_low,
+            )
+            acc.low = expected_low
+            valid = False
+
+        # volume must be >= 0
+        if acc.volume < 0:
+            logger.warning(
+                "Bar invariant violation: volume (%.6f) < 0, setting to 0",
+                acc.volume,
+            )
+            acc.volume = 0.0
+            valid = False
+
+        if not valid:
+            self._bar_invariant_violations += 1
+
+        return valid
+
     # ── utility ─────────────────────────────────────────────
 
-    def _emit_bar(self, symbol: str, acc: _BarAccumulator) -> BarEvent:
+    def _emit_bar(self, symbol: str, acc: _BarAccumulator,
+                  close_reason: CloseReason = CloseReason.MINUTE_BOUNDARY) -> BarEvent:
+        # Enforce invariants before publishing
+        self._enforce_invariants(acc)
+
+        # Collect late-tick count for this symbol and reset
+        late_dropped = self._late_ticks_dropped_by_symbol.get(symbol, 0)
+
+        now = time.time()
         bar = BarEvent(
             symbol=symbol,
             open=acc.open,
@@ -201,13 +286,19 @@ class BarBuilder:
             source=acc.source,
             bar_duration=60,
             tick_count=acc.tick_count,
+            n_ticks=acc.tick_count,
+            first_source_ts=acc.first_source_ts,
+            last_source_ts=acc.last_source_ts,
+            late_ticks_dropped=late_dropped,
+            close_reason=int(close_reason),
+            source_ts=acc.first_source_ts,
+            event_ts=now,
         )
         self._bus.publish(TOPIC_MARKET_BARS, bar)
         self._bars_emitted_total += 1
         self._bars_emitted_by_symbol[symbol] = self._bars_emitted_by_symbol.get(symbol, 0) + 1
         self._last_bar_ts_by_symbol[symbol] = acc.ts_open
 
-        now = time.time()
         window_seconds = self._bars_emitted_window_minutes * 60
         ts_deque = self._bars_emitted_timestamps_by_symbol.setdefault(symbol, deque())
         ts_deque.append(acc.ts_open)
@@ -223,10 +314,40 @@ class BarBuilder:
         emitted: list[BarEvent] = []
         with self._lock:
             for symbol, acc in self._bars.items():
-                emitted.append(self._emit_bar(symbol, acc))
+                emitted.append(self._emit_bar(symbol, acc, CloseReason.SHUTDOWN_FLUSH))
             self._bars.clear()
         logger.info("BarBuilder flushed %d partial bars", len(emitted))
         return emitted
+
+    def emit_heartbeat(self) -> ComponentHeartbeatEvent:
+        """Create and publish a structured heartbeat for this component."""
+        now = time.time()
+        with self._lock:
+            total_quotes = sum(self._quotes_received_by_symbol.values())
+            latest_lag = None
+            if self._last_bar_ts_by_symbol:
+                most_recent = max(self._last_bar_ts_by_symbol.values())
+                latest_lag = (now - most_recent) * 1000  # ms
+
+        health = "ok"
+        if latest_lag is not None and latest_lag > 300_000:
+            health = "degraded"
+        if not self._bars_emitted_total:
+            health = "down" if (now - self._start_time) > 120 else "ok"
+
+        hb = ComponentHeartbeatEvent(
+            component="bar_builder",
+            uptime_seconds=round(now - self._start_time, 1),
+            events_processed=total_quotes,
+            latest_lag_ms=round(latest_lag, 1) if latest_lag is not None else None,
+            health=health,
+            extra={
+                "bars_emitted_total": self._bars_emitted_total,
+                "bar_invariant_violations": self._bar_invariant_violations,
+            },
+        )
+        self._bus.publish(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, hb)
+        return hb
 
     def get_status(self) -> Dict[str, object]:
         now = time.time()
@@ -238,6 +359,7 @@ class BarBuilder:
             late_ticks_total = self._late_ticks_dropped_total
             late_ticks_by_symbol = dict(self._late_ticks_dropped_by_symbol)
             quotes_received_by_symbol = dict(self._quotes_received_by_symbol)
+            invariant_violations = self._bar_invariant_violations
             bars_emitted_recent_by_symbol = {
                 symbol: sum(1 for ts in timestamps if (now - ts) <= (self._bars_emitted_window_minutes * 60))
                 for symbol, timestamps in self._bars_emitted_timestamps_by_symbol.items()
@@ -283,5 +405,6 @@ class BarBuilder:
                 "late_ticks_dropped_by_symbol": late_ticks_by_symbol,
                 "quotes_received_by_symbol": quotes_received_by_symbol,
                 "active_symbols_count": len(active_symbols),
+                "bar_invariant_violations": invariant_violations,
             },
         )

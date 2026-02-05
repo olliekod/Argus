@@ -5,8 +5,13 @@ from .okx_client import OKXClient
 from .deribit_client import DeribitClient
 from .coinglass_client import CoinglassClient
 from .yahoo_client import YahooFinanceClient
+from .polymarket_gamma import PolymarketGammaClient
+from .polymarket_clob import PolymarketCLOBClient
+from .polymarket_watchlist import PolymarketWatchlistService
 
 __all__ = [
     'BybitWebSocket', 'CoinbaseClient', 'OKXClient',
-    'DeribitClient', 'CoinglassClient', 'YahooFinanceClient'
+    'DeribitClient', 'CoinglassClient', 'YahooFinanceClient',
+    'PolymarketGammaClient', 'PolymarketCLOBClient',
+    'PolymarketWatchlistService',
 ]

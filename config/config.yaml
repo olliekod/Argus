@@ -169,3 +169,15 @@ dashboard:
   enabled: true
   host: "127.0.0.1"
   port: 8777
+
+# -----------------------------------------------------------------------------
+# Polymarket Integration (Stream 3)
+# -----------------------------------------------------------------------------
+polymarket:
+  enabled: false                          # Set true to activate
+  gamma_poll_interval: 60                 # seconds between Gamma discovery polls
+  clob_poll_interval: 30                  # seconds between CLOB order-book polls
+  watchlist_sync_interval: 300            # seconds between watchlist syncs
+  max_watchlist: 50                       # max tokens to track
+  min_volume: 10000                       # minimum USD volume to qualify
+  keywords: []                            # keyword filter (empty = no filter)
