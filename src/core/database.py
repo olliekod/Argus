@@ -350,12 +350,50 @@ class Database:
                 close REAL NOT NULL,
                 volume REAL,
                 tick_count INTEGER DEFAULT 0,
+                n_ticks INTEGER DEFAULT 0,
+                first_source_ts REAL,
+                last_source_ts REAL,
+                late_ticks_dropped INTEGER DEFAULT 0,
+                close_reason INTEGER DEFAULT 0,
                 UNIQUE(timestamp, symbol, source)
             )
         """)
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_bars_ts_sym "
             "ON market_bars(timestamp, symbol)"
+        )
+
+        # ── Provenance column migration (safe ALTER for existing DBs) ──
+        for col, col_type, default in [
+            ("n_ticks", "INTEGER", "0"),
+            ("first_source_ts", "REAL", "NULL"),
+            ("last_source_ts", "REAL", "NULL"),
+            ("late_ticks_dropped", "INTEGER", "0"),
+            ("close_reason", "INTEGER", "0"),
+        ]:
+            try:
+                await self._connection.execute(
+                    f"ALTER TABLE market_bars ADD COLUMN {col} {col_type} DEFAULT {default}"
+                )
+            except Exception:
+                pass  # column already exists
+
+        # Component heartbeat log
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS component_heartbeats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT NOT NULL,
+                component TEXT NOT NULL,
+                uptime_seconds REAL,
+                events_processed INTEGER DEFAULT 0,
+                latest_lag_ms REAL,
+                health TEXT DEFAULT 'ok',
+                extra_json TEXT
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_heartbeats_ts_comp "
+            "ON component_heartbeats(timestamp, component)"
         )
 
         # Signal events (from detectors → PersistenceManager)

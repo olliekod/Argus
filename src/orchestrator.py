@@ -29,12 +29,17 @@ from .core.events import (
 )
 from .core.bar_builder import BarBuilder
 from .core.persistence import PersistenceManager
+from .core.feature_builder import FeatureBuilder
+from .core.regime_detector import RegimeDetector
 from .core.gap_risk_tracker import GapRiskTracker
 from .core.reddit_monitor import RedditMonitor
 from .core.conditions_monitor import ConditionsMonitor
 from .connectors.bybit_ws import BybitWebSocket
 from .connectors.deribit_client import DeribitClient
 from .connectors.yahoo_client import YahooFinanceClient
+from .connectors.polymarket_gamma import PolymarketGammaClient
+from .connectors.polymarket_clob import PolymarketCLOBClient
+from .connectors.polymarket_watchlist import PolymarketWatchlistService
 from .detectors.options_iv_detector import OptionsIVDetector
 from .detectors.volatility_detector import VolatilityDetector
 from .detectors.ibit_detector import IBITDetector
@@ -122,6 +127,13 @@ class ArgusOrchestrator:
         self.bar_builder: Optional[BarBuilder] = None
         self.persistence: Optional[PersistenceManager] = None
         self.query_layer: Optional[QueryLayer] = None
+        self.feature_builder: Optional[FeatureBuilder] = None
+        self.regime_detector: Optional[RegimeDetector] = None
+
+        # Polymarket connectors
+        self.polymarket_gamma: Optional[PolymarketGammaClient] = None
+        self.polymarket_clob: Optional[PolymarketCLOBClient] = None
+        self.polymarket_watchlist: Optional[PolymarketWatchlistService] = None
 
         # Get symbols to monitor
         self.symbols = self.config.get('symbols', {}).get('monitored', [
@@ -237,6 +249,10 @@ class ArgusOrchestrator:
         self.bar_builder = BarBuilder(self.event_bus)
         self.persistence = PersistenceManager(self.event_bus, self.db, loop)
         self.persistence.start()
+
+        # Phase 2c: Intelligence pipeline (downstream-only, safe in collector mode)
+        self.feature_builder = FeatureBuilder(self.event_bus)
+        self.regime_detector = RegimeDetector(self.event_bus)
         self._phase("event_bus_wired")
 
         # Phase 3: Connectors (with event bus)
@@ -259,22 +275,33 @@ class ArgusOrchestrator:
         await self._setup_detectors()
         self._phase("detectors_init")
 
-        # Phase 7b: Query layer (unified command interface)
+        # Phase 7b: Polymarket connectors (optional, fail-soft)
+        await self._setup_polymarket()
+        self._phase("polymarket_init")
+
+        # Phase 7c: Query layer (unified command interface)
+        connectors_map: Dict[str, Any] = {
+            "bybit": self.bybit_ws,
+            "deribit": self.deribit_client,
+            "yahoo": self.yahoo_client,
+        }
+        if self.polymarket_gamma:
+            connectors_map["polymarket_gamma"] = self.polymarket_gamma
+        if self.polymarket_clob:
+            connectors_map["polymarket_clob"] = self.polymarket_clob
         self.query_layer = QueryLayer(
             bus=self.event_bus,
             db=self.db,
             detectors=self.detectors,
-            connectors={
-                "bybit": self.bybit_ws,
-                "deribit": self.deribit_client,
-                "yahoo": self.yahoo_client,
-            },
+            connectors=connectors_map,
             bar_builder=self.bar_builder,
             persistence=self.persistence,
+            feature_builder=self.feature_builder,
+            regime_detector=self.regime_detector,
         )
         self._phase("query_layer_init")
 
-        # Phase 7c: Start the event bus (all subscriptions registered)
+        # Phase 7d: Start the event bus (all subscriptions registered)
         self.event_bus.start()
         self._phase("event_bus_started")
 
@@ -343,7 +370,43 @@ class ArgusOrchestrator:
             event_bus=self.event_bus,
         )
         self.logger.info("Yahoo Finance client configured for IBIT/BITO")
-        
+
+    async def _setup_polymarket(self) -> None:
+        """Initialize Polymarket connectors (optional, fail-soft)."""
+        pm_cfg = self.config.get('polymarket', {})
+        if not pm_cfg.get('enabled', False):
+            self.logger.info("Polymarket integration disabled (set polymarket.enabled=true to activate)")
+            return
+
+        try:
+            self.polymarket_gamma = PolymarketGammaClient(
+                event_bus=self.event_bus,
+                poll_interval=pm_cfg.get('gamma_poll_interval', 60),
+            )
+            await self.polymarket_gamma.start()
+
+            self.polymarket_clob = PolymarketCLOBClient(
+                event_bus=self.event_bus,
+                poll_interval=pm_cfg.get('clob_poll_interval', 30),
+            )
+            await self.polymarket_clob.start()
+
+            self.polymarket_watchlist = PolymarketWatchlistService(
+                gamma_client=self.polymarket_gamma,
+                clob_client=self.polymarket_clob,
+                sync_interval=pm_cfg.get('watchlist_sync_interval', 300),
+                max_watchlist=pm_cfg.get('max_watchlist', 50),
+                min_volume=pm_cfg.get('min_volume', 10_000),
+                keywords=pm_cfg.get('keywords', []),
+            )
+            await self.polymarket_watchlist.start()
+            self.logger.info("Polymarket integration initialised (Gamma + CLOB + Watchlist)")
+        except Exception:
+            self.logger.exception("Polymarket setup failed (non-fatal, continuing)")
+            self.polymarket_gamma = None
+            self.polymarket_clob = None
+            self.polymarket_watchlist = None
+
     async def _setup_detectors(self) -> None:
         """Initialize all detectors and attach to event bus."""
         thresholds = self.config.get('thresholds', {})
@@ -1881,6 +1944,20 @@ class ArgusOrchestrator:
         # Market session monitor (open/close notifications)
         self._tasks.append(asyncio.create_task(self._run_market_session_monitor()))
 
+        # Component heartbeat loop (Stream 2)
+        self._tasks.append(asyncio.create_task(self._publish_component_heartbeats()))
+
+        # Periodic status snapshots (Stream 2)
+        self._tasks.append(asyncio.create_task(self._publish_status_snapshots()))
+
+        # Polymarket polling loops (Stream 3)
+        if self.polymarket_gamma:
+            self._tasks.append(asyncio.create_task(self.polymarket_gamma.poll_loop()))
+        if self.polymarket_clob:
+            self._tasks.append(asyncio.create_task(self.polymarket_clob.poll_loop()))
+        if self.polymarket_watchlist:
+            self._tasks.append(asyncio.create_task(self.polymarket_watchlist.sync_loop()))
+
         # Automate gap risk snapshots at market close
         if self.gap_risk_tracker:
             self._tasks.append(asyncio.create_task(self._run_market_close_snapshot()))
@@ -1944,6 +2021,34 @@ class ArgusOrchestrator:
                 HeartbeatEvent(sequence=seq),
             )
 
+    async def _publish_component_heartbeats(self) -> None:
+        """Emit structured heartbeats for all components every 60s."""
+        interval = self.config.get('monitoring', {}).get('heartbeat_interval', 60)
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                if self.bar_builder:
+                    self.bar_builder.emit_heartbeat()
+                if self.persistence:
+                    self.persistence.emit_heartbeat()
+                if self.feature_builder:
+                    self.feature_builder.emit_heartbeat()
+                if self.regime_detector:
+                    self.regime_detector.emit_heartbeat()
+            except Exception:
+                self.logger.debug("Component heartbeat emission failed", exc_info=True)
+
+    async def _publish_status_snapshots(self) -> None:
+        """Periodically persist QueryLayer status snapshots to DB."""
+        interval = self.config.get('monitoring', {}).get('status_snapshot_persist_interval', 300)
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                if self.query_layer:
+                    await self.query_layer.persist_snapshot()
+            except Exception:
+                self.logger.debug("Status snapshot persist failed", exc_info=True)
+
     async def _publish_minute_ticks(self) -> None:
         """Emit minute-boundary ticks aligned to UTC minute boundaries."""
         while self._running:
@@ -1990,6 +2095,14 @@ class ArgusOrchestrator:
         # Cancel all tasks
         for task in self._tasks:
             task.cancel()
+
+        # Stop Polymarket clients
+        if self.polymarket_gamma:
+            await self.polymarket_gamma.stop()
+        if self.polymarket_clob:
+            await self.polymarket_clob.stop()
+        if self.polymarket_watchlist:
+            await self.polymarket_watchlist.stop()
 
         # Disconnect WebSockets
         if self.bybit_ws:

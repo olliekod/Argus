@@ -11,13 +11,22 @@ Commands
 /market  — Current regime, prices, IV
 /signals — Last 10 signal events
 /db      — Storage size, retention, row counts
+
+Stream 2 additions
+------------------
+* **Status snapshots** — ``snapshot()`` serialises the full status dict
+  for periodic DB / JSON persistence.
+* **Equity-gap-aware continuity** — equity symbols (IBIT, BITO) are not
+  flagged stale during known market-close hours (weekends, overnight).
 """
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 import logging
 
@@ -31,6 +40,24 @@ from .events import (
 )
 
 logger = logging.getLogger("argus.query")
+
+# ── Equity session helpers ────────────────────────────────────
+_EASTERN = ZoneInfo("America/New_York")
+
+# Symbols that only trade during US equity hours
+_EQUITY_SYMBOLS = {"IBIT", "BITO"}
+
+
+def _is_equity_market_open(now_utc: Optional[datetime] = None) -> bool:
+    """Return True if US equity markets are open (Mon-Fri 09:30-16:00 ET)."""
+    if now_utc is None:
+        now_utc = datetime.now(timezone.utc)
+    now_et = now_utc.astimezone(_EASTERN)
+    if now_et.weekday() >= 5:          # Saturday / Sunday
+        return False
+    t = now_et.time()
+    from datetime import time as dt_time
+    return dt_time(9, 30) <= t <= dt_time(16, 0)
 
 
 class QueryLayer:
@@ -56,6 +83,8 @@ class QueryLayer:
         connectors: Optional[Dict[str, Any]] = None,
         bar_builder: Optional[Any] = None,
         persistence: Optional[Any] = None,
+        feature_builder: Optional[Any] = None,
+        regime_detector: Optional[Any] = None,
         provider_names: Optional[List[str]] = None,
     ) -> None:
         self._bus = bus
@@ -64,6 +93,8 @@ class QueryLayer:
         self._connectors = connectors or {}
         self._bar_builder = bar_builder
         self._persistence = persistence
+        self._feature_builder = feature_builder
+        self._regime_detector = regime_detector
         self._provider_names = provider_names or [
             "bybit",
             "deribit",
@@ -98,6 +129,8 @@ class QueryLayer:
             "coinglass": "rest",
             "coinbase": "rest",
             "ibit_options": "batch",
+            "polymarket_gamma": "rest",
+            "polymarket_clob": "rest",
         }
         from .status import build_status
         provider_names = list(dict.fromkeys(self._provider_names + list(self._connectors.keys())))
@@ -151,6 +184,10 @@ class QueryLayer:
             internal_status["bar_builder"] = self._bar_builder.get_status()
         if self._persistence and hasattr(self._persistence, "get_status"):
             internal_status["persistence"] = self._persistence.get_status()
+        if self._feature_builder and hasattr(self._feature_builder, "get_status"):
+            internal_status["feature_builder"] = self._feature_builder.get_status()
+        if self._regime_detector and hasattr(self._regime_detector, "get_status"):
+            internal_status["regime_detector"] = self._regime_detector.get_status()
 
         last_write_ts = None
         if self._persistence and hasattr(self._persistence, "get_status"):
@@ -165,7 +202,10 @@ class QueryLayer:
             window_minutes = extras.get("bars_emitted_recent_window_minutes", 60)
             stale_threshold_seconds = 300
             now = time.time()
+            now_utc = datetime.fromtimestamp(now, tz=timezone.utc)
             running = self._bus.is_running() if hasattr(self._bus, "is_running") else True
+            equity_open = _is_equity_market_open(now_utc)
+
             for symbol, ts in last_bar_ts_epoch.items():
                 if ts is None:
                     continue
@@ -173,8 +213,14 @@ class QueryLayer:
                 expected_minutes = window_minutes
                 observed_minutes = recent_counts.get(symbol, 0)
                 missing_estimate = max(expected_minutes - observed_minutes, 0) if expected_minutes else None
+
+                # Equity-gap-aware: don't flag IBIT/BITO as stale when market closed
+                is_equity = any(eq in symbol.upper() for eq in _EQUITY_SYMBOLS)
+
                 if not running:
                     state = "stopped"
+                elif is_equity and not equity_open:
+                    state = "market_closed"
                 elif bar_age_seconds > stale_threshold_seconds:
                     state = "stale"
                 else:
@@ -183,9 +229,11 @@ class QueryLayer:
                     "bar_age_seconds": bar_age_seconds,
                     "missing_bar_estimate": missing_estimate,
                     "status": state,
+                    "is_equity": is_equity,
                 }
             bar_builder_status["continuity"] = {
                 "running": running,
+                "equity_market_open": equity_open,
                 "stale_threshold_seconds": stale_threshold_seconds,
                 "window_minutes": window_minutes,
                 "symbols": bar_continuity,
@@ -236,13 +284,19 @@ class QueryLayer:
                     "source": "yahoo",
                 }
 
-        # Regime from volatility detector
+        # Regime from volatility detector (legacy)
         regime: Dict[str, str] = {}
         vol_det = self._detectors.get("volatility")
         if vol_det and hasattr(vol_det, "get_current_regime"):
             for sym in ("BTCUSDT", "ETHUSDT", "IBIT", "BITO"):
                 r = vol_det.get_current_regime(sym)
                 if r and r != "unknown":
+                    regime[sym] = r
+
+        # Regime from RegimeDetector (Stream 4)
+        if self._regime_detector and hasattr(self._regime_detector, "get_all_regimes"):
+            for sym, r in self._regime_detector.get_all_regimes().items():
+                if r and r != "UNKNOWN":
                     regime[sym] = r
 
         # IV from options_iv detector
@@ -289,6 +343,7 @@ class QueryLayer:
             "price_snapshots",
             "system_health",
             "market_metrics",
+            "component_heartbeats",
         ]
         latest = await self._db.get_latest_timestamps(tables_to_check)
 
@@ -298,3 +353,41 @@ class QueryLayer:
             "row_counts": stats.get("row_counts"),
             "latest_timestamps": latest,
         }
+
+    # ── Status snapshot (Stream 2) ──────────────────────────
+
+    async def snapshot(self) -> Dict[str, Any]:
+        """Return a full status snapshot suitable for DB / JSON persistence."""
+        status_data = await self.status()
+        market_data = await self.market()
+        db_data = await self.db()
+        return {
+            "snapshot_ts": datetime.now(timezone.utc).isoformat(),
+            "status": status_data,
+            "market": market_data,
+            "db": db_data,
+        }
+
+    async def persist_snapshot(self) -> None:
+        """Dump a status snapshot into the system_health table as JSON.
+
+        Called periodically by the orchestrator to create an audit trail.
+        """
+        try:
+            snap = await self.snapshot()
+            ts_iso = snap["snapshot_ts"]
+            await self._db.execute(
+                """INSERT INTO system_health
+                   (timestamp, component, status, error_message, latency_ms)
+                   VALUES (?, ?, ?, ?, ?)""",
+                (
+                    ts_iso,
+                    "status_snapshot",
+                    "ok",
+                    json.dumps(snap, default=str)[:4000],
+                    None,
+                ),
+            )
+            logger.debug("Status snapshot persisted at %s", ts_iso)
+        except Exception:
+            logger.exception("Failed to persist status snapshot")
