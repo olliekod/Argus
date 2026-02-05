@@ -10,6 +10,7 @@ Checks economic calendar for blackout periods before entries.
 
 import asyncio
 import logging
+import re
 from datetime import datetime, date, timedelta, time, timezone
 from zoneinfo import ZoneInfo
 from typing import Dict, List, Optional, Any, Callable, Set
@@ -21,6 +22,16 @@ from .trader_config_generator import generate_all_configs, get_config_summary
 from ..core.economic_calendar import EconomicCalendar
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Hard tradeable-universe allowlist.
+# Only these underlyings may be traded as options positions.
+# Crypto symbols (BTCUSDT, ETHUSDT, …) are data/signal sources ONLY.
+# ---------------------------------------------------------------------------
+TRADEABLE_UNDERLYINGS: frozenset = frozenset({"IBIT", "BITO"})
+
+# Regex that matches a valid YYYY-MM-DD expiry string
+_EXPIRY_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 class PaperTraderFarm:
@@ -95,6 +106,15 @@ class PaperTraderFarm:
         self._drawdown_breaker_pct: float = 20.0  # halt at 20% drawdown
         self._drawdown_halted: bool = False
         self._current_epoch_start: Optional[str] = None
+
+        # Runaway safety: halt entries when exit-monitor errors spike
+        self._exit_errors: List[float] = []          # timestamps of recent errors
+        self._exit_error_window: int = 300            # 5-minute sliding window
+        self._exit_error_threshold: int = 10          # halt after 10 errors in window
+        self._runaway_halted: bool = False
+        self._runaway_halt_reason: Optional[str] = None
+        self._last_rejected_symbol_ts: float = 0.0   # rate-limit rejection logs
+        self._telegram_callback: Optional[Callable] = None
 
         logger.info(f"PaperTraderFarm initialized (full_coverage={full_coverage})")
     
@@ -251,6 +271,65 @@ class PaperTraderFarm:
         if get_gap_risk:
             self._get_gap_risk = get_gap_risk
     
+    def set_telegram_alert_callback(self, callback: Callable) -> None:
+        """Set callback for sending Telegram alerts (runaway safety, etc.)."""
+        self._telegram_callback = callback
+
+    def record_exit_error(self) -> None:
+        """Record an exit-monitor error for runaway detection.
+
+        Called by the orchestrator whenever the exit monitor loop catches
+        an exception so the farm can track error frequency.
+        """
+        import time as _time
+        now = _time.time()
+        self._exit_errors.append(now)
+        # Trim old entries outside the sliding window
+        cutoff = now - self._exit_error_window
+        self._exit_errors = [t for t in self._exit_errors if t >= cutoff]
+        if len(self._exit_errors) >= self._exit_error_threshold and not self._runaway_halted:
+            self._runaway_halted = True
+            self._runaway_halt_reason = (
+                f"exit_monitor_errors={len(self._exit_errors)} "
+                f"in {self._exit_error_window}s window"
+            )
+            logger.critical(
+                f"RUNAWAY SAFETY HALT: {self._runaway_halt_reason}. "
+                f"New entries blocked; collector feeds continue."
+            )
+            if self._telegram_callback:
+                asyncio.ensure_future(self._telegram_callback(
+                    f"🚨 *RUNAWAY SAFETY HALT*\n"
+                    f"{self._runaway_halt_reason}\n"
+                    f"New entries blocked. Collector feeds continue."
+                ))
+
+    @staticmethod
+    def _validate_signal_data(signal_data: Dict[str, Any]) -> Optional[str]:
+        """Validate critical signal fields before any trade insertion.
+
+        Returns an error message string if invalid, or None if OK.
+        """
+        # Credit must be a positive number
+        credit = signal_data.get('credit')
+        if credit is None or not isinstance(credit, (int, float)) or credit <= 0:
+            return f"invalid credit={credit!r}"
+
+        # Expiry must be a parseable YYYY-MM-DD date
+        expiry = signal_data.get('expiry')
+        if not expiry or not isinstance(expiry, str):
+            return f"missing/invalid expiry={expiry!r}"
+        expiry_clean = str(expiry).strip()
+        if not _EXPIRY_DATE_RE.match(expiry_clean):
+            return f"expiry not YYYY-MM-DD: {expiry_clean!r}"
+
+        # Strikes must be present and contain a '/'
+        strikes = signal_data.get('strikes', '')
+        if not strikes or '/' not in str(strikes):
+            return f"missing/invalid strikes={strikes!r}"
+
+        return None  # valid
+
     async def evaluate_signal(
         self,
         symbol: str,
@@ -258,10 +337,10 @@ class PaperTraderFarm:
     ) -> List[PaperTrade]:
         """
         Evaluate a trading signal across all traders.
-        
+
         Each trader decides independently whether to enter.
         Respects economic calendar blackout periods and correlation limits.
-        
+
         Args:
             symbol: Ticker symbol
             signal_data: Dict with signal details:
@@ -274,11 +353,42 @@ class PaperTraderFarm:
                 - strikes: Strike prices
                 - expiry: Expiration date
                 - credit: Entry credit
-                
+
         Returns:
             List of trades that were entered
         """
         import time as _time
+
+        # ── Hard tradeable-universe gate ──────────────────────────────
+        if symbol.upper() not in TRADEABLE_UNDERLYINGS:
+            now = _time.time()
+            if now - self._last_rejected_symbol_ts > 60:  # rate-limit log
+                logger.warning(
+                    f"REJECTED non-tradeable symbol {symbol!r}. "
+                    f"Allowed: {sorted(TRADEABLE_UNDERLYINGS)}"
+                )
+                self._last_rejected_symbol_ts = now
+            return []
+
+        # ── Runaway safety halt ───────────────────────────────────────
+        if self._runaway_halted:
+            logger.debug(
+                f"Blocked signal for {symbol}: runaway safety halt "
+                f"({self._runaway_halt_reason})"
+            )
+            return []
+
+        # ── Validate signal data before any work ──────────────────────
+        validation_error = self._validate_signal_data(signal_data)
+        if validation_error:
+            now = _time.time()
+            if now - self._last_rejected_symbol_ts > 60:
+                logger.warning(
+                    f"REJECTED signal for {symbol}: {validation_error}. "
+                    f"No positions will be created."
+                )
+                self._last_rejected_symbol_ts = now
+            return []
 
         # Guardrail: rate limit trades per minute
         now = _time.time()
@@ -399,6 +509,7 @@ class PaperTraderFarm:
             call_short = round(underlying_price + put_distance, 1)
             call_long = round(call_short + put_spread_width, 1)
 
+        skipped_invalid = 0
         for idx in entry_indices:
             config = self.trader_configs[idx]
 
@@ -413,11 +524,6 @@ class PaperTraderFarm:
             active_trader = self.active_traders.get(config.trader_id)
             if active_trader and len(active_trader.open_positions) >= config.max_position_size:
                 continue
-
-            # Instantiate trader if not already active (Lazy Loading)
-            if not active_trader:
-                active_trader = PaperTrader(config=config, db=self.db)
-                self.active_traders[config.trader_id] = active_trader
 
             # Per-strategy strike and credit selection
             strat = config.strategy_type
@@ -440,6 +546,14 @@ class PaperTraderFarm:
                 trade_credit = realistic_credit
                 trade_spread_width = put_spread_width
 
+            # ── Per-trade validation: skip garbage ────────────────────
+            if trade_credit <= 0:
+                skipped_invalid += 1
+                continue
+            if trade_strikes in ('', 'N/A'):
+                skipped_invalid += 1
+                continue
+
             # P1: Differentiate trade construction per config
             max_risk_per_contract = (trade_spread_width - trade_credit) * 100
             if max_risk_per_contract > 0:
@@ -451,11 +565,20 @@ class PaperTraderFarm:
             else:
                 contracts = 1
 
+            if contracts <= 0:
+                skipped_invalid += 1
+                continue
+
+            # Instantiate trader if not already active (Lazy Loading)
+            if not active_trader:
+                active_trader = PaperTrader(config=config, db=self.db)
+                self.active_traders[config.trader_id] = active_trader
+
             # Execute paper trade
             trade = active_trader.enter_trade(
                 symbol=symbol,
                 strikes=trade_strikes,
-                expiry=signal_data.get('expiry', 'N/A'),
+                expiry=signal_data.get('expiry'),
                 entry_credit=trade_credit,
                 contracts=contracts,
                 market_conditions={
@@ -477,6 +600,11 @@ class PaperTraderFarm:
                 },
             )
 
+            if trade is None:
+                # enter_trade returned None due to its own validation
+                skipped_invalid += 1
+                continue
+
             entered_trades.append(trade)
             db_batch.append(trade)
 
@@ -496,6 +624,8 @@ class PaperTraderFarm:
                 f"{len(entered_trades)}/{len(self.trader_configs)} "
                 f"traders entered {symbol} (credit=${realistic_credit:.3f}, slippage={1-slippage_factor:.0%})"
             )
+        if skipped_invalid:
+            logger.info(f"Skipped {skipped_invalid} traders due to per-trade validation (zero credit/invalid strikes/qty)")
         self.last_evaluation_entered = len(entered_trades)
 
         # P3: Update drawdown circuit breaker
@@ -535,6 +665,11 @@ class PaperTraderFarm:
             "active_traders": len(self.active_traders),
             "total_configs": len(self.trader_configs),
             "promoted_traders": len(self._promoted_trader_ids) if self._promoted_trader_ids else 0,
+            "tradeable_underlyings": sorted(TRADEABLE_UNDERLYINGS),
+            "runaway_halted": self._runaway_halted,
+            "runaway_halt_reason": self._runaway_halt_reason,
+            "drawdown_halted": self._drawdown_halted,
+            "exit_errors_recent": len(self._exit_errors),
         }
 
     def set_promoted_traders(self, trader_ids: List[str]) -> None:
