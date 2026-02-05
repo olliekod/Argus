@@ -354,6 +354,8 @@ class PaperTrader:
         now = current_date or datetime.now(timezone.utc)
         
         for trade in self.open_positions[:]:  # Copy to allow modification
+            if trade.status != "open":
+                continue
             if trade.id not in current_prices:
                 continue
             

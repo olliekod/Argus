@@ -85,12 +85,18 @@ class BybitWebSocket:
         self._reconnect_delay = 5
         self._max_reconnect_delay = 300
         self._ping_interval = 20
+        self._ping_timeout = 10
+        self._close_timeout = 5
+        self._recv_timeout = 60
 
         # Health / observability
         self.last_message_ts: Optional[float] = None
         self.last_heartbeat_ts: Optional[float] = None
         self.reconnect_attempts: int = 0
         self._connected_since: Optional[float] = None
+        self._message_count: int = 0
+        self._message_count_ts: float = time.time()
+        self._message_rate_per_min: float = 0.0
 
         # Latest data cache
         self.tickers: Dict[str, Dict] = {}
@@ -114,13 +120,18 @@ class BybitWebSocket:
                 async with websockets.connect(
                     self.url,
                     ping_interval=self._ping_interval,
-                    ping_timeout=10,
-                    close_timeout=5,
+                    ping_timeout=self._ping_timeout,
+                    close_timeout=self._close_timeout,
                 ) as ws:
                     self._ws = ws
                     self.reconnect_attempts = 0
                     self._reconnect_delay = 5
                     self._connected_since = time.time()
+                    self.last_message_ts = None
+                    self.last_heartbeat_ts = None
+                    self._message_count = 0
+                    self._message_count_ts = time.time()
+                    self._message_rate_per_min = 0.0
 
                     logger.info("Bybit WebSocket connected")
 
@@ -136,6 +147,8 @@ class BybitWebSocket:
                 logger.error(f"Bybit WebSocket error: {e}")
 
             self._connected_since = None
+            self.last_message_ts = None
+            self.last_heartbeat_ts = None
 
             if self._running:
                 self.reconnect_attempts += 1
@@ -155,6 +168,9 @@ class BybitWebSocket:
         if self._ws and _ws_is_open(self._ws):
             await self._ws.close()
             logger.info("Bybit WebSocket disconnected")
+        self._connected_since = None
+        self.last_message_ts = None
+        self.last_heartbeat_ts = None
 
     async def _subscribe(self) -> None:
         if not self._ws:
@@ -167,8 +183,30 @@ class BybitWebSocket:
     async def _message_loop(self) -> None:
         if not self._ws:
             return
-        async for message in self._ws:
+        while self._running and self._ws and _ws_is_open(self._ws):
+            try:
+                message = await asyncio.wait_for(self._ws.recv(), timeout=self._recv_timeout)
+            except asyncio.TimeoutError:
+                try:
+                    await self._ws.ping()
+                except Exception as e:
+                    logger.warning(f"Bybit WebSocket ping failed: {e}")
+                    break
+                continue
+            except ConnectionClosed as e:
+                logger.warning(f"Bybit WebSocket closed: {e.code} - {e.reason}")
+                break
+            except Exception as e:
+                logger.error(f"Bybit WebSocket recv error: {e}")
+                break
+
             self.last_message_ts = time.time()
+            self._message_count += 1
+            now = time.time()
+            if now - self._message_count_ts >= 60:
+                self._message_rate_per_min = self._message_count / max((now - self._message_count_ts) / 60, 1)
+                self._message_count = 0
+                self._message_count_ts = now
             try:
                 data = json.loads(message)
                 await self._handle_message(data)
@@ -260,11 +298,14 @@ class BybitWebSocket:
         """Return detailed health info for dashboards and health checks."""
         now = time.time()
         connected = self.is_connected
-        since_last_msg = (now - self.last_message_ts) if self.last_message_ts else None
+        since_last_msg = None
+        if connected and self.last_message_ts:
+            since_last_msg = (now - self.last_message_ts)
         return {
             'connected': connected,
             'seconds_since_last_message': round(since_last_msg, 1) if since_last_msg is not None else None,
             'reconnect_attempts': self.reconnect_attempts,
             'connected_since': datetime.fromtimestamp(self._connected_since, tz=timezone.utc).isoformat() if self._connected_since else None,
             'symbols': len(self.symbols),
+            'message_rate_per_min': round(self._message_rate_per_min, 2),
         }

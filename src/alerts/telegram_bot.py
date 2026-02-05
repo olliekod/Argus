@@ -7,6 +7,7 @@ Supports commands: /help, /status, /positions, /pnl
 """
 
 import asyncio
+import time
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, List, Optional
@@ -215,6 +216,7 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
 
     async def _cmd_dashboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /dashboard — single view of whether everything is working."""
+        start = time.perf_counter()
         try:
             if not self._get_dashboard:
                 await update.message.reply_text("Dashboard not available.")
@@ -309,9 +311,13 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         except Exception as e:
             logger.error(f"Error in /dashboard: {e}")
             await update.message.reply_text(f"Error: {e}")
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"Telegram /dashboard handled in {duration_ms:.1f}ms")
 
     async def _cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /status command."""
+        start = time.perf_counter()
         try:
             if self._get_conditions:
                 conditions = await self._get_conditions()
@@ -356,9 +362,13 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         except Exception as e:
             logger.error(f"Error in /status: {e}")
             await update.message.reply_text(f"❌ Error: {e}")
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"Telegram /status handled in {duration_ms:.1f}ms")
     
     async def _cmd_positions(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /positions command — grouped by strategy with top unrealized."""
+        start = time.perf_counter()
         try:
             if not self._get_positions:
                 await update.message.reply_text("Positions not available.")
@@ -393,9 +403,13 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         except Exception as e:
             logger.error(f"Error in /positions: {e}")
             await update.message.reply_text(f"Error: {e}")
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"Telegram /positions handled in {duration_ms:.1f}ms")
     
     async def _cmd_pnl(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /pnl command — statistically sane per-trader metrics."""
+        start = time.perf_counter()
         try:
             if not self._get_pnl:
                 await update.message.reply_text(
@@ -463,6 +477,9 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         except Exception as e:
             logger.error(f"Error in /pnl: {e}")
             await update.message.reply_text(f"❌ Error: {e}")
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"Telegram /pnl handled in {duration_ms:.1f}ms")
 
     async def _cmd_farm_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /farm_status command."""
@@ -610,6 +627,7 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
     
     async def _cmd_zombies(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /zombies — detect stale/orphaned positions (7-14 DTE aligned)."""
+        start = time.perf_counter()
         try:
             if not self._get_zombies:
                 await update.message.reply_text("Zombie detection not available.")
@@ -627,6 +645,9 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         except Exception as e:
             logger.error(f"Error in /zombies: {e}")
             await update.message.reply_text(f"Error: {e}")
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"Telegram /zombies handled in {duration_ms:.1f}ms")
 
     async def _cmd_zombie_clean(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /zombie_clean — close detected zombie positions."""
@@ -655,10 +676,14 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
 
     async def _cmd_db_stats(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /db_stats — show database size and table row counts."""
+        start = time.perf_counter()
         try:
             await update.message.reply_text("DB stats available via dashboard: /db_stats")
         except Exception as e:
             await update.message.reply_text(f"Error: {e}")
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"Telegram /db_stats handled in {duration_ms:.1f}ms")
 
     async def _cmd_follow(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /follow — show followed (best) traders."""

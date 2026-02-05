@@ -350,6 +350,7 @@ class IBITDetector(BaseDetector):
         if len(self._btc_iv_history) > 10:
             iv_z_score = calculate_z_score(btc_iv, self._btc_iv_history)
         
+        from dataclasses import asdict
         detection = self.create_detection(
             opportunity_type='ibit_options',
             asset='IBIT',
@@ -388,8 +389,8 @@ class IBITDetector(BaseDetector):
                 'in_blackout': is_blackout,
                 'blackout_warning': blackout_warning,
                 
-                # Full recommendation object for Telegram
-                'recommendation': recommendation,
+                # Full recommendation object for Telegram (JSON-serializable)
+                'recommendation': asdict(recommendation),
             },
             current_price=ibit_price,
             estimated_edge_bps=int(recommendation.net_credit / recommendation.max_risk * 100) if recommendation.max_risk > 0 else 100,
@@ -467,6 +468,8 @@ _This is a PAPER trade for tracking._
         recommendation = data.get('recommendation')
         
         if recommendation:
+            if isinstance(recommendation, dict):
+                recommendation = TradeRecommendation(**recommendation)
             alert = self.trade_calculator.format_telegram_alert(recommendation)
             
             # Add farm confirmation

@@ -94,6 +94,7 @@ class PaperTraderFarm:
         self._peak_balance: float = starting_balance
         self._drawdown_breaker_pct: float = 20.0  # halt at 20% drawdown
         self._drawdown_halted: bool = False
+        self._current_epoch_start: Optional[str] = None
 
         logger.info(f"PaperTraderFarm initialized (full_coverage={full_coverage})")
     
@@ -104,6 +105,7 @@ class PaperTraderFarm:
         # Create database table
         if self.db:
             await self._create_tables()
+            self._current_epoch_start = await self.db.get_current_epoch_start()
 
         # Generate trader configs with MAX_TRADERS guardrail
         t0 = _time.monotonic()
@@ -603,16 +605,20 @@ class PaperTraderFarm:
         """
         all_closed = []
         db_batch = []
+        eligible = 0
 
         # Only check traders with open positions
         for trader_id, trader in list(self.active_traders.items()):
             # Get prices relevant to this trader's positions
             trader_prices = {}
             for trade in trader.open_positions:
+                if trade.status != "open":
+                    continue
                 if trade.symbol in current_prices:
                     prices = current_prices[trade.symbol]
                     if trade.id in prices:
                         trader_prices[trade.id] = prices[trade.id]
+                        eligible += 1
 
             if not trader_prices:
                 continue
@@ -637,7 +643,10 @@ class PaperTraderFarm:
             await self._save_trades_batch(db_batch)
 
         if all_closed:
-            logger.info(f"Exit check: {len(all_closed)} trades closed")
+            logger.info(
+                f"Exit check: {len(all_closed)} trades closed "
+                f"(eligible={eligible:,}, db_updates={len(db_batch):,})"
+            )
 
         return all_closed
 
@@ -889,12 +898,26 @@ class PaperTraderFarm:
         end_et = start_et + timedelta(days=1)
         return start_et.astimezone(timezone.utc), end_et.astimezone(timezone.utc)
 
+    async def _get_epoch_start(self) -> Optional[str]:
+        """Fetch current epoch start timestamp (cached)."""
+        if not self.db:
+            return None
+        if not self._current_epoch_start:
+            self._current_epoch_start = await self.db.get_current_epoch_start()
+        return self._current_epoch_start
+
     async def _fetch_realized_stats(self, start: datetime, end: datetime) -> Dict[str, Any]:
         """Fetch realized trade stats between start/end timestamps."""
         if not self.db:
             return {'closed_trades': 0, 'winners': 0, 'realized_pnl': 0.0}
+        epoch_start = await self._get_epoch_start()
+        params = [start.isoformat(), end.isoformat()]
+        epoch_clause = ""
+        if epoch_start:
+            epoch_clause = " AND timestamp >= ?"
+            params.append(epoch_start)
         row = await self.db.fetch_one(
-            """
+            f"""
             SELECT
                 COUNT(*) as closed_trades,
                 SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) as winners,
@@ -903,8 +926,9 @@ class PaperTraderFarm:
             WHERE status != 'open'
               AND close_timestamp >= ?
               AND close_timestamp < ?
+              {epoch_clause}
             """,
-            (start.isoformat(), end.isoformat()),
+            tuple(params),
         )
         if not row:
             return {'closed_trades': 0, 'winners': 0, 'realized_pnl': 0.0}
@@ -918,14 +942,21 @@ class PaperTraderFarm:
         """Fetch count of trades opened between start/end timestamps."""
         if not self.db:
             return 0
+        epoch_start = await self._get_epoch_start()
+        params = [start.isoformat(), end.isoformat()]
+        epoch_clause = ""
+        if epoch_start:
+            epoch_clause = " AND timestamp >= ?"
+            params.append(epoch_start)
         row = await self.db.fetch_one(
-            """
+            f"""
             SELECT COUNT(*) as opened_trades
             FROM paper_trades
             WHERE timestamp >= ?
               AND timestamp < ?
+              {epoch_clause}
             """,
-            (start.isoformat(), end.isoformat()),
+            tuple(params),
         )
         return row['opened_trades'] if row else 0
 
@@ -933,12 +964,20 @@ class PaperTraderFarm:
         """Fetch count of open positions."""
         if not self.db:
             return len(self.get_aggregate_positions())
+        epoch_start = await self._get_epoch_start()
+        params: List[Any] = []
+        epoch_clause = ""
+        if epoch_start:
+            epoch_clause = " AND timestamp >= ?"
+            params.append(epoch_start)
         row = await self.db.fetch_one(
-            """
+            f"""
             SELECT COUNT(*) as open_trades
             FROM paper_trades
             WHERE status = 'open'
-            """
+            {epoch_clause}
+            """,
+            tuple(params),
         )
         return row['open_trades'] if row else 0
 
@@ -1081,7 +1120,12 @@ class PaperTraderFarm:
         if not self.db:
             return None
 
-        rows = await self.db.get_per_trader_pnl(days=days, min_trades=min_trades)
+        epoch_start = await self._get_epoch_start()
+        rows = await self.db.get_per_trader_pnl(
+            days=days,
+            min_trades=min_trades,
+            epoch_start=epoch_start,
+        )
         if not rows:
             return None
 
@@ -1182,7 +1226,13 @@ class PaperTraderFarm:
         if not self.db:
             return []
 
-        rows = await self.db.fetch_all("""
+        epoch_start = await self._get_epoch_start()
+        params: List[Any] = [f"-{grace_days} days", f"-{stale_days} days"]
+        epoch_clause = ""
+        if epoch_start:
+            epoch_clause = " AND timestamp >= ?"
+            params.append(epoch_start)
+        rows = await self.db.fetch_all(f"""
             SELECT id, trader_id, strategy_type, symbol, timestamp,
                    strikes, expiry, entry_credit, contracts, status,
                    market_conditions, close_reason
@@ -1197,8 +1247,9 @@ class PaperTraderFarm:
                       AND timestamp < datetime('now', ?)
                   )
               )
+              {epoch_clause}
             ORDER BY timestamp ASC
-        """, (f"-{grace_days} days", f"-{stale_days} days"))
+        """, tuple(params))
 
         zombies = []
         for row in rows:
@@ -1276,16 +1327,18 @@ class PaperTraderFarm:
             return "No database connected."
 
         if mode == 'epoch':
-            await self.db.reset_paper_epoch(
+            epoch_start = await self.db.reset_paper_epoch(
                 starting_equity=self.starting_balance,
                 scope=scope,
                 reason='manual_reset',
             )
+            self._current_epoch_start = epoch_start
             # Clear in-memory active traders
             self.active_traders.clear()
             self._positions_by_symbol.clear()
             self._peak_balance = self.starting_balance
             self._drawdown_halted = False
+            logger.info(f"Paper epoch reset: start={epoch_start} scope={scope}")
             return (
                 f"New epoch started. starting_equity=${self.starting_balance:,.0f}, "
                 f"scope={scope}. Old data preserved but excluded from current metrics."

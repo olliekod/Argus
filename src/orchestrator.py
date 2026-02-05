@@ -127,6 +127,19 @@ class ArgusOrchestrator:
         self._boot_phases: Dict[str, float] = {}
         self._boot_start = time.monotonic()
 
+        # Cached status snapshots for fast dashboard/telegram responses
+        self._status_snapshot: Dict[str, Any] = {}
+        self._status_snapshot_ts: float = 0.0
+        self._status_snapshot_lock = asyncio.Lock()
+        self._status_snapshot_interval = int(
+            self.config.get('monitoring', {}).get('status_snapshot_interval', 10)
+        )
+        self._zombies_snapshot: Dict[str, Any] = {'zombies': [], 'total': 0, 'report': 'No data yet'}
+        self._zombies_snapshot_ts: float = 0.0
+        self._zombies_snapshot_interval = int(
+            self.config.get('monitoring', {}).get('zombies_snapshot_interval', 120)
+        )
+
         # Dashboard
         dash_cfg = self.config.get('dashboard', {})
         self.dashboard: Optional[ArgusWebDashboard] = None
@@ -490,34 +503,39 @@ class ArgusOrchestrator:
     
     async def _get_pnl_summary(self) -> Dict:
         """Get P&L summary for Telegram /pnl command."""
-        # Prefer paper trader farm if available
-        if self.paper_trader_farm:
-            return await self.paper_trader_farm.get_pnl_for_telegram()
-        if self.daily_review:
-            from .analysis.daily_review import get_pnl_summary
-            return await get_pnl_summary(self.daily_review)
-        return {}
+        cached = self._get_snapshot_section('pnl')
+        if cached:
+            return cached
+        await self._refresh_status_snapshot(force=True)
+        return self._status_snapshot.get('pnl', {})
     
     async def _get_positions_summary(self) -> List[Dict]:
         """Get positions summary for Telegram /positions command."""
-        if self.paper_trader_farm:
-            return await self.paper_trader_farm.get_positions_for_telegram()
-        return []
+        cached = self._get_snapshot_section('positions')
+        if cached is not None:
+            return cached
+        await self._refresh_status_snapshot(force=True)
+        return self._status_snapshot.get('positions', [])
 
     async def _get_status_summary(self) -> Dict[str, Any]:
         """Get conditions plus data freshness for Telegram /status command."""
         conditions = {}
         if self.conditions_monitor:
             conditions = await self.conditions_monitor.get_current_conditions()
-        data_status = await self._get_data_status()
+        data_status = self._get_snapshot_section('data_status')
+        if data_status is None:
+            await self._refresh_status_snapshot(force=True)
+            data_status = self._status_snapshot.get('data_status', {})
         conditions['data_status'] = data_status
         return conditions
 
     async def _get_farm_status(self) -> Dict[str, Any]:
         """Get paper trader farm status summary for Telegram."""
-        if not self.paper_trader_farm:
-            return {}
-        return self.paper_trader_farm.get_status_summary()
+        cached = self._get_snapshot_section('farm')
+        if cached:
+            return cached
+        await self._refresh_status_snapshot(force=True)
+        return self._status_snapshot.get('farm', {})
 
     async def _get_signal_status(self) -> Dict[str, Any]:
         """Get IBIT/BITO signal checklist for Telegram."""
@@ -560,14 +578,10 @@ class ArgusOrchestrator:
 
     async def _get_zombies(self) -> Dict[str, Any]:
         """Detect zombies using the farm's 7-14 DTE-aligned detection logic."""
-        if self.paper_trader_farm:
-            zombies = await self.paper_trader_farm.detect_zombies(stale_days=14, grace_days=2)
-            return {
-                'zombies': zombies,
-                'total': len(zombies),
-                'report': await self.paper_trader_farm.format_zombies_report(stale_days=14, grace_days=2),
-            }
-        return {'zombies': [], 'total': 0, 'report': 'Farm not initialized'}
+        if not self.paper_trader_farm:
+            return {'zombies': [], 'total': 0, 'report': 'Farm not initialized'}
+        await self._refresh_zombies_snapshot(force=False)
+        return self._zombies_snapshot
 
     async def _get_followed_traders(self) -> List[Dict]:
         """Get the followed traders list from DB."""
@@ -593,7 +607,10 @@ class ArgusOrchestrator:
         health_age = _age(self._last_health_check)
 
         # Data freshness
-        data_status = await self._get_data_status()
+        data_status = self._get_snapshot_section('data_status')
+        if data_status is None:
+            await self._refresh_status_snapshot(force=True)
+            data_status = self._status_snapshot.get('data_status', {})
 
         # Farm stats
         farm = self.paper_trader_farm
@@ -1234,6 +1251,16 @@ class ArgusOrchestrator:
                 except Exception as e:
                     self.logger.error(f"Health check error: {e}")
 
+            try:
+                await self._refresh_status_snapshot()
+            except Exception as e:
+                self.logger.debug(f"Status snapshot refresh error: {e}")
+
+            try:
+                await self._refresh_zombies_snapshot()
+            except Exception as e:
+                self.logger.debug(f"Zombies snapshot refresh error: {e}")
+
             await asyncio.sleep(10)  # Check every 10s for heartbeat granularity
 
     async def _run_market_session_monitor(self) -> None:
@@ -1354,24 +1381,149 @@ class ArgusOrchestrator:
     # Dashboard helper callbacks
     # =========================================================================
 
+    def _get_snapshot_section(self, key: str) -> Optional[Any]:
+        """Fetch a cached snapshot section if available."""
+        return self._status_snapshot.get(key)
+
+    async def _refresh_status_snapshot(self, force: bool = False) -> None:
+        """Refresh cached dashboard/telegram status snapshot."""
+        now = time.time()
+        if not force and (now - self._status_snapshot_ts) < self._status_snapshot_interval:
+            return
+
+        async with self._status_snapshot_lock:
+            now = time.time()
+            if not force and (now - self._status_snapshot_ts) < self._status_snapshot_interval:
+                return
+
+            started = time.perf_counter()
+            snapshot: Dict[str, Any] = {}
+            try:
+                db_stats = await self.db.get_db_stats()
+                snapshot['system'] = {
+                    'db_size_mb': db_stats.get('db_size_mb', 0),
+                    'boot_phases': self._format_boot_phases(),
+                }
+                snapshot['db_stats'] = db_stats
+            except Exception as e:
+                self.logger.warning(f"Status snapshot system error: {e}")
+                snapshot['system'] = {'db_size_mb': 0, 'boot_phases': self._format_boot_phases()}
+                snapshot['db_stats'] = {'db_size_mb': 0, 'row_counts': {}}
+
+            try:
+                snapshot['providers'] = await self._get_provider_statuses()
+            except Exception as e:
+                self.logger.warning(f"Status snapshot providers error: {e}")
+                snapshot['providers'] = {'error': str(e)}
+
+            try:
+                snapshot['pnl'] = await self._compute_pnl_summary()
+            except Exception as e:
+                self.logger.warning(f"Status snapshot pnl error: {e}")
+                snapshot['pnl'] = {'error': str(e)}
+
+            try:
+                snapshot['farm'] = await self._compute_farm_status()
+            except Exception as e:
+                self.logger.warning(f"Status snapshot farm error: {e}")
+                snapshot['farm'] = {'error': str(e)}
+
+            try:
+                snapshot['positions'] = await self._compute_positions_summary()
+            except Exception as e:
+                self.logger.warning(f"Status snapshot positions error: {e}")
+                snapshot['positions'] = []
+
+            try:
+                snapshot['data_status'] = await self._get_data_status()
+            except Exception as e:
+                self.logger.warning(f"Status snapshot data_status error: {e}")
+                snapshot['data_status'] = {}
+
+            try:
+                snapshot['recent_logs'] = await self._read_recent_logs_text()
+            except Exception as e:
+                self.logger.warning(f"Status snapshot logs error: {e}")
+                snapshot['recent_logs'] = f"Error: {e}"
+
+            self._status_snapshot = snapshot
+            self._status_snapshot_ts = now
+            elapsed_ms = (time.perf_counter() - started) * 1000
+            self.logger.debug(f"Status snapshot refreshed in {elapsed_ms:.1f}ms")
+
+    async def _refresh_zombies_snapshot(self, force: bool = False) -> None:
+        """Refresh cached zombies report separately (heavier query)."""
+        now = time.time()
+        if not force and (now - self._zombies_snapshot_ts) < self._zombies_snapshot_interval:
+            return
+        if not self.paper_trader_farm:
+            self._zombies_snapshot = {'zombies': [], 'total': 0, 'report': 'Farm not initialized'}
+            self._zombies_snapshot_ts = now
+            return
+
+        started = time.perf_counter()
+        try:
+            zombies = await self.paper_trader_farm.detect_zombies(stale_days=14, grace_days=2)
+            report = await self.paper_trader_farm.format_zombies_report(stale_days=14, grace_days=2)
+            self._zombies_snapshot = {
+                'zombies': zombies,
+                'total': len(zombies),
+                'report': report,
+            }
+        except Exception as e:
+            self.logger.warning(f"Zombies snapshot error: {e}")
+            self._zombies_snapshot = {'zombies': [], 'total': 0, 'report': f"Error: {e}"}
+        self._zombies_snapshot_ts = now
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        self.logger.debug(f"Zombies snapshot refreshed in {elapsed_ms:.1f}ms")
+
     async def _get_dashboard_system_status(self) -> Dict[str, Any]:
         """System status for the dashboard /api/status endpoint."""
-        db_stats = await self.db.get_db_stats()
-        return {
-            'db_size_mb': db_stats.get('db_size_mb', 0),
-            'boot_phases': self._format_boot_phases(),
-        }
+        cached = self._get_snapshot_section('system')
+        if cached:
+            return cached
+        await self._refresh_status_snapshot(force=True)
+        return self._status_snapshot.get('system', {'db_size_mb': 0, 'boot_phases': self._format_boot_phases()})
 
     async def _get_provider_statuses(self) -> Dict[str, Any]:
         """Provider health for dashboard."""
-        result = {}
+        result: Dict[str, Any] = {}
         if self.bybit_ws:
             result['bybit'] = self.bybit_ws.get_health_status()
         if self.deribit_client:
-            result['deribit'] = {'connected': True, 'seconds_since_last_message': None, 'reconnect_attempts': 0}
+            result['deribit'] = {
+                'connected': True,
+                'seconds_since_last_message': None,
+                'reconnect_attempts': 0,
+            }
         if self.yahoo_client:
-            result['yahoo'] = {'connected': True, 'seconds_since_last_message': None, 'reconnect_attempts': 0}
+            result['yahoo'] = {
+                'connected': True,
+                'seconds_since_last_message': None,
+                'reconnect_attempts': 0,
+            }
         return result
+
+    async def _compute_pnl_summary(self) -> Dict:
+        """Compute P&L summary without cached shortcut."""
+        if self.paper_trader_farm:
+            return await self.paper_trader_farm.get_pnl_for_telegram()
+        if self.daily_review:
+            from .analysis.daily_review import get_pnl_summary
+            return await get_pnl_summary(self.daily_review)
+        return {}
+
+    async def _compute_positions_summary(self) -> List[Dict]:
+        """Compute positions summary without cached shortcut."""
+        if self.paper_trader_farm:
+            return await self.paper_trader_farm.get_positions_for_telegram()
+        return []
+
+    async def _compute_farm_status(self) -> Dict[str, Any]:
+        """Compute farm status without cached shortcut."""
+        if not self.paper_trader_farm:
+            return {}
+        return self.paper_trader_farm.get_status_summary()
 
     async def _run_dashboard_command(self, cmd: str) -> str:
         """Execute a / command from the web dashboard."""
@@ -1419,10 +1571,16 @@ class ArgusOrchestrator:
                     elif p.startswith('--mode='):
                         mode = p.split('=')[1]
                 if self.paper_trader_farm:
-                    return await self.paper_trader_farm.reset_paper_equity(scope=scope, mode=mode)
+                    result = await self.paper_trader_farm.reset_paper_equity(scope=scope, mode=mode)
+                    await self._refresh_status_snapshot(force=True)
+                    await self._refresh_zombies_snapshot(force=True)
+                    return result
                 return "Farm not initialized"
             elif cmd == '/db_stats':
-                stats = await self.db.get_db_stats()
+                stats = self._get_snapshot_section('db_stats')
+                if not stats:
+                    await self._refresh_status_snapshot(force=True)
+                    stats = self._status_snapshot.get('db_stats', {})
                 lines = [f"DB size: {stats['db_size_mb']} MB"]
                 for table, count in stats.get('row_counts', {}).items():
                     lines.append(f"  {table}: {count:,} rows")
@@ -1437,6 +1595,17 @@ class ArgusOrchestrator:
 
     async def _get_recent_logs_text(self) -> str:
         """Return recent log lines as text for dashboard."""
+        cached = self._get_snapshot_section('recent_logs')
+        if cached:
+            return cached
+        await self._refresh_status_snapshot(force=True)
+        cached = self._status_snapshot.get('recent_logs')
+        if cached:
+            return cached
+        return await self._read_recent_logs_text()
+
+    async def _read_recent_logs_text(self) -> str:
+        """Read recent log lines directly (no cache)."""
         if self._recent_logs:
             return "\n".join(self._recent_logs)
         # Read from log file as fallback
