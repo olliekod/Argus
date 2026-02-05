@@ -1316,7 +1316,8 @@ class ArgusOrchestrator:
                         len(t.open_positions) for t in farm.active_traders.values()
                     ) if farm else 0
                     bybit_health = self.bybit_ws.get_health_status() if self.bybit_ws else {}
-                    bybit_str = "connected" if bybit_health.get('connected') else "disconnected"
+                    bybit_connected = bybit_health.get('extras', {}).get('connected', False)
+                    bybit_str = "connected" if bybit_connected else "disconnected"
                     msg_age = bybit_health.get('seconds_since_last_message')
                     msg_age_str = f"{msg_age:.0f}s" if msg_age is not None else "N/A"
                     db_size = os.path.getsize(str(self.db.db_path)) / (1024 * 1024) if self.db.db_path.exists() else 0

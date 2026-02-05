@@ -252,6 +252,9 @@ class BarBuilder:
 
         if not last_bar_ts:
             status = "unknown"
+        elif any(age < 300 for age in ages.values()):
+            # If at least one symbol is ticking (e.g. crypto), pipeline is OK
+            status = "ok"
         elif max_age is not None and max_age > 300:
             status = "degraded"
         else:

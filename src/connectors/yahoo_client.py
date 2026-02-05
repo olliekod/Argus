@@ -10,7 +10,7 @@ import time
 from datetime import datetime
 from typing import Any, Callable, Dict, Optional
 import aiohttp
-
+import math
 from ..core.logger import get_connector_logger
 from ..core.events import QuoteEvent, TOPIC_MARKET_QUOTES
 
@@ -104,7 +104,6 @@ class YahooFinanceClient:
             async with session.get(url, params=params, headers=headers) as resp:
                 self.last_http_status = resp.status
                 if resp.status == 200:
-                    import time
                     self.last_message_ts = time.time()
                     self.last_success_ts = self.last_message_ts
                     self.consecutive_failures = 0
@@ -161,7 +160,6 @@ class YahooFinanceClient:
                                 returns.append(ret)
                             
                             if returns:
-                                import math
                                 mean_ret = sum(returns) / len(returns)
                                 variance = sum((r - mean_ret) ** 2 for r in returns) / len(returns)
                                 daily_vol = math.sqrt(variance)
@@ -204,7 +202,6 @@ class YahooFinanceClient:
     
     async def poll_once(self) -> None:
         """Run a single poll cycle (all symbols once)."""
-        import time as _time
         for symbol in self.symbols:
             try:
                 data = await self.get_quote(symbol)
@@ -229,7 +226,7 @@ class YahooFinanceClient:
                                 ask=price,
                                 mid=price,
                                 last=price,
-                                timestamp=_time.time(),
+                                timestamp=time.time(),
                                 source='yahoo',
                                 volume_24h=float(data.get('volume', 0) or 0),
                             )
@@ -269,7 +266,6 @@ class YahooFinanceClient:
 
     def get_health_status(self) -> Dict[str, Any]:
         """Return health for dashboard."""
-        import time
         now = time.time()
         age = (now - self.last_message_ts) if self.last_message_ts else None
         if self.consecutive_failures > 0:
