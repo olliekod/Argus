@@ -46,6 +46,10 @@ class Database:
         self._connection = await aiosqlite.connect(str(self.db_path))
         self._connection.row_factory = aiosqlite.Row
         await self._create_tables()
+        # Enable WAL mode for long-running app
+        await self._connection.execute("PRAGMA journal_mode=WAL")
+        await self._connection.execute("PRAGMA synchronous=NORMAL")
+        await self._connection.execute("PRAGMA cache_size=-64000")  # 64MB cache
         logger.info(f"Database connected: {self.db_path}")
     
     async def close(self) -> None:
@@ -319,6 +323,19 @@ class Database:
         )
         
         await self._connection.commit()
+
+        # Paper equity epochs (for reset_paper command)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS paper_equity_epochs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                epoch_start TEXT NOT NULL,
+                starting_equity REAL NOT NULL,
+                reason TEXT,
+                scope TEXT DEFAULT 'all'
+            )
+        """)
+        await self._connection.commit()
+
         logger.debug("Database tables created/verified")
     
     # =========================================================================
@@ -926,14 +943,81 @@ class Database:
                 (cutoff,)
             )
             logger.info(f"Cleaned up {table} older than {days} days")
-        
+
         await self._connection.commit()
+
+        # Clean up old closed paper trades (keep open ones)
+        if 'paper_trades' in retention_days:
+            days = retention_days['paper_trades']
+            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            await self._connection.execute(
+                "DELETE FROM paper_trades WHERE status != 'open' AND close_timestamp < ?",
+                (cutoff,)
+            )
+            logger.info(f"Cleaned up closed paper_trades older than {days} days")
+            await self._connection.commit()
     
     async def vacuum(self) -> None:
         """Optimize database by reclaiming space."""
         await self._connection.execute("VACUUM")
         logger.info("Database vacuumed")
-    
+
+    async def run_maintenance(self) -> Dict[str, Any]:
+        """Run periodic maintenance: PRAGMA optimize + retention cleanup."""
+        await self._connection.execute("PRAGMA optimize")
+        logger.info("PRAGMA optimize completed")
+        return await self.get_db_stats()
+
+    async def get_db_stats(self) -> Dict[str, Any]:
+        """Get database size and table row counts."""
+        import os
+        db_size = os.path.getsize(str(self.db_path)) if self.db_path.exists() else 0
+        tables = [
+            'detections', 'funding_rates', 'options_iv', 'liquidations',
+            'price_snapshots', 'system_health', 'daily_stats',
+        ]
+        # Also check paper_trades if it exists
+        try:
+            cursor = await self._connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='paper_trades'"
+            )
+            if await cursor.fetchone():
+                tables.append('paper_trades')
+        except Exception:
+            pass
+
+        row_counts = {}
+        for table in tables:
+            try:
+                cursor = await self._connection.execute(f"SELECT COUNT(*) as cnt FROM {table}")
+                row = await cursor.fetchone()
+                row_counts[table] = row['cnt'] if row else 0
+            except Exception:
+                row_counts[table] = -1
+
+        return {
+            'db_size_bytes': db_size,
+            'db_size_mb': round(db_size / (1024 * 1024), 1),
+            'row_counts': row_counts,
+        }
+
+    async def reset_paper_epoch(self, starting_equity: float, scope: str = 'all', reason: str = 'manual_reset') -> None:
+        """Start a new paper equity epoch. Old data remains but is excluded from current metrics."""
+        await self._connection.execute("""
+            INSERT INTO paper_equity_epochs (epoch_start, starting_equity, reason, scope)
+            VALUES (?, ?, ?, ?)
+        """, (datetime.utcnow().isoformat(), starting_equity, reason, scope))
+        await self._connection.commit()
+        logger.info(f"New paper equity epoch started: equity=${starting_equity}, scope={scope}, reason={reason}")
+
+    async def get_current_epoch_start(self) -> Optional[str]:
+        """Get the start timestamp of the current paper equity epoch."""
+        cursor = await self._connection.execute(
+            "SELECT epoch_start FROM paper_equity_epochs ORDER BY id DESC LIMIT 1"
+        )
+        row = await cursor.fetchone()
+        return row['epoch_start'] if row else None
+
     async def backup(self, backup_path: str) -> None:
         """Create a database backup."""
         backup_db = Path(backup_path)

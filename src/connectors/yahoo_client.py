@@ -166,37 +166,41 @@ class YahooFinanceClient:
             logger.error(f"Yahoo request failed: {e}")
             return None
     
+    async def poll_once(self) -> None:
+        """Run a single poll cycle (all symbols once)."""
+        for symbol in self.symbols:
+            try:
+                data = await self.get_quote(symbol)
+                if data:
+                    self.prices[symbol] = data
+                    if self.on_update:
+                        try:
+                            if asyncio.iscoroutinefunction(self.on_update):
+                                await self.on_update(data)
+                            else:
+                                self.on_update(data)
+                        except Exception as e:
+                            logger.error(f"Update callback error: {e}")
+            except Exception as e:
+                logger.error(f"Yahoo poll_once error for {symbol}: {e}")
+            await asyncio.sleep(1)
+
     async def poll(self, interval_seconds: int = 60) -> None:
         """
         Continuously poll for price updates.
-        
+
         Args:
             interval_seconds: Polling interval (default 60s for stocks)
         """
         self._running = True
         logger.info(f"Starting Yahoo Finance polling ({interval_seconds}s interval)")
-        
+
         while self._running:
             try:
-                for symbol in self.symbols:
-                    data = await self.get_quote(symbol)
-                    if data:
-                        self.prices[symbol] = data
-                        
-                        if self.on_update:
-                            try:
-                                if asyncio.iscoroutinefunction(self.on_update):
-                                    await self.on_update(data)
-                                else:
-                                    self.on_update(data)
-                            except Exception as e:
-                                logger.error(f"Update callback error: {e}")
-                    
-                    await asyncio.sleep(1)
-                    
+                await self.poll_once()
             except Exception as e:
                 logger.error(f"Yahoo polling error: {e}")
-            
+
             await asyncio.sleep(interval_seconds)
     
     def get_price(self, symbol: str) -> Optional[float]:

@@ -39,20 +39,31 @@ class PaperTraderFarm:
         full_coverage: bool = True,
         config_file: Optional[str] = None,
         starting_balance: float = 5000.0,
+        max_traders: int = 2_000_000,
+        max_open_positions_total: int = 500_000,
+        max_trades_per_minute: int = 10_000,
     ):
         """
         Initialize the paper trader farm.
-        
+
         Args:
             db: Database instance for logging trades
             total_traders: Number of traders (ignored if full_coverage=True)
             full_coverage: If True, generate ALL unique parameter combinations
             config_file: Optional path to saved configs
+            max_traders: Hard cap on total configs (guardrail)
+            max_open_positions_total: Safety cap on open positions
+            max_trades_per_minute: Rate limit on new trades
         """
         self.db = db
         self.total_traders = total_traders
         self.full_coverage = full_coverage
         self.starting_balance = starting_balance
+        self.max_traders = max_traders
+        self.max_open_positions_total = max_open_positions_total
+        self.max_trades_per_minute = max_trades_per_minute
+        self._trades_this_minute: int = 0
+        self._minute_reset_ts: float = 0
         
         # New: Tensors for GPU evaluation
         self.trader_tensors: Optional['torch.Tensor'] = None
@@ -88,23 +99,39 @@ class PaperTraderFarm:
     
     async def initialize(self) -> None:
         """Initialize all traders and database tables."""
+        import time as _time
+
         # Create database table
         if self.db:
             await self._create_tables()
-        
-        # Generate trader configs - use full coverage for all unique combos
+
+        # Generate trader configs with MAX_TRADERS guardrail
+        t0 = _time.monotonic()
         configs = generate_all_configs(
             total_traders=self.total_traders,
             full_coverage=self.full_coverage,
+            max_traders=self.max_traders,
         )
         self.trader_configs = configs
-        
+        gen_time = _time.monotonic() - t0
+
+        if len(configs) >= self.max_traders:
+            logger.warning(
+                f"MAX_TRADERS guardrail hit: capped at {self.max_traders:,} "
+                f"(full coverage would produce more). Continuing safely."
+            )
+
         # Prepare Tensors for GPU
+        t1 = _time.monotonic()
         await self._prepare_trader_tensors()
-        
+        tensor_time = _time.monotonic() - t1
+
         # Log summary
         summary = get_config_summary(configs)
-        logger.info(f"Initialized paper trader farm with {len(configs):,} configurations:")
+        logger.info(
+            f"Farm initialized: {len(configs):,} configs in {gen_time:.1f}s, "
+            f"GPU upload in {tensor_time:.1f}s"
+        )
         for strat, count in summary['by_strategy'].items():
             logger.info(f"  {strat}: {count:,} traders")
     
@@ -150,19 +177,31 @@ class PaperTraderFarm:
             )
         """)
         
-        # Migration: Add missing columns to existing tables
-        try:
-            # Check if columns exist by trying a simple select
-            await self.db.execute("SELECT trader_id FROM paper_trades LIMIT 1")
-        except Exception:
-            # Table might exist but be empty or have wrong schema
-            # Try to add the column
+        # Index on timestamp for retention cleanup
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_ts
+            ON paper_trades(timestamp)
+        """)
+        await self.db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_paper_trades_expiry
+            ON paper_trades(expiry)
+        """)
+
+        # Migrations: add columns if missing
+        migrations = [
+            ("trader_id", "ALTER TABLE paper_trades ADD COLUMN trader_id TEXT"),
+            ("close_reason", "ALTER TABLE paper_trades ADD COLUMN close_reason TEXT"),
+        ]
+        for col, sql in migrations:
             try:
-                await self.db.execute("ALTER TABLE paper_trades ADD COLUMN trader_id TEXT")
-                logger.info("Added trader_id column to paper_trades")
+                await self.db.execute(f"SELECT {col} FROM paper_trades LIMIT 1")
             except Exception:
-                pass  # Column already exists or other issue
-        
+                try:
+                    await self.db.execute(sql)
+                    logger.info(f"Migration: added {col} column to paper_trades")
+                except Exception:
+                    pass
+
         logger.info("Paper trading tables created")
 
     async def _prepare_trader_tensors(self) -> None:
@@ -237,6 +276,23 @@ class PaperTraderFarm:
         Returns:
             List of trades that were entered
         """
+        import time as _time
+
+        # Guardrail: rate limit trades per minute
+        now = _time.time()
+        if now - self._minute_reset_ts > 60:
+            self._trades_this_minute = 0
+            self._minute_reset_ts = now
+        if self._trades_this_minute >= self.max_trades_per_minute:
+            logger.warning(f"Trade rate limit hit ({self.max_trades_per_minute}/min). Skipping signal.")
+            return []
+
+        # Guardrail: total open positions cap
+        total_open = sum(len(t.open_positions) for t in self.active_traders.values())
+        if total_open >= self.max_open_positions_total:
+            logger.warning(f"Open positions cap hit ({total_open:,}/{self.max_open_positions_total:,}). Skipping signal.")
+            return []
+
         # P3: Drawdown circuit breaker check
         if self._drawdown_halted:
             logger.debug(f"Blocked signal for {symbol}: drawdown circuit breaker active")
@@ -428,6 +484,9 @@ class PaperTraderFarm:
         # P2: Batch database writes for entries
         if db_batch and self.db:
             await self._save_trades_batch(db_batch)
+
+        # Update rate limit counter
+        self._trades_this_minute += len(entered_trades)
 
         if entered_trades:
             logger.info(
@@ -1102,6 +1161,127 @@ class PaperTraderFarm:
             'starting_balance': self.starting_balance,
             'return_definition': 'realized_pnl / starting_balance * 100',
         }
+
+
+    # =========================================================================
+    # Zombie Detection & Cleanup (7-14 DTE aligned)
+    # =========================================================================
+
+    async def detect_zombies(self, stale_days: int = 14, grace_days: int = 2) -> List[Dict]:
+        """Detect zombie positions without closing them.
+
+        Zombie = orphaned/stuck, NOT just aged.
+
+        Rules:
+        1. Status='open' AND expiry < today - grace_days (expired + grace period)
+        2. Status='open' AND no expiry AND timestamp < now - stale_days
+           (truly stale with no expiry info)
+
+        Does NOT close positions just due to age.
+        """
+        if not self.db:
+            return []
+
+        rows = await self.db.fetch_all("""
+            SELECT id, trader_id, strategy_type, symbol, timestamp,
+                   strikes, expiry, entry_credit, contracts, status,
+                   market_conditions, close_reason
+            FROM paper_trades
+            WHERE status = 'open'
+              AND (
+                  (expiry IS NOT NULL AND expiry < date('now', ?))
+                  OR (expiry IS NULL AND timestamp < datetime('now', ?))
+              )
+            ORDER BY timestamp ASC
+        """, (f"-{grace_days} days", f"-{stale_days} days"))
+
+        zombies = []
+        for row in rows:
+            r = dict(row)
+            if r.get('expiry') and r['expiry'] < datetime.now().strftime('%Y-%m-%d'):
+                r['zombie_reason'] = 'expired_past_grace'
+            else:
+                r['zombie_reason'] = 'stale_no_expiry'
+            zombies.append(r)
+
+        return zombies
+
+    async def close_zombies(self, stale_days: int = 14, grace_days: int = 2) -> int:
+        """Detect and close zombie positions.
+
+        Sets status='expired', close_reason=zombie_reason.
+        """
+        zombies = await self.detect_zombies(stale_days, grace_days)
+        if not zombies:
+            return 0
+
+        now = datetime.now(timezone.utc).isoformat()
+        for z in zombies:
+            await self.db.execute("""
+                UPDATE paper_trades
+                SET status = 'expired',
+                    close_timestamp = ?,
+                    close_reason = ?,
+                    realized_pnl = COALESCE(realized_pnl, 0)
+                WHERE id = ? AND status = 'open'
+            """, (now, z['zombie_reason'], z['id']))
+
+        logger.info(f"Closed {len(zombies)} zombie positions")
+        return len(zombies)
+
+    async def format_zombies_report(self, stale_days: int = 14, grace_days: int = 2) -> str:
+        """Format zombie detection report for Telegram / dashboard."""
+        zombies = await self.detect_zombies(stale_days, grace_days)
+        if not zombies:
+            return "No zombie positions detected."
+
+        by_reason = {}
+        for z in zombies:
+            reason = z.get('zombie_reason', 'unknown')
+            by_reason[reason] = by_reason.get(reason, 0) + 1
+
+        lines = [
+            f"ZOMBIE REPORT: {len(zombies)} detected",
+            f"  stale_days={stale_days}, grace_days={grace_days}",
+            "",
+        ]
+        for reason, count in sorted(by_reason.items()):
+            lines.append(f"  {reason}: {count}")
+
+        lines.append("")
+        lines.append("Use /zombie_clean to close them.")
+        return "\n".join(lines)
+
+    # =========================================================================
+    # Paper Equity Reset
+    # =========================================================================
+
+    async def reset_paper_equity(self, scope: str = 'all', mode: str = 'epoch') -> str:
+        """Reset paper equity by starting a new epoch.
+
+        Args:
+            scope: 'all' or a specific trader_id
+            mode: 'epoch' (start fresh epoch, old data excluded from current metrics)
+        """
+        if not self.db:
+            return "No database connected."
+
+        if mode == 'epoch':
+            await self.db.reset_paper_epoch(
+                starting_equity=self.starting_balance,
+                scope=scope,
+                reason='manual_reset',
+            )
+            # Clear in-memory active traders
+            self.active_traders.clear()
+            self._positions_by_symbol.clear()
+            self._peak_balance = self.starting_balance
+            self._drawdown_halted = False
+            return (
+                f"New epoch started. starting_equity=${self.starting_balance:,.0f}, "
+                f"scope={scope}. Old data preserved but excluded from current metrics."
+            )
+        return f"Unknown mode: {mode}"
 
 
 # Test function
