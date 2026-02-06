@@ -45,6 +45,9 @@ def _make_persist_status(**extras_overrides):
         "write_queue_depth": 10,
         "bar_buffer_size": 0,
         "persist_lag_ema_ms": None,
+        "persist_lag_crypto_ema_ms": None,
+        "persist_lag_deribit_ema_ms": None,
+        "persist_lag_equities_ema_ms": None,
     }
     extras.update(extras_overrides)
     return {
@@ -205,6 +208,32 @@ class TestLogFloodGuard:
             resource_snapshot=_make_resource(log_entropy={"errors_last_hour": 5000}),
         )
         assert any(a["guard"] == "log_flood" for a in alerts)
+
+
+class TestPersistLagGuard:
+    def test_crypto_lag_drives_alerts(self):
+        g = SoakGuardian(config={"alert_cooldown_s": 0, "persist_lag_sustained_s": 0})
+        alerts = g.evaluate(
+            bus_stats=_make_bus_stats(),
+            bar_builder_status=_make_bb_status(),
+            persistence_status=_make_persist_status(persist_lag_crypto_ema_ms=20_000),
+            resource_snapshot=_make_resource(),
+        )
+        assert any(a["guard"] == "persist_lag" for a in alerts)
+
+    def test_deribit_lag_does_not_trigger_crypto_guard(self):
+        g = SoakGuardian(config={"alert_cooldown_s": 0, "persist_lag_sustained_s": 0})
+        alerts = g.evaluate(
+            bus_stats=_make_bus_stats(),
+            bar_builder_status=_make_bb_status(),
+            persistence_status=_make_persist_status(
+                persist_lag_crypto_ema_ms=1000,
+                persist_lag_deribit_ema_ms=25_000,
+                persist_lag_ema_ms=25_000,
+            ),
+            resource_snapshot=_make_resource(),
+        )
+        assert not any(a["guard"] == "persist_lag" for a in alerts)
 
 
 class TestBarLivenessGuard:

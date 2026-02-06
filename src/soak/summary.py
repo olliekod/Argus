@@ -88,6 +88,9 @@ def build_soak_summary(
                 "bar_flush_retries": getattr(persistence, "_bar_retry_count", 0),
                 "persist_lag_ms": ps.get("extras", {}).get("persist_lag_ms"),
                 "persist_lag_ema_ms": ps.get("extras", {}).get("persist_lag_ema_ms"),
+                "persist_lag_crypto_ema_ms": ps.get("extras", {}).get("persist_lag_crypto_ema_ms"),
+                "persist_lag_deribit_ema_ms": ps.get("extras", {}).get("persist_lag_deribit_ema_ms"),
+                "persist_lag_equities_ema_ms": ps.get("extras", {}).get("persist_lag_equities_ema_ms"),
                 # Spool overflow metrics
                 "spool_active": ps.get("extras", {}).get("spool_active", False),
                 "spool_bars_pending": ps.get("extras", {}).get("spool_bars_pending", 0),

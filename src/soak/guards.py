@@ -49,6 +49,9 @@ _DEFAULTS: Dict[str, Any] = {
     "persist_lag_p95_warn_ms": 5000,
     "persist_lag_p95_alert_ms": 15000,
     "persist_lag_sustained_s": 60,
+    "persist_lag_crypto_enabled": True,
+    "persist_lag_deribit_enabled": False,
+    "persist_lag_equities_enabled": False,
 
     # Bar flush failures
     "bar_flush_failure_threshold": 1,
@@ -106,7 +109,7 @@ class SoakGuardian:
 
         # Rolling windows for sustained checks
         self._persist_queue_high_since: Optional[float] = None
-        self._persist_lag_high_since: Optional[float] = None
+        self._persist_lag_high_since: Dict[str, Optional[float]] = {}
 
         # Previous bus stats for delta computation
         self._prev_bus_stats: Dict[str, Dict[str, int]] = {}
@@ -310,38 +313,75 @@ class SoakGuardian:
     def _check_persist_lag(
         self, persist_status: Dict, now: float
     ) -> List[Dict[str, Any]]:
-        guard = "persist_lag"
         extras = persist_status.get("extras", {})
-        lag_ema = extras.get("persist_lag_ema_ms")
+        triggered: List[Dict[str, Any]] = []
+
+        if self._cfg.get("persist_lag_crypto_enabled", True):
+            triggered += self._check_persist_lag_metric(
+                guard="persist_lag",
+                lag_ema=extras.get("persist_lag_crypto_ema_ms"),
+                now=now,
+                label="persist_lag_crypto_ema",
+            )
+
+        if self._cfg.get("persist_lag_deribit_enabled", False):
+            triggered += self._check_persist_lag_metric(
+                guard="persist_lag_deribit",
+                lag_ema=extras.get("persist_lag_deribit_ema_ms"),
+                now=now,
+                label="persist_lag_deribit_ema",
+            )
+
+        if self._cfg.get("persist_lag_equities_enabled", False):
+            triggered += self._check_persist_lag_metric(
+                guard="persist_lag_equities",
+                lag_ema=extras.get("persist_lag_equities_ema_ms"),
+                now=now,
+                label="persist_lag_equities_ema",
+            )
+
+        return triggered
+
+    def _check_persist_lag_metric(
+        self,
+        *,
+        guard: str,
+        lag_ema: Optional[float],
+        now: float,
+        label: str,
+    ) -> List[Dict[str, Any]]:
         if lag_ema is None:
             self._set_health(guard, "ok")
+            self._persist_lag_high_since.pop(guard, None)
             return []
 
         warn_ms = self._cfg["persist_lag_p95_warn_ms"]
         alert_ms = self._cfg["persist_lag_p95_alert_ms"]
         sustained_s = self._cfg["persist_lag_sustained_s"]
+        high_since = self._persist_lag_high_since.get(guard)
 
         if lag_ema >= alert_ms:
-            if self._persist_lag_high_since is None:
-                self._persist_lag_high_since = now
-            if now - self._persist_lag_high_since >= sustained_s:
+            if high_since is None:
+                high_since = now
+                self._persist_lag_high_since[guard] = high_since
+            if now - high_since >= sustained_s:
                 return self._fire(
                     ALERT, guard,
-                    f"persist_lag_ema={lag_ema:.0f}ms >= {alert_ms}ms "
+                    f"{label}={lag_ema:.0f}ms >= {alert_ms}ms "
                     f"for {sustained_s}s",
                     now,
                 )
             self._set_health(guard, "warn")
             return []
-        elif lag_ema >= warn_ms:
-            if self._persist_lag_high_since is None:
-                self._persist_lag_high_since = now
+        if lag_ema >= warn_ms:
+            if high_since is None:
+                self._persist_lag_high_since[guard] = now
             self._set_health(guard, "warn")
             return []
-        else:
-            self._persist_lag_high_since = None
-            self._set_health(guard, "ok")
-            return []
+
+        self._persist_lag_high_since.pop(guard, None)
+        self._set_health(guard, "ok")
+        return []
 
     def _check_bar_flush_failures(
         self, persist_status: Dict, now: float

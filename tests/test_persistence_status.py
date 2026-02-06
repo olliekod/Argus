@@ -172,3 +172,59 @@ def test_persist_lag_ema_ignores_stale_then_updates():
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)
+
+
+def test_persist_lag_ema_separates_crypto_and_deribit():
+    loop = asyncio.new_event_loop()
+    thread = _start_loop(loop)
+
+    try:
+        bus = EventBus()
+        with tempfile.TemporaryDirectory() as td:
+            pm = PersistenceManager(bus, _DummyDB(), loop, spool_dir=td)
+            now = time.time()
+            crypto_bar = BarEvent(
+                symbol="BTCUSDT",
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=10.0,
+                timestamp=now,
+                source="bybit",
+                bar_duration=60,
+                tick_count=1,
+                source_ts=now - 0.1,
+                last_source_ts=now - 0.1,
+            )
+            deribit_bar = BarEvent(
+                symbol="BTC-INDEX",
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=10.0,
+                timestamp=now,
+                source="deribit",
+                bar_duration=60,
+                tick_count=1,
+                source_ts=now - 20.0,
+                last_source_ts=now - 20.0,
+            )
+            pm._on_bar(crypto_bar)
+            pm._on_bar(deribit_bar)
+            pm._do_flush()
+            status = pm.get_status()
+
+            crypto_ema = status["extras"]["persist_lag_crypto_ema_ms"]
+            deribit_ema = status["extras"]["persist_lag_deribit_ema_ms"]
+            overall_ema = status["extras"]["persist_lag_ema_ms"]
+            assert crypto_ema is not None
+            assert crypto_ema < 2_000
+            assert deribit_ema is not None
+            assert deribit_ema > 10_000
+            assert overall_ema is not None
+            assert overall_ema > crypto_ema
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)

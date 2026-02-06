@@ -117,6 +117,15 @@ def _print_summary(data: dict) -> None:
         lag = pt.get("persist_lag_ema_ms")
         if lag is not None:
             print(f"    persist_lag_ema: {lag:.0f}ms")
+        crypto_lag = pt.get("persist_lag_crypto_ema_ms")
+        if crypto_lag is not None:
+            print(f"    persist_lag_crypto_ema: {crypto_lag:.0f}ms")
+        deribit_lag = pt.get("persist_lag_deribit_ema_ms")
+        if deribit_lag is not None:
+            print(f"    persist_lag_deribit_ema: {deribit_lag:.0f}ms")
+        equities_lag = pt.get("persist_lag_equities_ema_ms")
+        if equities_lag is not None:
+            print(f"    persist_lag_equities_ema: {equities_lag:.0f}ms")
         # Spool overflow status
         if pt.get("spool_active"):
             pending = pt.get("spool_bars_pending", 0)
