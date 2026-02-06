@@ -49,7 +49,7 @@ _DEFAULTS: Dict[str, Any] = {
     "persist_lag_p95_warn_ms": 5000,
     "persist_lag_p95_alert_ms": 15000,
     "persist_lag_sustained_s": 60,
-    "persist_lag_crypto_enabled": True,
+    "persist_lag_use_crypto_only": True,
     "persist_lag_deribit_enabled": False,
     "persist_lag_equities_enabled": False,
 
@@ -96,7 +96,20 @@ class SoakGuardian:
         config: Optional[Dict[str, Any]] = None,
         alert_callback: Optional[Callable] = None,
     ) -> None:
-        self._cfg = {**_DEFAULTS, **(config or {})}
+        raw_cfg = config or {}
+        self._cfg = {**_DEFAULTS, **raw_cfg}
+        persist_cfg = raw_cfg.get("persist_lag", {}) if isinstance(raw_cfg, dict) else {}
+        if isinstance(persist_cfg, dict):
+            use_crypto_only = persist_cfg.get("use_crypto_only", True)
+            self._cfg["persist_lag_use_crypto_only"] = bool(use_crypto_only)
+            if "deribit_enabled" in persist_cfg:
+                self._cfg["persist_lag_deribit_enabled"] = bool(
+                    persist_cfg.get("deribit_enabled")
+                )
+            if "equities_enabled" in persist_cfg:
+                self._cfg["persist_lag_equities_enabled"] = bool(
+                    persist_cfg.get("equities_enabled")
+                )
         self._alert_cb = alert_callback
         self._lock = threading.Lock()
 
@@ -316,13 +329,19 @@ class SoakGuardian:
         extras = persist_status.get("extras", {})
         triggered: List[Dict[str, Any]] = []
 
-        if self._cfg.get("persist_lag_crypto_enabled", True):
-            triggered += self._check_persist_lag_metric(
-                guard="persist_lag",
-                lag_ema=extras.get("persist_lag_crypto_ema_ms"),
-                now=now,
-                label="persist_lag_crypto_ema",
-            )
+        if self._cfg.get("persist_lag_use_crypto_only", True):
+            primary_lag = extras.get("persist_lag_crypto_ema_ms")
+            primary_label = "persist_lag_crypto_ema"
+        else:
+            primary_lag = extras.get("persist_lag_ema_ms")
+            primary_label = "persist_lag_ema"
+
+        triggered += self._check_persist_lag_metric(
+            guard="persist_lag",
+            lag_ema=primary_lag,
+            now=now,
+            label=primary_label,
+        )
 
         if self._cfg.get("persist_lag_deribit_enabled", False):
             triggered += self._check_persist_lag_metric(
