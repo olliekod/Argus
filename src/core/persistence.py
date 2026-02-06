@@ -78,6 +78,82 @@ _RESUME_THRESHOLD_PCT = 80.0      # Resume when spool below this % of max
 _PAUSE_LOG_INTERVAL = 60.0        # Rate-limit pause log messages (seconds)
 _PERSIST_LAG_MAX_AGE_SECONDS = 300.0  # Ignore bar timestamps older than this
 
+_CRYPTO_SOURCES = {"bybit", "binance", "coinbase", "okx"}
+_DERIBIT_SOURCES = {"deribit"}
+_EQUITIES_SOURCES = {"yahoo"}
+
+_CRYPTO_LAG_CLASS = "crypto"
+_DERIBIT_LAG_CLASS = "deribit"
+_EQUITIES_LAG_CLASS = "equities"
+
+
+def _normalize_source(source: Optional[str]) -> Optional[str]:
+    if not source:
+        return None
+    return str(source).strip().lower()
+
+
+def _infer_source_class_from_symbol(symbol: Optional[str]) -> Optional[str]:
+    if not symbol:
+        return None
+    symbol_upper = symbol.upper()
+    if symbol_upper.endswith("-INDEX") or symbol_upper.endswith("INDEX"):
+        return _DERIBIT_LAG_CLASS
+    if symbol_upper in {"IBIT", "BITO"}:
+        return _EQUITIES_LAG_CLASS
+    crypto_markers = ("USDT", "USDC", "PERP")
+    if any(marker in symbol_upper for marker in crypto_markers) or symbol_upper.endswith("USD"):
+        return _CRYPTO_LAG_CLASS
+    return None
+
+
+def _classify_bar_source(bar: BarEvent) -> Optional[str]:
+    source_hint = None
+    for attr in ("connector", "provider", "source"):
+        candidate = getattr(bar, attr, None)
+        if candidate:
+            source_hint = candidate
+            break
+    source_hint = _normalize_source(source_hint)
+    if source_hint in _CRYPTO_SOURCES:
+        return _CRYPTO_LAG_CLASS
+    if source_hint in _DERIBIT_SOURCES:
+        return _DERIBIT_LAG_CLASS
+    if source_hint in _EQUITIES_SOURCES:
+        return _EQUITIES_LAG_CLASS
+    return _infer_source_class_from_symbol(getattr(bar, "symbol", None))
+
+
+def _extract_source_ts(bar: BarEvent, now: float) -> Optional[float]:
+    last_source_ts = getattr(bar, "last_source_ts", 0.0)
+    source_ts = last_source_ts if _ts_sane(last_source_ts) else getattr(bar, "source_ts", 0.0)
+    if not source_ts or source_ts <= 0:
+        return None
+    if not _ts_sane(source_ts):
+        logger.warning(
+            "Ignoring bar source_ts with unexpected units: %r (symbol=%s)",
+            source_ts,
+            getattr(bar, "symbol", "unknown"),
+        )
+        return None
+    age_seconds = now - source_ts
+    if age_seconds < 0 or age_seconds > _PERSIST_LAG_MAX_AGE_SECONDS:
+        logger.warning(
+            "Ignoring bar source_ts outside lag window: %r age=%.1fs (symbol=%s)",
+            source_ts,
+            age_seconds,
+            getattr(bar, "symbol", "unknown"),
+        )
+        return None
+    return source_ts
+
+
+def _compute_persist_lag_ms(source_ts_values: List[float], now: float) -> Optional[float]:
+    if not source_ts_values:
+        return None
+    avg_source_ts = sum(source_ts_values) / len(source_ts_values)
+    return (now - avg_source_ts) * 1000
+
 
 class PersistenceManager:
     """Async-safe persistence subscriber for the event bus.
@@ -168,6 +244,9 @@ class PersistenceManager:
         # Lag tracking (Stream 2.1)
         self._last_persist_lag_ms: Optional[float] = None
         self._persist_lag_ema: Optional[float] = None
+        self._persist_lag_crypto_ema: Optional[float] = None
+        self._persist_lag_deribit_ema: Optional[float] = None
+        self._persist_lag_equities_ema: Optional[float] = None
 
         # Recover spool from previous crash (if any)
         self._recover_spool()
@@ -590,34 +669,30 @@ class PersistenceManager:
             now = time.time()
 
             # Compute persist_lag_ms from source timestamps
-            source_ts_values = []
+            source_ts_values: List[float] = []
+            source_ts_by_class: Dict[str, List[float]] = {
+                _CRYPTO_LAG_CLASS: [],
+                _DERIBIT_LAG_CLASS: [],
+                _EQUITIES_LAG_CLASS: [],
+            }
             for b in batch:
-                last_source_ts = getattr(b, 'last_source_ts', 0.0)
-                source_ts = last_source_ts if _ts_sane(last_source_ts) else getattr(b, 'source_ts', 0.0)
-                if not source_ts or source_ts <= 0:
-                    continue
-                if not _ts_sane(source_ts):
-                    logger.warning(
-                        "Ignoring bar source_ts with unexpected units: %r (symbol=%s)",
-                        source_ts,
-                        getattr(b, 'symbol', 'unknown'),
-                    )
-                    continue
-                age_seconds = now - source_ts
-                if age_seconds < 0 or age_seconds > _PERSIST_LAG_MAX_AGE_SECONDS:
-                    logger.warning(
-                        "Ignoring bar source_ts outside lag window: %r age=%.1fs (symbol=%s)",
-                        source_ts,
-                        age_seconds,
-                        getattr(b, 'symbol', 'unknown'),
-                    )
+                source_ts = _extract_source_ts(b, now)
+                if source_ts is None:
                     continue
                 source_ts_values.append(source_ts)
-            if source_ts_values:
-                avg_source_ts = sum(source_ts_values) / len(source_ts_values)
-                persist_lag = (now - avg_source_ts) * 1000
-            else:
-                persist_lag = None
+                source_class = _classify_bar_source(b)
+                if source_class in source_ts_by_class:
+                    source_ts_by_class[source_class].append(source_ts)
+            persist_lag = _compute_persist_lag_ms(source_ts_values, now)
+            persist_lag_crypto = _compute_persist_lag_ms(
+                source_ts_by_class[_CRYPTO_LAG_CLASS], now
+            )
+            persist_lag_deribit = _compute_persist_lag_ms(
+                source_ts_by_class[_DERIBIT_LAG_CLASS], now
+            )
+            persist_lag_equities = _compute_persist_lag_ms(
+                source_ts_by_class[_EQUITIES_LAG_CLASS], now
+            )
 
             with self._status_lock:
                 self._last_flush_ts = now
@@ -634,6 +709,21 @@ class PersistenceManager:
                     self._persist_lag_ema = (
                         persist_lag if self._persist_lag_ema is None
                         else (persist_lag * 0.2) + (self._persist_lag_ema * 0.8)
+                    )
+                if persist_lag_crypto is not None:
+                    self._persist_lag_crypto_ema = (
+                        persist_lag_crypto if self._persist_lag_crypto_ema is None
+                        else (persist_lag_crypto * 0.2) + (self._persist_lag_crypto_ema * 0.8)
+                    )
+                if persist_lag_deribit is not None:
+                    self._persist_lag_deribit_ema = (
+                        persist_lag_deribit if self._persist_lag_deribit_ema is None
+                        else (persist_lag_deribit * 0.2) + (self._persist_lag_deribit_ema * 0.8)
+                    )
+                if persist_lag_equities is not None:
+                    self._persist_lag_equities_ema = (
+                        persist_lag_equities if self._persist_lag_equities_ema is None
+                        else (persist_lag_equities * 0.2) + (self._persist_lag_equities_ema * 0.8)
                     )
 
             # After successful buffer flush, drain spool if active
@@ -776,6 +866,9 @@ class PersistenceManager:
         with self._status_lock:
             total_writes = self._bars_writes_total + self._metrics_writes_total + self._signals_writes_total
             lag_ms = self._last_persist_lag_ms
+            persist_lag_crypto = self._persist_lag_crypto_ema
+            persist_lag_deribit = self._persist_lag_deribit_ema
+            persist_lag_equities = self._persist_lag_equities_ema
 
         health = "ok"
         if self._consecutive_failures > 0:
@@ -811,6 +904,15 @@ class PersistenceManager:
                 "signal_queue_depth": self._signal_queue.qsize(),
                 "telemetry_queue_depth": self._telemetry_queue.qsize(),
                 "persist_lag_ema_ms": round(self._persist_lag_ema, 1) if self._persist_lag_ema else None,
+                "persist_lag_crypto_ema_ms": (
+                    round(persist_lag_crypto, 1) if persist_lag_crypto is not None else None
+                ),
+                "persist_lag_deribit_ema_ms": (
+                    round(persist_lag_deribit, 1) if persist_lag_deribit is not None else None
+                ),
+                "persist_lag_equities_ema_ms": (
+                    round(persist_lag_equities, 1) if persist_lag_equities is not None else None
+                ),
                 "spool_active": spool_active,
                 "spool_bars_pending": spool_bars_pending,
                 "ingestion_paused": ingestion_paused,
@@ -844,6 +946,9 @@ class PersistenceManager:
             consecutive_failures = self._consecutive_failures
             persist_lag_ms = self._last_persist_lag_ms
             persist_lag_ema = self._persist_lag_ema
+            persist_lag_crypto = self._persist_lag_crypto_ema
+            persist_lag_deribit = self._persist_lag_deribit_ema
+            persist_lag_equities = self._persist_lag_equities_ema
             signals_dropped_total = self._signals_dropped_total
             metrics_dropped_total = self._metrics_dropped_total
             heartbeats_dropped_total = self._heartbeats_dropped_total
@@ -900,6 +1005,15 @@ class PersistenceManager:
                 "write_queue_depth": self._signal_queue.qsize() + self._telemetry_queue.qsize(),
                 "persist_lag_ms": round(persist_lag_ms, 1) if persist_lag_ms is not None else None,
                 "persist_lag_ema_ms": round(persist_lag_ema, 1) if persist_lag_ema is not None else None,
+                "persist_lag_crypto_ema_ms": (
+                    round(persist_lag_crypto, 1) if persist_lag_crypto is not None else None
+                ),
+                "persist_lag_deribit_ema_ms": (
+                    round(persist_lag_deribit, 1) if persist_lag_deribit is not None else None
+                ),
+                "persist_lag_equities_ema_ms": (
+                    round(persist_lag_equities, 1) if persist_lag_equities is not None else None
+                ),
                 # Spool metrics
                 "spool_active": spool_active,
                 "spool_bars_pending": spool_bars_pending,
