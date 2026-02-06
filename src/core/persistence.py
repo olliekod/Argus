@@ -595,6 +595,11 @@ class PersistenceManager:
 
         age_seconds = now - source_ts
         if age_seconds < 0:
+            with self._status_lock:
+                self._source_ts_future_clamped_total += 1
+                self._increment_symbol_counter(
+                    self._source_ts_future_clamped_by_symbol, symbol
+                )
             return now
         if age_seconds > _PERSIST_LAG_MAX_AGE_SECONDS:
             with self._status_lock:

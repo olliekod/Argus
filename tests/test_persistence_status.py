@@ -212,7 +212,44 @@ def test_persist_lag_future_ts_clamps_to_now():
         thread.join(timeout=2)
 
 
-def test_persist_lag_future_within_skew_not_clamped():
+def test_persist_lag_small_future_skew_does_not_mark_stale():
+    loop = asyncio.new_event_loop()
+    thread = _start_loop(loop)
+
+    try:
+        bus = EventBus()
+        with tempfile.TemporaryDirectory() as td:
+            pm = PersistenceManager(bus, _DummyDB(), loop, spool_dir=td)
+            now = time.time()
+            bar = BarEvent(
+                symbol="BTCUSDT",
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=10.0,
+                timestamp=now,
+                source="bybit",
+                bar_duration=60,
+                tick_count=1,
+                source_ts=now + 0.4,
+                last_source_ts=now + 0.4,
+            )
+            pm._on_bar(bar)
+            pm._do_flush()
+            status = pm.get_status()
+
+            assert status["extras"]["source_ts_future_clamped_total"] == 1
+            assert status["extras"]["source_ts_stale_ignored_total"] == 0
+            assert status["extras"]["persist_lag_ms"] == 0.0
+            assert status["extras"]["persist_lag_ema_ms"] is not None
+            assert status["extras"]["persist_lag_ema_ms"] >= 0.0
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+
+
+def test_persist_lag_future_within_skew_clamps_and_counts():
     loop = asyncio.new_event_loop()
     thread = _start_loop(loop)
 
@@ -239,7 +276,9 @@ def test_persist_lag_future_within_skew_not_clamped():
             pm._do_flush()
             status = pm.get_status()
 
-            assert status["extras"]["source_ts_future_clamped_total"] == 0
+            assert status["extras"]["source_ts_future_clamped_total"] == 1
+            assert status["extras"]["source_ts_future_clamped_by_symbol"]["BTCUSDT"] == 1
+            assert status["extras"]["source_ts_stale_ignored_total"] == 0
             assert status["extras"]["persist_lag_ms"] == 0.0
             assert status["extras"]["persist_lag_ema_ms"] is not None
             assert status["extras"]["persist_lag_ema_ms"] >= 0.0
