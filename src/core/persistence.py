@@ -46,6 +46,7 @@ from queue import Empty, Full, Queue
 from typing import Any, Dict, List, Optional
 
 from .bus import EventBus
+from .bar_builder import _ts_sane
 from .events import (
     BarEvent,
     ComponentHeartbeatEvent,
@@ -75,6 +76,7 @@ _SPOOL_DRAIN_BATCH = 500          # Bars to drain from spool per flush cycle
 _PAUSE_ON_SPOOL_FULL = True       # Pause ingestion when spool full (safe failure)
 _RESUME_THRESHOLD_PCT = 80.0      # Resume when spool below this % of max
 _PAUSE_LOG_INTERVAL = 60.0        # Rate-limit pause log messages (seconds)
+_PERSIST_LAG_MAX_AGE_SECONDS = 300.0  # Ignore bar timestamps older than this
 
 
 class PersistenceManager:
@@ -588,10 +590,29 @@ class PersistenceManager:
             now = time.time()
 
             # Compute persist_lag_ms from source timestamps
-            source_ts_values = [
-                b.source_ts for b in batch
-                if hasattr(b, 'source_ts') and b.source_ts > 0
-            ]
+            source_ts_values = []
+            for b in batch:
+                last_source_ts = getattr(b, 'last_source_ts', 0.0)
+                source_ts = last_source_ts if _ts_sane(last_source_ts) else getattr(b, 'source_ts', 0.0)
+                if not source_ts or source_ts <= 0:
+                    continue
+                if not _ts_sane(source_ts):
+                    logger.warning(
+                        "Ignoring bar source_ts with unexpected units: %r (symbol=%s)",
+                        source_ts,
+                        getattr(b, 'symbol', 'unknown'),
+                    )
+                    continue
+                age_seconds = now - source_ts
+                if age_seconds < 0 or age_seconds > _PERSIST_LAG_MAX_AGE_SECONDS:
+                    logger.warning(
+                        "Ignoring bar source_ts outside lag window: %r age=%.1fs (symbol=%s)",
+                        source_ts,
+                        age_seconds,
+                        getattr(b, 'symbol', 'unknown'),
+                    )
+                    continue
+                source_ts_values.append(source_ts)
             if source_ts_values:
                 avg_source_ts = sum(source_ts_values) / len(source_ts_values)
                 persist_lag = (now - avg_source_ts) * 1000

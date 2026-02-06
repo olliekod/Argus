@@ -8,13 +8,35 @@ Fetches IBIT ETF price data for options monitoring.
 import asyncio
 import time
 from datetime import datetime
-from typing import Any, Callable, Dict, Optional
+from typing import Any, Callable, Dict, Optional, Tuple
 import aiohttp
 import math
 from ..core.logger import get_connector_logger
 from ..core.events import QuoteEvent, TOPIC_MARKET_QUOTES
+from ..core.bar_builder import _ts_sane
 
 logger = get_connector_logger('yahoo')
+
+
+def _parse_yahoo_source_ts(meta: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], Optional[float]]:
+    """Extract and normalize Yahoo's source timestamp to epoch seconds."""
+    raw = meta.get("regularMarketTime")
+    if raw is None:
+        return None, "missing", None
+    try:
+        raw_val = float(raw)
+    except (TypeError, ValueError):
+        return None, "invalid", raw
+
+    if _ts_sane(raw_val):
+        return raw_val, None, raw_val
+
+    if raw_val > 10_000_000_000:
+        candidate = raw_val / 1000.0
+        if _ts_sane(candidate):
+            return candidate, "converted_ms", raw_val
+
+    return None, "out_of_range", raw_val
 
 
 class YahooFinanceClient:
@@ -171,6 +193,7 @@ class YahooFinanceClient:
                     else:
                         annualized_vol = 0
                     
+                    source_ts, ts_reason, ts_raw = _parse_yahoo_source_ts(meta)
                     parsed = {
                         'symbol': symbol,
                         'timestamp': datetime.utcnow().isoformat(),
@@ -183,6 +206,9 @@ class YahooFinanceClient:
                         'volume': meta.get('regularMarketVolume', 0),
                         'realized_vol_5d': annualized_vol,
                         'market_state': meta.get('marketState', 'CLOSED'),
+                        'source_ts': source_ts,
+                        'source_ts_raw': ts_raw,
+                        'source_ts_reason': ts_reason,
                     }
                     
                     return parsed
@@ -220,17 +246,28 @@ class YahooFinanceClient:
                     if self._event_bus is not None:
                         try:
                             price = data.get('price', 0)
-                            now = time.time()
+                            source_ts = data.get('source_ts')
+                            source_ts_raw = data.get('source_ts_raw')
+                            source_ts_reason = data.get('source_ts_reason')
+                            if source_ts is None:
+                                logger.warning(
+                                    "Rejected Yahoo quote for %s: %s (raw_ts=%r)",
+                                    symbol,
+                                    source_ts_reason or "missing source_ts",
+                                    source_ts_raw,
+                                )
+                                source_ts = 0.0
+                            timestamp = source_ts if source_ts else 0.0
                             quote = QuoteEvent(
                                 symbol=symbol,
                                 bid=price,
                                 ask=price,
                                 mid=price,
                                 last=price,
-                                timestamp=now,
+                                timestamp=timestamp,
                                 source='yahoo',
                                 volume_24h=float(data.get('volume', 0) or 0),
-                                source_ts=now,
+                                source_ts=source_ts,
                             )
                             self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
                         except Exception as e:
