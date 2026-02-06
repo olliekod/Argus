@@ -235,6 +235,7 @@ class TestPersistLagGuard:
         )
         assert not any(a["guard"] == "persist_lag" for a in alerts)
 
+<<<<<<< codex/implement-telemetry-truth-layer-and-dashboard-wiring
     def test_deribit_enabled_without_use_crypto_only(self):
         g = SoakGuardian(config={
             "alert_cooldown_s": 0,
@@ -252,6 +253,14 @@ class TestPersistLagGuard:
         })
         assert g._cfg["persist_lag_use_crypto_only"] is True
         assert g._cfg["persist_lag_deribit_enabled"] is True
+=======
+    def test_use_crypto_only_config_disables_deribit(self):
+        g = SoakGuardian(config={
+            "alert_cooldown_s": 0,
+            "persist_lag_sustained_s": 0,
+            "persist_lag": {"use_crypto_only": True},
+        })
+>>>>>>> main
         alerts = g.evaluate(
             bus_stats=_make_bus_stats(),
             bar_builder_status=_make_bb_status(),
@@ -261,6 +270,7 @@ class TestPersistLagGuard:
             ),
             resource_snapshot=_make_resource(),
         )
+<<<<<<< codex/implement-telemetry-truth-layer-and-dashboard-wiring
         assert any(a["guard"] == "persist_lag_deribit" for a in alerts)
 
     def test_use_crypto_only_defaults_true(self):
@@ -269,6 +279,9 @@ class TestPersistLagGuard:
             "persist_lag": {},
         })
         assert g._cfg["persist_lag_use_crypto_only"] is True
+=======
+        assert not any(a["guard"] == "persist_lag_deribit" for a in alerts)
+>>>>>>> main
 
 
 class TestBarLivenessGuard:
