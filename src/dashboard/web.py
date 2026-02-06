@@ -158,10 +158,12 @@ class ArgusWebDashboard:
         self._get_providers: Optional[Callable] = None
         self._run_command: Optional[Callable] = None
         self._get_recent_logs: Optional[Callable] = None
+        self._get_soak_summary: Optional[Callable] = None
         self._boot_phases: str = ''
 
         self._app.router.add_get('/', self._handle_index)
         self._app.router.add_get('/api/status', self._handle_status)
+        self._app.router.add_get('/debug/soak', self._handle_soak)
         self._app.router.add_post('/api/command', self._handle_command)
 
     def set_callbacks(
@@ -172,6 +174,7 @@ class ArgusWebDashboard:
         get_providers=None,
         run_command=None,
         get_recent_logs=None,
+        get_soak_summary=None,
     ):
         if get_status: self._get_status = get_status
         if get_pnl: self._get_pnl = get_pnl
@@ -179,6 +182,7 @@ class ArgusWebDashboard:
         if get_providers: self._get_providers = get_providers
         if run_command: self._run_command = run_command
         if get_recent_logs: self._get_recent_logs = get_recent_logs
+        if get_soak_summary: self._get_soak_summary = get_soak_summary
 
     def set_boot_phases(self, text: str):
         self._boot_phases = text
@@ -288,3 +292,27 @@ class ArgusWebDashboard:
             logger.info(f"/api/command {status_code} in {duration_ms:.1f}ms")
 
         return web.json_response(response, status=status_code)
+
+    async def _handle_soak(self, request):
+        """GET /debug/soak — single-payload soak summary."""
+        start = time.perf_counter()
+        try:
+            if self._get_soak_summary:
+                result = await self._get_soak_summary()
+            else:
+                result = {"error": "Soak summary not configured"}
+        except Exception as e:
+            logger.error(f"/debug/soak error: {e}")
+            result = {"error": str(e)}
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"/debug/soak 200 in {duration_ms:.1f}ms")
+
+        def _ensure_json_safe(payload):
+            try:
+                json.dumps(payload)
+                return payload
+            except TypeError:
+                return json.loads(json.dumps(payload, default=str))
+
+        return web.json_response(_ensure_json_safe(result))
