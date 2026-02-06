@@ -126,6 +126,18 @@ def _print_summary(data: dict) -> None:
         equities_lag = pt.get("persist_lag_equities_ema_ms")
         if equities_lag is not None:
             print(f"    persist_lag_equities_ema: {equities_lag:.0f}ms")
+        counters = []
+        for key in (
+            "source_ts_future_clamped_total",
+            "source_ts_stale_ignored_total",
+            "source_ts_units_discarded_total",
+            "source_ts_missing_total",
+        ):
+            value = pt.get(key, 0)
+            if value:
+                counters.append(f"{key}={value}")
+        if counters:
+            print(f"    source_ts: {', '.join(counters)}")
         # Spool overflow status
         if pt.get("spool_active"):
             pending = pt.get("spool_bars_pending", 0)

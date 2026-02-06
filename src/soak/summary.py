@@ -17,10 +17,13 @@ def build_soak_summary(
     bus=None,
     bar_builder=None,
     persistence=None,
+    feature_builder=None,
+    regime_detector=None,
     resource_monitor=None,
     guardian=None,
     tape_recorder=None,
-    connectors: Optional[Dict[str, Any]] = None,
+    providers: Optional[Dict[str, Any]] = None,
+    detectors: Optional[Dict[str, Any]] = None,
     polymarket_gamma=None,
     polymarket_clob=None,
     polymarket_watchlist=None,
@@ -48,22 +51,24 @@ def build_soak_summary(
         except Exception as e:
             components["persistence"] = {"error": str(e)}
 
-    if connectors:
-        for name, client in connectors.items():
-            if client is None:
-                components[name] = {"status": "not_configured"}
-                continue
-            try:
-                if hasattr(client, "get_health_status"):
-                    components[name] = client.get_health_status()
-                elif hasattr(client, "get_health"):
-                    components[name] = client.get_health()
-                else:
-                    components[name] = {"status": "unknown"}
-            except Exception as e:
-                components[name] = {"error": str(e)}
+    if feature_builder:
+        try:
+            components["feature_builder"] = feature_builder.get_status()
+        except Exception as e:
+            components["feature_builder"] = {"error": str(e)}
+
+    if regime_detector:
+        try:
+            components["regime_detector"] = regime_detector.get_status()
+        except Exception as e:
+            components["regime_detector"] = {"error": str(e)}
 
     summary["components"] = components
+
+    if providers is not None:
+        summary["providers"] = providers
+    if detectors is not None:
+        summary["detectors"] = detectors
 
     # 2) EventBus telemetry
     if bus:
@@ -91,6 +96,18 @@ def build_soak_summary(
                 "persist_lag_crypto_ema_ms": ps.get("extras", {}).get("persist_lag_crypto_ema_ms"),
                 "persist_lag_deribit_ema_ms": ps.get("extras", {}).get("persist_lag_deribit_ema_ms"),
                 "persist_lag_equities_ema_ms": ps.get("extras", {}).get("persist_lag_equities_ema_ms"),
+                "source_ts_future_clamped_total": ps.get("extras", {}).get(
+                    "source_ts_future_clamped_total", 0
+                ),
+                "source_ts_stale_ignored_total": ps.get("extras", {}).get(
+                    "source_ts_stale_ignored_total", 0
+                ),
+                "source_ts_units_discarded_total": ps.get("extras", {}).get(
+                    "source_ts_units_discarded_total", 0
+                ),
+                "source_ts_missing_total": ps.get("extras", {}).get(
+                    "source_ts_missing_total", 0
+                ),
                 # Spool overflow metrics
                 "spool_active": ps.get("extras", {}).get("spool_active", False),
                 "spool_bars_pending": ps.get("extras", {}).get("spool_bars_pending", 0),
