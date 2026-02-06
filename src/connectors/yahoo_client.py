@@ -220,15 +220,17 @@ class YahooFinanceClient:
                     if self._event_bus is not None:
                         try:
                             price = data.get('price', 0)
+                            now = time.time()
                             quote = QuoteEvent(
                                 symbol=symbol,
                                 bid=price,
                                 ask=price,
                                 mid=price,
                                 last=price,
-                                timestamp=time.time(),
+                                timestamp=now,
                                 source='yahoo',
                                 volume_24h=float(data.get('volume', 0) or 0),
+                                source_ts=now,
                             )
                             self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
                         except Exception as e:

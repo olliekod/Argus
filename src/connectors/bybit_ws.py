@@ -323,6 +323,15 @@ class BybitWebSocket:
                     ask = parsed.get('ask_price', 0.0)
                     mid = (bid + ask) / 2 if (bid and ask) else parsed['last_price']
                     now = time.time()
+
+                    # Extract upstream timestamp from Bybit WS payload.
+                    # Bybit sends 'ts' at message level in milliseconds.
+                    raw_ts = data.get('ts')
+                    if raw_ts is not None:
+                        source_ts = float(raw_ts) / 1000.0  # ms → seconds
+                    else:
+                        source_ts = now  # fallback: use receive time
+
                     quote = QuoteEvent(
                         symbol=symbol,
                         bid=bid,
@@ -332,6 +341,7 @@ class BybitWebSocket:
                         timestamp=now,
                         source='bybit',
                         volume_24h=parsed.get('volume_24h', 0.0),
+                        source_ts=source_ts,
                     )
                     self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
 
