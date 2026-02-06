@@ -25,10 +25,19 @@ from .core.logger import setup_logger, get_logger, uptime_seconds
 from .core.bus import EventBus
 from .core.events import (
     HeartbeatEvent,
-    TOPIC_SYSTEM_HEARTBEAT,
     MinuteTickEvent,
+    BarEvent,
+    QuoteEvent,
+    MetricEvent,
+    SignalEvent,
+    TOPIC_MARKET_BARS,
+    TOPIC_MARKET_METRICS,
+    TOPIC_MARKET_QUOTES,
+    TOPIC_SIGNALS,
+    TOPIC_SYSTEM_HEARTBEAT,
     TOPIC_SYSTEM_MINUTE_TICK,
 )
+from .core.status_tracker import ActivityStatusTracker
 from .core.bar_builder import BarBuilder
 from .core.persistence import PersistenceManager
 from .core.feature_builder import FeatureBuilder
@@ -135,6 +144,22 @@ class ArgusOrchestrator:
         self.query_layer: Optional[QueryLayer] = None
         self.feature_builder: Optional[FeatureBuilder] = None
         self.regime_detector: Optional[RegimeDetector] = None
+        self._provider_names = [
+            "bybit",
+            "deribit",
+            "yahoo",
+            "binance",
+            "okx",
+            "coinglass",
+            "coinbase",
+            "ibit_options",
+            "polymarket_gamma",
+            "polymarket_clob",
+        ]
+        self._activity_tracker = ActivityStatusTracker(
+            provider_names=self._provider_names,
+            boot_ts=time.time(),
+        )
 
         # Polymarket connectors
         self.polymarket_gamma: Optional[PolymarketGammaClient] = None
@@ -260,6 +285,89 @@ class ArgusOrchestrator:
             prev = ts
         return "\n".join(lines)
 
+    def _note_detector_activity(self, detector: str, *, kind: str = "event") -> None:
+        self._activity_tracker.record_detector_event(
+            detector, event_ts=time.time(), kind=kind
+        )
+
+    def _note_detector_signal(self, event: SignalEvent) -> None:
+        detector = getattr(event, "detector", None)
+        if detector:
+            self._activity_tracker.record_detector_signal(
+                detector, event_ts=event.timestamp
+            )
+
+    def _note_provider_quote(self, event: QuoteEvent) -> None:
+        provider = getattr(event, "source", None)
+        if not provider:
+            return
+        self._activity_tracker.record_provider_event(
+            provider,
+            event_ts=event.event_ts,
+            source_ts=event.source_ts or event.timestamp,
+            kind="quote",
+        )
+
+    def _note_provider_bar(self, event: BarEvent) -> None:
+        provider = getattr(event, "source", None)
+        if not provider:
+            return
+        source_ts = (
+            event.last_source_ts
+            or event.first_source_ts
+            or event.source_ts
+            or event.timestamp
+        )
+        self._activity_tracker.record_provider_event(
+            provider,
+            event_ts=event.event_ts,
+            source_ts=source_ts,
+            kind="bar",
+        )
+
+    def _note_provider_metric(self, event: MetricEvent) -> None:
+        provider = getattr(event, "source", None)
+        if not provider:
+            return
+        self._activity_tracker.record_provider_event(
+            provider,
+            event_ts=event.event_ts,
+            source_ts=event.source_ts or event.timestamp,
+            kind="metric",
+        )
+
+    def _wire_activity_tracking(self) -> None:
+        self.event_bus.subscribe(TOPIC_MARKET_QUOTES, self._note_provider_quote)
+        self.event_bus.subscribe(TOPIC_MARKET_BARS, self._note_provider_bar)
+        self.event_bus.subscribe(TOPIC_MARKET_METRICS, self._note_provider_metric)
+        self.event_bus.subscribe(TOPIC_SIGNALS, self._note_detector_signal)
+
+    def _record_detector_activity(self, detector: str, event_ts: float, kind: str) -> None:
+        if kind == "signal":
+            self._activity_tracker.record_detector_signal(detector, event_ts=event_ts)
+        else:
+            self._activity_tracker.record_detector_event(
+                detector, event_ts=event_ts, kind=kind
+            )
+
+    def _sync_provider_registry(self) -> None:
+        providers = {
+            "bybit": self.bybit_ws,
+            "deribit": self.deribit_client,
+            "yahoo": self.yahoo_client,
+            "binance": getattr(self, "binance_ws", None),
+            "okx": getattr(self, "okx_client", None),
+            "coinglass": getattr(self, "coinglass_client", None),
+            "coinbase": getattr(self, "coinbase_client", None),
+            "ibit_options": getattr(self, "ibit_options_client", None),
+            "polymarket_gamma": self.polymarket_gamma,
+            "polymarket_clob": self.polymarket_clob,
+        }
+        for name in self._provider_names:
+            self._activity_tracker.register_provider(
+                name, configured=providers.get(name) is not None
+            )
+
     async def setup(self) -> None:
         """Initialize all components with phase timing."""
         self.logger.info("Setting up Argus components...")
@@ -284,10 +392,12 @@ class ArgusOrchestrator:
         # Phase 2c: Intelligence pipeline (downstream-only, safe in collector mode)
         self.feature_builder = FeatureBuilder(self.event_bus)
         self.regime_detector = RegimeDetector(self.event_bus)
+        self._wire_activity_tracking()
         self._phase("event_bus_wired")
 
         # Phase 3: Connectors (with event bus)
         await self._setup_connectors()
+        self._sync_provider_registry()
         self._phase("connectors_init")
 
         # Phase 4: Telegram
@@ -312,6 +422,7 @@ class ArgusOrchestrator:
 
         # Phase 7b: Polymarket connectors (optional, fail-soft)
         await self._setup_polymarket()
+        self._sync_provider_registry()
         self._phase("polymarket_init")
 
         # Phase 7c: Query layer (unified command interface)
@@ -333,6 +444,7 @@ class ArgusOrchestrator:
             persistence=self.persistence,
             feature_builder=self.feature_builder,
             regime_detector=self.regime_detector,
+            provider_names=self._provider_names,
         )
         self._phase("query_layer_init")
 
@@ -448,17 +560,23 @@ class ArgusOrchestrator:
         thresholds = self.config.get('thresholds', {})
         is_collector = self.mode == "collector"
 
+        def _register(detector) -> None:
+            detector.set_activity_callback(self._record_detector_activity)
+            self._activity_tracker.register_detector(detector.name)
+
         # Options IV detector (BTC options on Deribit - for research)
         iv_config = thresholds.get('options_iv', {})
         if iv_config.get('enabled', True):
             self.detectors['options_iv'] = OptionsIVDetector(iv_config, self.db)
             self.detectors['options_iv'].attach_bus(self.event_bus)
+            _register(self.detectors['options_iv'])
 
         # Volatility detector
         vol_config = thresholds.get('volatility', {})
         if vol_config.get('enabled', True):
             self.detectors['volatility'] = VolatilityDetector(vol_config, self.db)
             self.detectors['volatility'].attach_bus(self.event_bus)
+            _register(self.detectors['volatility'])
 
         # IBIT options detector (actionable for Robinhood)
         ibit_config = thresholds.get('ibit', {
@@ -471,6 +589,7 @@ class ArgusOrchestrator:
         if ibit_config.get('enabled', True):
             self.detectors['ibit'] = IBITDetector(ibit_config, self.db, symbol='IBIT')
             self.detectors['ibit'].attach_bus(self.event_bus)
+            _register(self.detectors['ibit'])
             # Wire up Telegram for paper trade notifications
             self.detectors['ibit'].set_telegram_callback(self._send_paper_notification)
             # Wire up farm if available and NOT in collector mode
@@ -490,6 +609,7 @@ class ArgusOrchestrator:
         if bito_config.get('enabled', True):
             self.detectors['bito'] = IBITDetector(bito_config, self.db, symbol='BITO')
             self.detectors['bito'].attach_bus(self.event_bus)
+            _register(self.detectors['bito'])
             self.detectors['bito'].set_telegram_callback(self._send_paper_notification)
             # Wire up farm if available and NOT in collector mode
             if self.paper_trader_farm and not is_collector:
@@ -921,6 +1041,9 @@ class ArgusOrchestrator:
         )
         
         if 'volatility' in self.detectors:
+            self._note_detector_activity(
+                self.detectors['volatility'].name, kind="metric"
+            )
             await self.detectors['volatility'].analyze(data)
     
     async def _on_yahoo_update(self, data: Dict) -> None:
@@ -930,10 +1053,16 @@ class ArgusOrchestrator:
             return
         data['source'] = 'yahoo'
         if symbol == 'IBIT' and 'ibit' in self.detectors:
+            self._note_detector_activity(
+                self.detectors['ibit'].name, kind="metric"
+            )
             detection = await self.detectors['ibit'].analyze(data)
             if detection:
                 await self._send_alert(detection)
         elif symbol == 'BITO' and 'bito' in self.detectors:
+            self._note_detector_activity(
+                self.detectors['bito'].name, kind="metric"
+            )
             detection = await self.detectors['bito'].analyze(data)
             if detection:
                 await self._send_alert(detection)
@@ -1031,6 +1160,9 @@ class ArgusOrchestrator:
                     if data:
                         # Feed to options IV detector
                         if 'options_iv' in self.detectors:
+                            self._note_detector_activity(
+                                self.detectors['options_iv'].name, kind="metric"
+                            )
                             detection = await self.detectors['options_iv'].analyze(data)
                             if detection:
                                 await self._send_alert(detection)
@@ -1040,6 +1172,7 @@ class ArgusOrchestrator:
                             for key in ('ibit', 'bito'):
                                 detector = self.detectors.get(key)
                                 if detector:
+                                    self._note_detector_activity(detector.name, kind="metric")
                                     detector.update_btc_iv(data.get('atm_iv', 0))
                             
             except Exception as e:
@@ -1629,6 +1762,11 @@ class ArgusOrchestrator:
                 self.logger.warning(f"Status snapshot providers error: {e}")
                 snapshot['providers'] = {'error': str(e)}
             try:
+                snapshot['detectors'] = await self._get_detector_statuses()
+            except Exception as e:
+                self.logger.warning(f"Status snapshot detectors error: {e}")
+                snapshot['detectors'] = {'error': str(e)}
+            try:
                 if self.query_layer:
                     status_v2 = await self.query_layer.status()
                     snapshot['internal'] = status_v2.get('internal', {})
@@ -1713,6 +1851,8 @@ class ArgusOrchestrator:
                 "internal": self._get_snapshot_section("internal") or {},
                 "bus": self._get_snapshot_section("bus") or {},
                 "db": self._get_snapshot_section("db") or {},
+                "providers": self._get_snapshot_section("providers") or {},
+                "detectors": self._get_snapshot_section("detectors") or {},
             }
             return {**cached, **extra}
         await self._refresh_status_snapshot(force=True)
@@ -1721,54 +1861,18 @@ class ArgusOrchestrator:
             "internal": self._status_snapshot.get("internal", {}),
             "bus": self._status_snapshot.get("bus", {}),
             "db": self._status_snapshot.get("db", {}),
+            "providers": self._status_snapshot.get("providers", {}),
+            "detectors": self._status_snapshot.get("detectors", {}),
         }
         return {**system, **extra}
 
     async def _get_provider_statuses(self) -> Dict[str, Any]:
-        """Provider health for dashboard, dynamically pulling from connectors."""
-        result: Dict[str, Any] = {}
-        providers = {
-            'bybit': self.bybit_ws,
-            'deribit': self.deribit_client,
-            'yahoo': self.yahoo_client,
-            'binance': None,
-            'okx': None,
-            'coinglass': None,
-            'coinbase': None,
-            'ibit_options': None,
-        }
-        provider_types = {
-            'bybit': 'ws',
-            'binance': 'ws',
-            'deribit': 'rest',
-            'yahoo': 'rest',
-            'okx': 'rest',
-            'coinglass': 'rest',
-            'coinbase': 'rest',
-            'ibit_options': 'batch',
-        }
-        from .core.status import build_status
-        for name, client in providers.items():
-            if not client:
-                result[name] = build_status(
-                    name=name,
-                    type=provider_types.get(name, 'rest'),
-                    status='unknown',
-                    last_error='not_configured',
-                    extras={'configured': False},
-                )
-                continue
-            if hasattr(client, 'get_health_status'):
-                result[name] = client.get_health_status()
-            elif hasattr(client, 'get_health'):
-                result[name] = client.get_health()
-            else:
-                result[name] = build_status(
-                    name=name,
-                    type=provider_types.get(name, 'rest'),
-                    status='ok' if getattr(client, 'is_connected', True) else 'down',
-                )
-        return result
+        """Provider health for dashboard using the activity tracker."""
+        return self._activity_tracker.get_provider_statuses()
+
+    async def _get_detector_statuses(self) -> Dict[str, Any]:
+        """Detector activity status for dashboard."""
+        return self._activity_tracker.get_detector_statuses()
 
     async def _compute_pnl_summary(self) -> Dict:
         """Compute P&L summary without cached shortcut."""
@@ -1964,19 +2068,17 @@ class ArgusOrchestrator:
 
     async def _get_soak_summary(self) -> Dict[str, Any]:
         """Build the soak summary for /debug/soak endpoint."""
-        connectors_map: Dict[str, Any] = {
-            "bybit": self.bybit_ws,
-            "deribit": self.deribit_client,
-            "yahoo": self.yahoo_client,
-        }
         return build_soak_summary(
             bus=self.event_bus,
             bar_builder=self.bar_builder,
             persistence=self.persistence,
+            feature_builder=self.feature_builder,
+            regime_detector=self.regime_detector,
             resource_monitor=self.resource_monitor,
             guardian=self.soak_guardian,
             tape_recorder=self.tape_recorder,
-            connectors=connectors_map,
+            providers=self._activity_tracker.get_provider_statuses(),
+            detectors=self._activity_tracker.get_detector_statuses(),
             polymarket_gamma=getattr(self, 'polymarket_gamma', None),
             polymarket_clob=getattr(self, 'polymarket_clob', None),
             polymarket_watchlist=getattr(self, 'polymarket_watchlist', None),

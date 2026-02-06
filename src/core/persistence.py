@@ -38,7 +38,7 @@ import logging
 import os
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -77,6 +77,10 @@ _PAUSE_ON_SPOOL_FULL = True       # Pause ingestion when spool full (safe failur
 _RESUME_THRESHOLD_PCT = 80.0      # Resume when spool below this % of max
 _PAUSE_LOG_INTERVAL = 60.0        # Rate-limit pause log messages (seconds)
 _PERSIST_LAG_MAX_AGE_SECONDS = 300.0  # Ignore bar timestamps older than this
+_PERSIST_LAG_MAX_FUTURE_SKEW_SECONDS = 2.0  # Clamp if timestamp too far in future
+_SOURCE_TS_LOG_INTERVAL_SECONDS = 60.0
+_SOURCE_TS_SYMBOL_MAX = 200
+_SOURCE_TS_LOG_SYMBOL_MAX = 200
 
 _CRYPTO_SOURCES = {"bybit", "binance", "coinbase", "okx"}
 _DERIBIT_SOURCES = {"deribit"}
@@ -124,28 +128,23 @@ def _classify_bar_source(bar: BarEvent) -> Optional[str]:
     return _infer_source_class_from_symbol(getattr(bar, "symbol", None))
 
 
-def _extract_source_ts(bar: BarEvent, now: float) -> Optional[float]:
+def _select_source_ts(bar: BarEvent) -> Optional[float]:
     last_source_ts = getattr(bar, "last_source_ts", 0.0)
-    source_ts = last_source_ts if _ts_sane(last_source_ts) else getattr(bar, "source_ts", 0.0)
-    if not source_ts or source_ts <= 0:
-        return None
-    if not _ts_sane(source_ts):
-        logger.warning(
-            "Ignoring bar source_ts with unexpected units: %r (symbol=%s)",
-            source_ts,
-            getattr(bar, "symbol", "unknown"),
-        )
-        return None
-    age_seconds = now - source_ts
-    if age_seconds < 0 or age_seconds > _PERSIST_LAG_MAX_AGE_SECONDS:
-        logger.warning(
-            "Ignoring bar source_ts outside lag window: %r age=%.1fs (symbol=%s)",
-            source_ts,
-            age_seconds,
-            getattr(bar, "symbol", "unknown"),
-        )
-        return None
-    return source_ts
+    first_source_ts = getattr(bar, "first_source_ts", 0.0)
+    bar_source_ts = getattr(bar, "source_ts", 0.0)
+    if _ts_sane(last_source_ts):
+        return last_source_ts
+    if _ts_sane(first_source_ts):
+        return first_source_ts
+    if _ts_sane(bar_source_ts):
+        return bar_source_ts
+    if last_source_ts > 0:
+        return last_source_ts
+    if first_source_ts > 0:
+        return first_source_ts
+    if bar_source_ts > 0:
+        return bar_source_ts
+    return None
 
 
 def _compute_persist_lag_ms(source_ts_values: List[float], now: float) -> Optional[float]:
@@ -247,6 +246,15 @@ class PersistenceManager:
         self._persist_lag_crypto_ema: Optional[float] = None
         self._persist_lag_deribit_ema: Optional[float] = None
         self._persist_lag_equities_ema: Optional[float] = None
+        self._source_ts_future_clamped_total: int = 0
+        self._source_ts_stale_ignored_total: int = 0
+        self._source_ts_units_discarded_total: int = 0
+        self._source_ts_missing_total: int = 0
+        self._source_ts_future_clamped_by_symbol: "OrderedDict[str, int]" = OrderedDict()
+        self._source_ts_stale_ignored_by_symbol: "OrderedDict[str, int]" = OrderedDict()
+        self._source_ts_units_discarded_by_symbol: "OrderedDict[str, int]" = OrderedDict()
+        self._source_ts_missing_by_symbol: "OrderedDict[str, int]" = OrderedDict()
+        self._source_ts_future_log_ts_by_symbol: "OrderedDict[str, float]" = OrderedDict()
 
         # Recover spool from previous crash (if any)
         self._recover_spool()
@@ -519,6 +527,85 @@ class PersistenceManager:
                     rejected,
                 )
 
+    def _increment_symbol_counter(
+        self, store: "OrderedDict[str, int]", symbol: str
+    ) -> None:
+        if not symbol:
+            symbol = "unknown"
+        if symbol in store:
+            store[symbol] += 1
+            store.move_to_end(symbol)
+            return
+        if len(store) >= _SOURCE_TS_SYMBOL_MAX:
+            store.popitem(last=False)
+        store[symbol] = 1
+
+    def _record_future_log_ts(self, symbol: str, now: float) -> None:
+        if not symbol:
+            symbol = "unknown"
+        store = self._source_ts_future_log_ts_by_symbol
+        if symbol in store:
+            store[symbol] = now
+            store.move_to_end(symbol)
+            return
+        if len(store) >= _SOURCE_TS_LOG_SYMBOL_MAX:
+            store.popitem(last=False)
+        store[symbol] = now
+
+    def _extract_source_ts_for_lag(
+        self, bar: BarEvent, now: float
+    ) -> Optional[float]:
+        symbol = getattr(bar, "symbol", "unknown")
+        source_ts = _select_source_ts(bar)
+        if source_ts is None or source_ts <= 0:
+            with self._status_lock:
+                self._source_ts_missing_total += 1
+                self._increment_symbol_counter(
+                    self._source_ts_missing_by_symbol, symbol
+                )
+            return None
+        if not _ts_sane(source_ts):
+            with self._status_lock:
+                self._source_ts_units_discarded_total += 1
+                self._increment_symbol_counter(
+                    self._source_ts_units_discarded_by_symbol, symbol
+                )
+            logger.warning(
+                "Ignoring bar source_ts with units mismatch: %r (symbol=%s)",
+                source_ts,
+                symbol,
+            )
+            return None
+        if source_ts > (now + _PERSIST_LAG_MAX_FUTURE_SKEW_SECONDS):
+            with self._status_lock:
+                self._source_ts_future_clamped_total += 1
+                self._increment_symbol_counter(
+                    self._source_ts_future_clamped_by_symbol, symbol
+                )
+                last_log = self._source_ts_future_log_ts_by_symbol.get(symbol, 0.0)
+                if (now - last_log) >= _SOURCE_TS_LOG_INTERVAL_SECONDS:
+                    self._record_future_log_ts(symbol, now)
+                    logger.info(
+                        "Clamped future bar source_ts for %s: %.3f > now+%.1fs",
+                        symbol,
+                        source_ts,
+                        _PERSIST_LAG_MAX_FUTURE_SKEW_SECONDS,
+                    )
+            return now
+
+        age_seconds = now - source_ts
+        if age_seconds < 0:
+            return now
+        if age_seconds > _PERSIST_LAG_MAX_AGE_SECONDS:
+            with self._status_lock:
+                self._source_ts_stale_ignored_total += 1
+                self._increment_symbol_counter(
+                    self._source_ts_stale_ignored_by_symbol, symbol
+                )
+            return None
+
+        return source_ts
+
     @property
     def ingestion_paused(self) -> bool:
         """Whether bar ingestion is currently paused (thread-safe read)."""
@@ -676,7 +763,7 @@ class PersistenceManager:
                 _EQUITIES_LAG_CLASS: [],
             }
             for b in batch:
-                source_ts = _extract_source_ts(b, now)
+                source_ts = self._extract_source_ts_for_lag(b, now)
                 if source_ts is None:
                     continue
                 source_ts_values.append(source_ts)
@@ -869,6 +956,10 @@ class PersistenceManager:
             persist_lag_crypto = self._persist_lag_crypto_ema
             persist_lag_deribit = self._persist_lag_deribit_ema
             persist_lag_equities = self._persist_lag_equities_ema
+            source_ts_future_clamped_total = self._source_ts_future_clamped_total
+            source_ts_stale_ignored_total = self._source_ts_stale_ignored_total
+            source_ts_units_discarded_total = self._source_ts_units_discarded_total
+            source_ts_missing_total = self._source_ts_missing_total
 
         health = "ok"
         if self._consecutive_failures > 0:
@@ -913,6 +1004,10 @@ class PersistenceManager:
                 "persist_lag_equities_ema_ms": (
                     round(persist_lag_equities, 1) if persist_lag_equities is not None else None
                 ),
+                "source_ts_future_clamped_total": source_ts_future_clamped_total,
+                "source_ts_stale_ignored_total": source_ts_stale_ignored_total,
+                "source_ts_units_discarded_total": source_ts_units_discarded_total,
+                "source_ts_missing_total": source_ts_missing_total,
                 "spool_active": spool_active,
                 "spool_bars_pending": spool_bars_pending,
                 "ingestion_paused": ingestion_paused,
@@ -949,6 +1044,14 @@ class PersistenceManager:
             persist_lag_crypto = self._persist_lag_crypto_ema
             persist_lag_deribit = self._persist_lag_deribit_ema
             persist_lag_equities = self._persist_lag_equities_ema
+            source_ts_future_clamped_total = self._source_ts_future_clamped_total
+            source_ts_stale_ignored_total = self._source_ts_stale_ignored_total
+            source_ts_units_discarded_total = self._source_ts_units_discarded_total
+            source_ts_missing_total = self._source_ts_missing_total
+            source_ts_future_clamped_by_symbol = dict(self._source_ts_future_clamped_by_symbol)
+            source_ts_stale_ignored_by_symbol = dict(self._source_ts_stale_ignored_by_symbol)
+            source_ts_units_discarded_by_symbol = dict(self._source_ts_units_discarded_by_symbol)
+            source_ts_missing_by_symbol = dict(self._source_ts_missing_by_symbol)
             signals_dropped_total = self._signals_dropped_total
             metrics_dropped_total = self._metrics_dropped_total
             heartbeats_dropped_total = self._heartbeats_dropped_total
@@ -1014,6 +1117,14 @@ class PersistenceManager:
                 "persist_lag_equities_ema_ms": (
                     round(persist_lag_equities, 1) if persist_lag_equities is not None else None
                 ),
+                "source_ts_future_clamped_total": source_ts_future_clamped_total,
+                "source_ts_stale_ignored_total": source_ts_stale_ignored_total,
+                "source_ts_units_discarded_total": source_ts_units_discarded_total,
+                "source_ts_missing_total": source_ts_missing_total,
+                "source_ts_future_clamped_by_symbol": source_ts_future_clamped_by_symbol,
+                "source_ts_stale_ignored_by_symbol": source_ts_stale_ignored_by_symbol,
+                "source_ts_units_discarded_by_symbol": source_ts_units_discarded_by_symbol,
+                "source_ts_missing_by_symbol": source_ts_missing_by_symbol,
                 # Spool metrics
                 "spool_active": spool_active,
                 "spool_bars_pending": spool_bars_pending,
