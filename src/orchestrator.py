@@ -2083,6 +2083,7 @@ class ArgusOrchestrator:
             polymarket_gamma=getattr(self, 'polymarket_gamma', None),
             polymarket_clob=getattr(self, 'polymarket_clob', None),
             polymarket_watchlist=getattr(self, 'polymarket_watchlist', None),
+            bybit_ws=self.bybit_ws,
         )
 
     async def _send_soak_alert(

@@ -233,6 +233,44 @@ class TestSourceTimestampPolicy:
             bus.stop()
 
 
+class TestInvalidPriceQuotes:
+    def test_invalid_bid_ask_is_rejected(self):
+        bus = EventBus()
+        emitted = []
+        bus.subscribe(TOPIC_MARKET_BARS, lambda bar: emitted.append(bar))
+        bb = BarBuilder(bus)
+        bus.start()
+
+        try:
+            base = 1_700_000_000.0
+            minute0 = _minute_floor(base)
+
+            bad_quote = QuoteEvent(
+                symbol="BTC",
+                bid=0.0,
+                ask=0.0,
+                mid=0.0,
+                last=0.0,
+                timestamp=minute0 + 1,
+                source="test",
+                volume_24h=1000.0,
+                source_ts=minute0 + 1,
+                event_ts=minute0 + 1,
+                receive_time=minute0 + 1,
+            )
+            bb._on_quote(bad_quote)
+            _drain(bus)
+
+            assert not emitted
+            assert "BTC" not in bb._bars
+            status = bb.get_status()
+            extras = status["extras"]
+            assert extras["quotes_rejected_invalid_price_total"] == 1
+            assert extras["quotes_rejected_invalid_price_by_symbol"]["BTC"] == 1
+        finally:
+            bus.stop()
+
+
 class TestLateTickReset:
     def test_late_ticks_reset_between_bars(self):
         bus = EventBus()

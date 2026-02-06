@@ -27,6 +27,7 @@ def build_soak_summary(
     polymarket_gamma=None,
     polymarket_clob=None,
     polymarket_watchlist=None,
+    bybit_ws=None,
 ) -> Dict[str, Any]:
     """Build a single-payload soak summary.
 
@@ -131,6 +132,12 @@ def build_soak_summary(
             summary["data_integrity"] = {
                 "quotes_rejected_total": extras.get("quotes_rejected_total", 0),
                 "quotes_rejected_by_symbol": extras.get("quotes_rejected_by_symbol", {}),
+                "quotes_rejected_invalid_price_total": extras.get(
+                    "quotes_rejected_invalid_price_total", 0
+                ),
+                "quotes_rejected_invalid_price_by_symbol": extras.get(
+                    "quotes_rejected_invalid_price_by_symbol", {}
+                ),
                 "late_ticks_dropped_total": extras.get("late_ticks_dropped_total", 0),
                 "late_ticks_dropped_by_symbol": extras.get("late_ticks_dropped_by_symbol", {}),
                 "bars_emitted_total": extras.get("bars_emitted_total", 0),
@@ -144,6 +151,25 @@ def build_soak_summary(
             }
         except Exception as e:
             summary["data_integrity"] = {"error": str(e)}
+    if bybit_ws:
+        try:
+            bybit_status = bybit_ws.get_health_status()
+            bybit_extras = bybit_status.get("extras", {})
+            data_integrity = summary.setdefault("data_integrity", {})
+            data_integrity.update(
+                {
+                    "bybit_invalid_quotes_total": bybit_extras.get("quotes_invalid_total", 0),
+                    "invalid_quotes_by_reason": _top_n(
+                        bybit_extras.get("quotes_invalid_by_reason", {}),
+                    ),
+                    "invalid_quotes_by_symbol": _top_n(
+                        bybit_extras.get("quotes_invalid_by_symbol", {}),
+                    ),
+                }
+            )
+        except Exception as e:
+            data_integrity = summary.setdefault("data_integrity", {})
+            data_integrity["bybit_invalid_quotes_error"] = str(e)
 
     # 5) Polymarket telemetry
     poly: Dict[str, Any] = {}
@@ -194,3 +220,10 @@ def build_soak_summary(
             summary["tape"] = {"error": str(e)}
 
     return summary
+
+
+def _top_n(counter: Dict[str, int], n: int = 10) -> Dict[str, int]:
+    if not counter:
+        return {}
+    items = sorted(counter.items(), key=lambda kv: kv[1], reverse=True)
+    return {k: v for k, v in items[:n]}

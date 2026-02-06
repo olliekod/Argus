@@ -154,9 +154,23 @@ def _print_summary(data: dict) -> None:
         print("  DATA INTEGRITY")
         print(f"    bars_emitted_total: {di.get('bars_emitted_total', 0)}")
         print(f"    quotes_rejected_total: {di.get('quotes_rejected_total', 0)}")
+        print(
+            "    quotes_rejected_invalid_price_total: "
+            f"{di.get('quotes_rejected_invalid_price_total', 0)}"
+        )
         rejected = di.get("quotes_rejected_by_symbol", {})
         if rejected:
             print(f"      by_symbol: {rejected}")
+        invalid_price = di.get("quotes_rejected_invalid_price_by_symbol", {})
+        if invalid_price:
+            print(f"      invalid_price_by_symbol: {invalid_price}")
+        print(f"    bybit_invalid_quotes_total: {di.get('bybit_invalid_quotes_total', 0)}")
+        invalid_reasons = di.get("invalid_quotes_by_reason", {})
+        if invalid_reasons:
+            print(f"      invalid_by_reason: {invalid_reasons}")
+        invalid_symbols = di.get("invalid_quotes_by_symbol", {})
+        if invalid_symbols:
+            print(f"      invalid_by_symbol: {invalid_symbols}")
         print(f"    late_ticks_dropped_total: {di.get('late_ticks_dropped_total', 0)}")
         print(f"    bar_invariant_violations: {di.get('bar_invariant_violations', 0)}")
         # Rolling bars/minute

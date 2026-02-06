@@ -50,7 +50,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from datetime import datetime, timezone
 from typing import Deque, Dict
 
@@ -150,6 +150,9 @@ class BarBuilder:
         self._invariant_violation_count = 0
         self._quotes_rejected_total = 0
         self._quotes_rejected_by_symbol: Dict[str, int] = {}
+        self._quotes_rejected_invalid_price_total = 0
+        self._quotes_rejected_invalid_price_by_symbol: "OrderedDict[str, int]" = OrderedDict()
+        self._quotes_rejected_invalid_price_cap = 100
         self._start_time = time.time()
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
         bus.subscribe(TOPIC_SYSTEM_MINUTE_TICK, self._on_minute_tick)
@@ -217,6 +220,13 @@ class BarBuilder:
                     event,
                     f"source_ts={event.source_ts:.0f} outside sane range",
                 )
+            return
+
+        if event.bid <= 0 or event.ask <= 0:
+            self._reject_invalid_price(event, "non-positive bid/ask")
+            return
+        if event.bid > event.ask:
+            self._reject_invalid_price(event, "crossed bid/ask")
             return
 
         ts = event.timestamp
@@ -400,6 +410,7 @@ class BarBuilder:
                 "bar_invariant_violations": self._invariant_violation_count,
                 "invariant_violation_count": self._invariant_violation_count,
                 "quotes_rejected_total": self._quotes_rejected_total,
+                "quotes_rejected_invalid_price_total": self._quotes_rejected_invalid_price_total,
             },
         )
         self._bus.publish(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, hb)
@@ -481,6 +492,10 @@ class BarBuilder:
                 "quotes_received_by_symbol": quotes_received_by_symbol,
                 "quotes_rejected_total": self._quotes_rejected_total,
                 "quotes_rejected_by_symbol": dict(self._quotes_rejected_by_symbol),
+                "quotes_rejected_invalid_price_total": self._quotes_rejected_invalid_price_total,
+                "quotes_rejected_invalid_price_by_symbol": dict(
+                    self._quotes_rejected_invalid_price_by_symbol
+                ),
                 "active_symbols_count": len(active_symbols),
                 "bar_invariant_violations": invariant_violations,
                 "invariant_violation_count": invariant_violations,
@@ -501,3 +516,36 @@ class BarBuilder:
             event.timestamp,
             event.source_ts,
         )
+
+    def _reject_invalid_price(self, event: QuoteEvent, reason: str) -> None:
+        self._quotes_rejected_invalid_price_total += 1
+        self._bump_bounded_counter(
+            self._quotes_rejected_invalid_price_by_symbol,
+            event.symbol,
+            self._quotes_rejected_invalid_price_cap,
+        )
+        logger.warning(
+            "Rejected quote for %s [connector=%s]: %s "
+            "(bid=%r, ask=%r, timestamp=%r, source_ts=%r)",
+            event.symbol,
+            event.source,
+            reason,
+            event.bid,
+            event.ask,
+            event.timestamp,
+            event.source_ts,
+        )
+
+    @staticmethod
+    def _bump_bounded_counter(
+        store: "OrderedDict[str, int]",
+        key: str,
+        cap: int,
+    ) -> None:
+        if key in store:
+            store[key] += 1
+            store.move_to_end(key)
+            return
+        if len(store) >= cap:
+            store.popitem(last=False)
+        store[key] = 1
