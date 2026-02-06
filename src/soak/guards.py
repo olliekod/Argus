@@ -96,7 +96,24 @@ class SoakGuardian:
         config: Optional[Dict[str, Any]] = None,
         alert_callback: Optional[Callable] = None,
     ) -> None:
-        self._cfg = {**_DEFAULTS, **(config or {})}
+        raw_cfg = config or {}
+        self._cfg = {**_DEFAULTS, **raw_cfg}
+        persist_cfg = raw_cfg.get("persist_lag", {}) if isinstance(raw_cfg, dict) else {}
+        if isinstance(persist_cfg, dict) and persist_cfg:
+            use_crypto_only = persist_cfg.get("use_crypto_only")
+            if use_crypto_only is True:
+                self._cfg["persist_lag_crypto_enabled"] = True
+                self._cfg["persist_lag_deribit_enabled"] = False
+                self._cfg["persist_lag_equities_enabled"] = False
+            elif use_crypto_only is False:
+                if "deribit_enabled" in persist_cfg:
+                    self._cfg["persist_lag_deribit_enabled"] = bool(
+                        persist_cfg.get("deribit_enabled")
+                    )
+                if "equities_enabled" in persist_cfg:
+                    self._cfg["persist_lag_equities_enabled"] = bool(
+                        persist_cfg.get("equities_enabled")
+                    )
         self._alert_cb = alert_callback
         self._lock = threading.Lock()
 

@@ -209,6 +209,10 @@ soak:
     persist_lag_p95_warn_ms: 5000
     persist_lag_p95_alert_ms: 15000
     persist_lag_sustained_s: 60
+    persist_lag:
+      use_crypto_only: true
+      deribit_enabled: false
+      equities_enabled: false
 
     # Bar flush failures
     bar_flush_failure_threshold: 1

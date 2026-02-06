@@ -52,6 +52,10 @@ button:hover{background:#1a4a8a}
 <div id="providers">Loading...</div>
 </div>
 <div class="card">
+<h2>Detectors</h2>
+<div id="detectors">Loading...</div>
+</div>
+<div class="card">
 <h2>Internal</h2>
 <div id="internal">Loading...</div>
 </div>
@@ -88,16 +92,23 @@ async function load(){
       '<div><span class="label">Boot phases:</span></div>'+
       '<pre>'+(s.boot_phases||'N/A')+'</pre>';
     // Providers
-    let p=d.providers||{};let ph='<table><tr><th>Provider</th><th>Status</th><th>Age</th><th>Failures</th><th>Latency</th></tr>';
-    for(let k in p){let v=p[k]||{};let status=v.status||(v.connected?'ok':'unknown');
-      let cls=(status==='ok')?'ok':(status==='degraded'?'warn':'err');
-      let age=(v.staleness&&v.staleness.age_seconds!=null)?v.staleness.age_seconds:(v.seconds_since_last_message||'-');
-      let failures=v.consecutive_failures||0;
-      let latency='-';
-      if(v.timing&&v.timing.avg_latency_ms!=null){latency=v.timing.avg_latency_ms.toFixed(1)+'ms';}
-      else if(v.timing&&v.timing.last_latency_ms!=null){latency=v.timing.last_latency_ms.toFixed(1)+'ms';}
-      ph+='<tr><td>'+k+'</td><td class="'+cls+'">'+status+'</td><td>'+age+'</td><td>'+failures+'</td><td>'+latency+'</td></tr>';}
+    let p=d.providers||{};let ph='<table><tr><th>Provider</th><th>Health</th><th>Age(s)</th><th>Counters</th></tr>';
+    for(let k in p){let v=p[k]||{};let status=v.health||'unknown';
+      let cls=(status==='ok')?'ok':(status==='warn'?'warn':(status==='alert'?'err':'warn'));
+      let age=(v.last_msg_age_s!=null)?v.last_msg_age_s:'-';
+      let counters=v.counters||{};
+      let counts='msgs '+(counters.messages_total||0)+' / q '+(counters.quotes_total||0)+' / b '+(counters.bars_total||0)+' / m '+(counters.metrics_total||0);
+      ph+='<tr><td>'+k+'</td><td class="'+cls+'">'+status.toUpperCase()+'</td><td>'+age+'</td><td>'+counts+'</td></tr>';}
     ph+='</table>';document.getElementById('providers').innerHTML=ph;
+    // Detectors
+    let det=d.detectors||{};let dh='<table><tr><th>Detector</th><th>Health</th><th>Age(s)</th><th>Counters</th></tr>';
+    for(let k in det){let v=det[k]||{};let status=v.health||'unknown';
+      let cls=(status==='ok')?'ok':(status==='warn'?'warn':(status==='alert'?'err':'warn'));
+      let age=(v.last_event_age_s!=null)?v.last_event_age_s:'-';
+      let counters=v.counters||{};
+      let counts='events '+(counters.events_total||0)+' / bars '+(counters.bars_total||0)+' / metrics '+(counters.metrics_total||0)+' / signals '+(counters.signals_total||0);
+      dh+='<tr><td>'+k+'</td><td class="'+cls+'">'+status.toUpperCase()+'</td><td>'+age+'</td><td>'+counts+'</td></tr>';}
+    dh+='</table>';document.getElementById('detectors').innerHTML=dh;
     // Internal
     let i=d.internal||{};let ih='<table><tr><th>Component</th><th>Status</th><th>Age</th><th>Details</th></tr>';
     for(let k in i){let v=i[k]||{};let status=v.status||'unknown';
@@ -235,8 +246,8 @@ class ArgusWebDashboard:
                     system['error'] = str(e)
             result['system'] = system
 
-            # Providers
-            if self._get_providers:
+            # Providers (prefer canonical snapshot)
+            if "providers" not in result and self._get_providers:
                 try:
                     result['providers'] = await self._get_providers()
                 except Exception as e:

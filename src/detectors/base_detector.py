@@ -56,6 +56,7 @@ class BaseDetector(ABC):
 
         # Event bus reference (set by attach_bus)
         self._event_bus = None
+        self._activity_callback = None
 
     # ── bus wiring ──────────────────────────────────────────
 
@@ -65,8 +66,14 @@ class BaseDetector(ABC):
         bus.subscribe(TOPIC_MARKET_BARS, self._bus_on_bar)
         self.logger.info("Attached to event bus (market.bars)")
 
+    def set_activity_callback(self, callback) -> None:
+        """Provide a callback for activity tracking (detector_name, event_ts, kind)."""
+        self._activity_callback = callback
+
     def _bus_on_bar(self, event: BarEvent) -> None:
         """Internal handler invoked by the bus worker thread."""
+        if self._activity_callback:
+            self._activity_callback(self.name, event.event_ts, "bar")
         try:
             self.on_bar(event)
         except Exception:

@@ -117,6 +117,7 @@ def test_persist_lag_ignores_ms_source_ts():
             status = pm.get_status()
 
             assert status["extras"]["persist_lag_ms"] is None
+            assert status["extras"]["source_ts_units_discarded_total"] == 1
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)
@@ -149,6 +150,7 @@ def test_persist_lag_ema_ignores_stale_then_updates():
             pm._do_flush()
             status = pm.get_status()
             assert status["extras"]["persist_lag_ema_ms"] is None
+            assert status["extras"]["source_ts_stale_ignored_total"] == 1
 
             fresh_bar = BarEvent(
                 symbol="BTC",
@@ -169,6 +171,75 @@ def test_persist_lag_ema_ignores_stale_then_updates():
             status = pm.get_status()
             assert status["extras"]["persist_lag_ema_ms"] is not None
             assert status["extras"]["persist_lag_ema_ms"] < 2_000
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+
+
+def test_persist_lag_future_ts_clamps_to_now():
+    loop = asyncio.new_event_loop()
+    thread = _start_loop(loop)
+
+    try:
+        bus = EventBus()
+        with tempfile.TemporaryDirectory() as td:
+            pm = PersistenceManager(bus, _DummyDB(), loop, spool_dir=td)
+            now = time.time()
+            bar = BarEvent(
+                symbol="BTCUSDT",
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=10.0,
+                timestamp=now,
+                source="bybit",
+                bar_duration=60,
+                tick_count=1,
+                source_ts=now + 10.0,
+                last_source_ts=now + 10.0,
+            )
+            pm._on_bar(bar)
+            pm._do_flush()
+            status = pm.get_status()
+
+            assert status["extras"]["source_ts_future_clamped_total"] == 1
+            assert status["extras"]["persist_lag_ema_ms"] is not None
+            assert status["extras"]["persist_lag_ema_ms"] <= 5.0
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+
+
+def test_persist_lag_future_within_skew_not_clamped():
+    loop = asyncio.new_event_loop()
+    thread = _start_loop(loop)
+
+    try:
+        bus = EventBus()
+        with tempfile.TemporaryDirectory() as td:
+            pm = PersistenceManager(bus, _DummyDB(), loop, spool_dir=td)
+            now = time.time()
+            bar = BarEvent(
+                symbol="BTCUSDT",
+                open=100.0,
+                high=101.0,
+                low=99.0,
+                close=100.5,
+                volume=10.0,
+                timestamp=now,
+                source="bybit",
+                bar_duration=60,
+                tick_count=1,
+                source_ts=now + 1.0,
+                last_source_ts=now + 1.0,
+            )
+            pm._on_bar(bar)
+            pm._do_flush()
+            status = pm.get_status()
+
+            assert status["extras"]["source_ts_future_clamped_total"] == 0
+            assert status["extras"]["persist_lag_ema_ms"] is not None
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)

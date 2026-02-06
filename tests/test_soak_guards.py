@@ -235,6 +235,23 @@ class TestPersistLagGuard:
         )
         assert not any(a["guard"] == "persist_lag" for a in alerts)
 
+    def test_use_crypto_only_config_disables_deribit(self):
+        g = SoakGuardian(config={
+            "alert_cooldown_s": 0,
+            "persist_lag_sustained_s": 0,
+            "persist_lag": {"use_crypto_only": True},
+        })
+        alerts = g.evaluate(
+            bus_stats=_make_bus_stats(),
+            bar_builder_status=_make_bb_status(),
+            persistence_status=_make_persist_status(
+                persist_lag_crypto_ema_ms=500,
+                persist_lag_deribit_ema_ms=50_000,
+            ),
+            resource_snapshot=_make_resource(),
+        )
+        assert not any(a["guard"] == "persist_lag_deribit" for a in alerts)
+
 
 class TestBarLivenessGuard:
     def test_active_bars_ok(self):
