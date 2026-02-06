@@ -12,6 +12,7 @@ import asyncio
 import os
 import signal
 import time
+import traceback
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -181,6 +182,7 @@ class ArgusOrchestrator:
         self.research_enabled = self.research_config.get('enabled', False)
         self.research_alerts_enabled = self.research_config.get('alerts_enabled', False)
         self.research_daily_review_enabled = self.research_config.get('daily_review_enabled', False)
+        self._deribit_traceback_ts = 0.0
 
         # Market session tracking
         self._market_was_open: bool = False
@@ -1042,6 +1044,10 @@ class ArgusOrchestrator:
                             
             except Exception as e:
                 self.logger.error(f"Deribit polling error: {e}")
+                now = time.time()
+                if (now - self._deribit_traceback_ts) >= 60:
+                    self._deribit_traceback_ts = now
+                    self.logger.error("Deribit polling traceback:\n%s", traceback.format_exc())
             
             await asyncio.sleep(interval)
     

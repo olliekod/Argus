@@ -100,7 +100,7 @@ class DeribitClient:
                 self.last_http_status = resp.status
                 data = await resp.json()
                 
-                if 'error' in data:
+                if isinstance(data, dict) and 'error' in data:
                     self.last_error = str(data.get('error'))
                     self.error_count += 1
                     self.consecutive_failures += 1
@@ -158,16 +158,24 @@ class DeribitClient:
             return f"list len={len(data)}"
         return f"{type(data).__name__}"
 
+    @staticmethod
+    def _get_dict(data: Any, context: str) -> Dict[str, Any]:
+        if isinstance(data, dict):
+            return data
+        logger.warning("Deribit %s expected dict but got %s", context, type(data).__name__)
+        return {}
+
     @classmethod
     def _extract_source_ts(cls, data: Any) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[float]]:
         """Extract a source timestamp from a Deribit API response."""
-        if not isinstance(data, dict):
-            return None, "missing", None, None
+        data_dict = cls._get_dict(data, "source_ts")
+        result = data_dict.get("result")
+        result_dict = result if isinstance(result, dict) else {}
         candidates = [
-            ("result.timestamp", data.get("result", {}).get("timestamp")),
-            ("result.creation_timestamp", data.get("result", {}).get("creation_timestamp")),
-            ("usOut", data.get("usOut")),
-            ("usIn", data.get("usIn")),
+            ("result.timestamp", result_dict.get("timestamp")),
+            ("result.creation_timestamp", result_dict.get("creation_timestamp")),
+            ("usOut", data_dict.get("usOut")),
+            ("usIn", data_dict.get("usIn")),
         ]
         for label, raw in candidates:
             source_ts, reason = cls._normalize_source_ts(raw)
@@ -222,9 +230,9 @@ class DeribitClient:
             Ticker data with IV and Greeks or None
         """
         data = await self._request('ticker', {'instrument_name': instrument_name})
-        
-        if 'result' in data:
-            result = data['result']
+        data_dict = self._get_dict(data, "ticker")
+        result = data_dict.get("result")
+        if isinstance(result, dict):
             return {
                 'instrument': instrument_name,
                 'timestamp': datetime.utcnow().isoformat(),
@@ -243,6 +251,11 @@ class DeribitClient:
                 'open_interest': result.get('open_interest'),
                 'volume_24h': result.get('stats', {}).get('volume'),
             }
+        if result is not None and not isinstance(result, dict):
+            logger.warning(
+                "Deribit ticker response unexpected result (%s)",
+                self._describe_payload(result),
+            )
         return None
     
     async def get_book_summary_by_currency(
@@ -269,6 +282,12 @@ class DeribitClient:
         result_items = self._coerce_result_list(data, "book_summary")
         result = []
         for item in result_items:
+            if not isinstance(item, dict):
+                logger.warning(
+                    "Deribit book_summary item unexpected payload (%s)",
+                    self._describe_payload(item),
+                )
+                continue
             result.append({
                 'instrument': item.get('instrument_name'),
                 'currency': currency,
@@ -310,9 +329,23 @@ class DeribitClient:
             'get_instruments',
             {'currency': currency, 'kind': kind, 'expired': str(expired).lower()}
         )
-        
+        data_dict = self._get_dict(data, "instruments")
+        result_items = data_dict.get('result', [])
+        if not isinstance(result_items, list):
+            logger.warning(
+                "Deribit instruments response unexpected result (%s)",
+                self._describe_payload(result_items),
+            )
+            return []
+
         result = []
-        for item in data.get('result', []):
+        for item in result_items:
+            if not isinstance(item, dict):
+                logger.warning(
+                    "Deribit instruments item unexpected payload (%s)",
+                    self._describe_payload(item),
+                )
+                continue
             result.append({
                 'instrument': item.get('instrument_name'),
                 'currency': currency,
