@@ -492,8 +492,11 @@ class BarBuilder:
             self._quotes_rejected_by_symbol.get(event.symbol, 0) + 1
         )
         logger.warning(
-            "Rejected quote for %s (%s): %s",
+            "Rejected quote for %s [connector=%s]: %s "
+            "(timestamp=%r, source_ts=%r)",
             event.symbol,
             event.source,
             reason,
+            event.timestamp,
+            event.source_ts,
         )

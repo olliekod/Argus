@@ -569,30 +569,43 @@ class ArgusOrchestrator:
         )
         
         # Paper Trader Farm with guardrails from config
-        farm_cfg = self.config.get('farm', {})
-        self.paper_trader_farm = PaperTraderFarm(
-            db=self.db,
-            full_coverage=True,
-            starting_balance=float(farm_cfg.get('default_starting_equity', 5000.0)),
-            max_traders=int(farm_cfg.get('max_traders', 2_000_000)),
-            max_open_positions_total=int(farm_cfg.get('max_open_positions_total', 500_000)),
-            max_trades_per_minute=int(farm_cfg.get('max_trades_per_minute', 10_000)),
-        )
-        await self.paper_trader_farm.initialize()
-        
-        # Wire up data sources to paper trader farm
-        self.paper_trader_farm.set_data_sources(
-            get_conditions=self.conditions_monitor.get_current_conditions,
-        )
-        # Wire Telegram callback for runaway safety alerts
-        self.paper_trader_farm.set_telegram_alert_callback(self._send_paper_notification)
-        self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.trader_configs):,} traders")
+        # Skip in collector mode to avoid millions of trader configs and GPU uploads
+        if self.mode == "collector":
+            self.paper_trader_farm = None
+            self.logger.info(
+                "PaperTraderFarm initialization SKIPPED (ARGUS_MODE=collector)"
+            )
+        else:
+            farm_cfg = self.config.get('farm', {})
+            self.paper_trader_farm = PaperTraderFarm(
+                db=self.db,
+                full_coverage=True,
+                starting_balance=float(farm_cfg.get('default_starting_equity', 5000.0)),
+                max_traders=int(farm_cfg.get('max_traders', 2_000_000)),
+                max_open_positions_total=int(farm_cfg.get('max_open_positions_total', 500_000)),
+                max_trades_per_minute=int(farm_cfg.get('max_trades_per_minute', 10_000)),
+            )
+            await self.paper_trader_farm.initialize()
 
-        # Wire up data sources to daily review (after farm is ready)
+            # Wire up data sources to paper trader farm
+            self.paper_trader_farm.set_data_sources(
+                get_conditions=self.conditions_monitor.get_current_conditions,
+            )
+            # Wire Telegram callback for runaway safety alerts
+            self.paper_trader_farm.set_telegram_alert_callback(self._send_paper_notification)
+            self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.trader_configs):,} traders")
+
+        # Wire up data sources to daily review (after farm is ready, if available)
         self.daily_review.set_data_sources(
             get_conditions=self.conditions_monitor.get_current_conditions,
-            get_positions=self.paper_trader_farm.get_positions_for_review,
-            get_trade_stats=self.paper_trader_farm.get_trade_activity_summary,
+            get_positions=(
+                self.paper_trader_farm.get_positions_for_review
+                if self.paper_trader_farm else None
+            ),
+            get_trade_stats=(
+                self.paper_trader_farm.get_trade_activity_summary
+                if self.paper_trader_farm else None
+            ),
             get_gap_risk=self.gap_risk_tracker.get_status if self.gap_risk_tracker else None,
         )
         self.logger.info("Daily Review initialized")

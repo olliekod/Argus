@@ -357,6 +357,7 @@ class DeribitClient:
                     last=index_price,
                     timestamp=now,
                     source='deribit',
+                    source_ts=now,
                 )
                 self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
 
