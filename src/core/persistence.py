@@ -72,6 +72,9 @@ _WRITE_STOP = object()
 _BAR_BUFFER_MAX = 100_000         # Max bars held in memory
 _SPOOL_MAX_BYTES = 1 << 30        # 1 GB max spool file size
 _SPOOL_DRAIN_BATCH = 500          # Bars to drain from spool per flush cycle
+_PAUSE_ON_SPOOL_FULL = True       # Pause ingestion when spool full (safe failure)
+_RESUME_THRESHOLD_PCT = 80.0      # Resume when spool below this % of max
+_PAUSE_LOG_INTERVAL = 60.0        # Rate-limit pause log messages (seconds)
 
 
 class PersistenceManager:
@@ -96,6 +99,9 @@ class PersistenceManager:
         *,
         spool_dir: Optional[str] = None,
         bar_buffer_max: int = _BAR_BUFFER_MAX,
+        spool_max_bytes: int = _SPOOL_MAX_BYTES,
+        pause_on_spool_full: bool = _PAUSE_ON_SPOOL_FULL,
+        resume_threshold_pct: float = _RESUME_THRESHOLD_PCT,
     ) -> None:
         self._bus = bus
         self._db = db
@@ -113,6 +119,7 @@ class PersistenceManager:
         # Disk spool for bar overflow (JSONL append-only file)
         self._spool_dir = Path(spool_dir) if spool_dir else Path("data")
         self._spool_path = self._spool_dir / "bar_spool.jsonl"
+        self._spool_max_bytes: int = spool_max_bytes
         self._spool_active: bool = False
         self._spool_write_handle: Optional[Any] = None
         self._spool_read_offset: int = 0
@@ -120,6 +127,14 @@ class PersistenceManager:
         self._bars_spooled_total: int = 0
         self._spool_write_errors: int = 0
         self._spool_bars_pending: int = 0
+
+        # Safe-pause: pause ingestion when spool full + DB unreachable
+        self._pause_on_spool_full: bool = pause_on_spool_full
+        self._resume_threshold_pct: float = resume_threshold_pct
+        self._ingestion_paused: bool = False
+        self._pause_entered_ts: Optional[float] = None
+        self._bars_rejected_paused: int = 0
+        self._pause_log_ts: Optional[float] = None
 
         # Priority queues: signals (medium) vs metrics/heartbeats (low)
         self._signal_queue: Queue = Queue(maxsize=_SIGNAL_QUEUE_MAXSIZE)
@@ -257,8 +272,13 @@ class PersistenceManager:
             line = json.dumps(asdict(bar), separators=(",", ":")) + "\n"
             line_bytes = len(line.encode("utf-8"))
 
-            if self._spool_bytes_written + line_bytes > _SPOOL_MAX_BYTES:
-                # Spool is full — fall back to in-memory beyond max
+            if self._spool_bytes_written + line_bytes > self._spool_max_bytes:
+                if self._pause_on_spool_full:
+                    # SAFE PAUSE: stop accepting bars instead of OOM risk
+                    self._enter_pause("spool_full")
+                    self._bars_rejected_paused += 1
+                    return
+                # Legacy fallback (pause_on_spool_full=False): unbounded memory
                 self._bar_buffer.append(bar)
                 logger.critical(
                     "Bar spool FULL (%d bytes, %d bars pending). "
@@ -277,9 +297,14 @@ class PersistenceManager:
             self._bars_spooled_total += 1
             self._spool_active = True
         except OSError as e:
-            # Disk write failed — fall back to memory
-            self._bar_buffer.append(bar)
             self._spool_write_errors += 1
+            if self._pause_on_spool_full and self._spool_write_errors >= 3:
+                # Repeated disk failures — pause to prevent OOM
+                self._enter_pause("spool_write_error")
+                self._bars_rejected_paused += 1
+                return
+            # Isolated disk write failure — fall back to memory
+            self._bar_buffer.append(bar)
             logger.error(
                 "Failed to spool bar to disk: %s — kept in memory (buffer=%d)",
                 e, len(self._bar_buffer),
@@ -331,6 +356,9 @@ class PersistenceManager:
                 "Drained %d bars from spool to DB (%d still pending)",
                 len(spool_batch), self._spool_bars_pending,
             )
+            # Successful drain may allow pause recovery
+            if self._ingestion_paused:
+                self._check_pause_recovery()
         except Exception:
             logger.warning(
                 "Failed to drain spool batch (%d bars) — returned to buffer",
@@ -356,11 +384,89 @@ class PersistenceManager:
         self._spool_bars_pending = 0
         logger.info("Bar spool fully drained and cleaned up")
 
+    # ── safe-pause management ─────────────────────────────
+
+    def _enter_pause(self, reason: str) -> None:
+        """Enter the ingestion-paused state.  Called under _bar_lock."""
+        if not self._ingestion_paused:
+            self._ingestion_paused = True
+            self._pause_entered_ts = time.time()
+            self._pause_log_ts = None  # allow immediate first log
+            logger.critical(
+                "INGESTION PAUSED (%s): spool=%d bytes, %d bars pending, "
+                "buffer=%d/%d. DB recovery urgently needed!",
+                reason,
+                self._spool_bytes_written,
+                self._spool_bars_pending,
+                len(self._bar_buffer),
+                self._bar_buffer_max,
+            )
+
+    def _check_pause_recovery(self) -> None:
+        """Resume ingestion if spool has drained below the resume threshold.
+
+        Called after a successful DB write (buffer flush or spool drain).
+        Must NOT hold _bar_lock when called.
+        """
+        with self._bar_lock:
+            if not self._ingestion_paused:
+                return
+
+            threshold_bytes = self._spool_max_bytes * (
+                self._resume_threshold_pct / 100.0
+            )
+            spool_ok = self._spool_bytes_written < threshold_bytes
+            buffer_ok = len(self._bar_buffer) < self._bar_buffer_max
+
+            if spool_ok and buffer_ok:
+                pause_duration = time.time() - (
+                    self._pause_entered_ts or time.time()
+                )
+                rejected = self._bars_rejected_paused
+                self._ingestion_paused = False
+                self._pause_entered_ts = None
+                logger.warning(
+                    "INGESTION RESUMED: spool at %.1f%% (threshold=%.0f%%), "
+                    "buffer=%d/%d. Paused for %.1fs, "
+                    "%d bars rejected during pause.",
+                    (self._spool_bytes_written / max(1, self._spool_max_bytes))
+                    * 100,
+                    self._resume_threshold_pct,
+                    len(self._bar_buffer),
+                    self._bar_buffer_max,
+                    pause_duration,
+                    rejected,
+                )
+
+    @property
+    def ingestion_paused(self) -> bool:
+        """Whether bar ingestion is currently paused (thread-safe read)."""
+        with self._bar_lock:
+            return self._ingestion_paused
+
     # ── handlers (run on bus worker threads) ────────────────
 
     def _on_bar(self, event: BarEvent) -> None:
-        """Buffer bar for batched write. Bounded with disk spool overflow."""
+        """Buffer bar for batched write. Bounded with disk spool overflow.
+
+        When ingestion is paused (spool full + DB unreachable), bars are
+        rejected at this boundary to keep memory bounded.  The paused state
+        is highly visible in health/status and triggers alerts.
+        """
         with self._bar_lock:
+            if self._ingestion_paused:
+                self._bars_rejected_paused += 1
+                now = time.time()
+                if (self._pause_log_ts is None
+                        or now - self._pause_log_ts >= _PAUSE_LOG_INTERVAL):
+                    self._pause_log_ts = now
+                    logger.critical(
+                        "INGESTION PAUSED: bar rejected (total rejected=%d). "
+                        "Spool full + DB unreachable. "
+                        "Waiting for DB recovery.",
+                        self._bars_rejected_paused,
+                    )
+                return
             if self._spool_active or len(self._bar_buffer) >= self._bar_buffer_max:
                 self._spool_bar(event)
             else:
@@ -512,6 +618,10 @@ class PersistenceManager:
             # After successful buffer flush, drain spool if active
             if self._spool_active:
                 self._drain_spool_to_db()
+
+            # Check if we can resume from pause
+            if self._ingestion_paused:
+                self._check_pause_recovery()
         else:
             # All retries failed — return bars to buffer (never drop)
             with self._bar_lock:
@@ -652,6 +762,14 @@ class PersistenceManager:
         if self._db_write_errors > 5:
             health = "down"
 
+        with self._bar_lock:
+            ingestion_paused = self._ingestion_paused
+            bars_rejected_paused = self._bars_rejected_paused
+            spool_active = self._spool_active
+            spool_bars_pending = self._spool_bars_pending
+        if ingestion_paused:
+            health = "down"
+
         hb = ComponentHeartbeatEvent(
             component="persistence",
             uptime_seconds=round(now - self._start_time, 1),
@@ -672,8 +790,10 @@ class PersistenceManager:
                 "signal_queue_depth": self._signal_queue.qsize(),
                 "telemetry_queue_depth": self._telemetry_queue.qsize(),
                 "persist_lag_ema_ms": round(self._persist_lag_ema, 1) if self._persist_lag_ema else None,
-                "spool_active": self._spool_active,
-                "spool_bars_pending": self._spool_bars_pending,
+                "spool_active": spool_active,
+                "spool_bars_pending": spool_bars_pending,
+                "ingestion_paused": ingestion_paused,
+                "bars_rejected_paused": bars_rejected_paused,
             },
         )
         self._bus.publish(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, hb)
@@ -687,6 +807,9 @@ class PersistenceManager:
             spool_bytes_written = self._spool_bytes_written
             bars_spooled_total = self._bars_spooled_total
             spool_write_errors = self._spool_write_errors
+            ingestion_paused = self._ingestion_paused
+            bars_rejected_paused = self._bars_rejected_paused
+            pause_entered_ts = self._pause_entered_ts
         with self._status_lock:
             last_flush_ts = self._last_flush_ts
             last_flush_ms = self._last_flush_ms
@@ -715,6 +838,8 @@ class PersistenceManager:
             status = "degraded"
         if last_write_ts is None:
             status = "unknown"
+        if ingestion_paused:
+            status = "paused"
 
         from .status import build_status
 
@@ -758,7 +883,12 @@ class PersistenceManager:
                 "spool_active": spool_active,
                 "spool_bars_pending": spool_bars_pending,
                 "spool_file_size": spool_bytes_written,
+                "spool_max_bytes": self._spool_max_bytes,
                 "bars_spooled_total": bars_spooled_total,
                 "spool_write_errors": spool_write_errors,
+                # Safe-pause metrics
+                "ingestion_paused": ingestion_paused,
+                "bars_rejected_paused": bars_rejected_paused,
+                "pause_entered_ts": pause_entered_ts,
             },
         )

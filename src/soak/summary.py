@@ -92,8 +92,13 @@ def build_soak_summary(
                 "spool_active": ps.get("extras", {}).get("spool_active", False),
                 "spool_bars_pending": ps.get("extras", {}).get("spool_bars_pending", 0),
                 "spool_file_size": ps.get("extras", {}).get("spool_file_size", 0),
+                "spool_max_bytes": ps.get("extras", {}).get("spool_max_bytes", 0),
                 "bars_spooled_total": ps.get("extras", {}).get("bars_spooled_total", 0),
                 "spool_write_errors": ps.get("extras", {}).get("spool_write_errors", 0),
+                # Safe-pause metrics
+                "ingestion_paused": ps.get("extras", {}).get("ingestion_paused", False),
+                "bars_rejected_paused": ps.get("extras", {}).get("bars_rejected_paused", 0),
+                "pause_entered_ts": ps.get("extras", {}).get("pause_entered_ts"),
             }
         except Exception as e:
             summary["persistence_telemetry"] = {"error": str(e)}

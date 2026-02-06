@@ -181,6 +181,7 @@ class SoakGuardian:
         triggered += self._check_disk_fatigue(resource_snapshot, now)
         triggered += self._check_bars_dropped(now)
         triggered += self._check_bar_buffer_pressure(persistence_status, now)
+        triggered += self._check_ingestion_paused(persistence_status, now)
 
         # Update previous state
         self._prev_bus_stats = {
@@ -503,6 +504,28 @@ class SoakGuardian:
                 now,
             )
 
+        self._set_health(guard, "ok")
+        return []
+
+    def _check_ingestion_paused(
+        self, persist_status: Dict, now: float
+    ) -> List[Dict[str, Any]]:
+        guard = "ingestion_paused"
+        extras = persist_status.get("extras", {})
+        paused = extras.get("ingestion_paused", False)
+        rejected = extras.get("bars_rejected_paused", 0)
+        pause_ts = extras.get("pause_entered_ts")
+
+        if paused:
+            duration = f"{now - pause_ts:.0f}s" if pause_ts else "unknown"
+            return self._fire(
+                ALERT, guard,
+                f"INGESTION PAUSED — bars rejected={rejected}, "
+                f"duration={duration}. "
+                f"Spool full + DB unreachable. "
+                f"System will auto-resume when DB recovers.",
+                now,
+            )
         self._set_health(guard, "ok")
         return []
 
