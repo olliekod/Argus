@@ -184,7 +184,8 @@ class BarBuilder:
             self._reject_quote(event, "missing/invalid timestamp")
             return
         if not event.source_ts or event.source_ts <= 0:
-            self._reject_quote(event, "missing/invalid source_ts")
+            reason = "missing source_ts" if not event.source_ts else "non-positive source_ts"
+            self._reject_quote(event, reason)
             return
 
         # Sanity-check timestamp units (detect ms-vs-seconds confusion)
