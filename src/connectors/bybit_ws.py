@@ -10,8 +10,9 @@ import asyncio
 import json
 import random
 import time
+from collections import OrderedDict
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import websockets
 from websockets.exceptions import ConnectionClosed
 
@@ -115,6 +116,13 @@ class BybitWebSocket:
         # Latest data cache
         self.tickers: Dict[str, Dict] = {}
         self.funding_rates: Dict[str, Dict] = {}
+        self.quotes_invalid_total: int = 0
+        self.quotes_invalid_by_symbol: "OrderedDict[str, int]" = OrderedDict()
+        self.quotes_invalid_by_reason: "OrderedDict[str, int]" = OrderedDict()
+        self._invalid_log_ts: Dict[Tuple[str, str], float] = {}
+        self._invalid_symbol_cap = 100
+        self._invalid_reason_cap = 50
+        self._invalid_log_interval_s = 60
 
         logger.info(f"Bybit WebSocket initialized for {len(self.symbols)} symbols")
 
@@ -275,14 +283,44 @@ class BybitWebSocket:
         try:
             ticker_data = data.get('data', {})
             symbol = ticker_data.get('symbol', '')
+            bid_raw = ticker_data.get('bid1Price')
+            ask_raw = ticker_data.get('ask1Price')
+            last_raw = ticker_data.get('lastPrice')
+            bid, bid_err = self._coerce_float(bid_raw)
+            ask, ask_err = self._coerce_float(ask_raw)
+            last, last_err = self._coerce_float(last_raw)
+            invalid_reason = None
+            if bid_err or ask_err or last_err:
+                if "missing" in (bid_err, ask_err, last_err):
+                    invalid_reason = "missing_fields"
+                else:
+                    invalid_reason = "non_numeric"
+            else:
+                if bid <= 0 or ask <= 0:
+                    invalid_reason = "zero_bidask"
+                elif bid > ask:
+                    invalid_reason = "crossed"
+                elif last <= 0 and (bid <= 0 or ask <= 0):
+                    invalid_reason = "zero_bidask"
+            if invalid_reason:
+                self._record_invalid_quote(
+                    symbol=symbol,
+                    reason=invalid_reason,
+                    bid_raw=bid_raw,
+                    ask_raw=ask_raw,
+                    last_raw=last_raw,
+                )
+            bid = bid if bid is not None else 0.0
+            ask = ask if ask is not None else 0.0
+            last = last if last is not None else 0.0
             parsed = {
                 'symbol': symbol,
                 'timestamp': datetime.now(timezone.utc).isoformat(),
-                'last_price': float(ticker_data.get('lastPrice', 0)),
+                'last_price': last,
                 'mark_price': float(ticker_data.get('markPrice', 0)),
                 'index_price': float(ticker_data.get('indexPrice', 0)),
-                'bid_price': float(ticker_data.get('bid1Price', 0)),
-                'ask_price': float(ticker_data.get('ask1Price', 0)),
+                'bid_price': bid,
+                'ask_price': ask,
                 'volume_24h': float(ticker_data.get('volume24h', 0)),
                 'turnover_24h': float(ticker_data.get('turnover24h', 0)),
                 'funding_rate': float(ticker_data.get('fundingRate', 0)),
@@ -319,9 +357,6 @@ class BybitWebSocket:
             # Publish QuoteEvent to the event bus (price-only)
             if self._event_bus is not None:
                 try:
-                    bid = parsed.get('bid_price', 0.0)
-                    ask = parsed.get('ask_price', 0.0)
-                    mid = (bid + ask) / 2 if (bid and ask) else parsed['last_price']
                     now = time.time()
 
                     # Extract upstream timestamp from Bybit WS payload.
@@ -332,18 +367,23 @@ class BybitWebSocket:
                     else:
                         source_ts = now  # fallback: use receive time
 
-                    quote = QuoteEvent(
-                        symbol=symbol,
-                        bid=bid,
-                        ask=ask,
-                        mid=mid,
-                        last=parsed['last_price'],
-                        timestamp=now,
-                        source='bybit',
-                        volume_24h=parsed.get('volume_24h', 0.0),
-                        source_ts=source_ts,
-                    )
-                    self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
+                    if not invalid_reason:
+                        bid = parsed.get('bid_price', 0.0)
+                        ask = parsed.get('ask_price', 0.0)
+                        mid = (bid + ask) / 2 if (bid and ask) else parsed['last_price']
+
+                        quote = QuoteEvent(
+                            symbol=symbol,
+                            bid=bid,
+                            ask=ask,
+                            mid=mid,
+                            last=parsed['last_price'],
+                            timestamp=now,
+                            source='bybit',
+                            volume_24h=parsed.get('volume_24h', 0.0),
+                            source_ts=source_ts,
+                        )
+                        self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
 
                     # Publish non-price metrics separately
                     fr = parsed.get('funding_rate', 0.0)
@@ -362,6 +402,61 @@ class BybitWebSocket:
                     logger.error(f"QuoteEvent publish error: {e}")
         except Exception as e:
             logger.error(f"Error parsing ticker: {e}")
+
+    @staticmethod
+    def _coerce_float(value: Any) -> Tuple[Optional[float], Optional[str]]:
+        if value is None:
+            return None, "missing"
+        if isinstance(value, str) and not value.strip():
+            return None, "missing"
+        try:
+            return float(value), None
+        except (TypeError, ValueError):
+            return None, "non_numeric"
+
+    def _record_invalid_quote(
+        self,
+        *,
+        symbol: str,
+        reason: str,
+        bid_raw: Any,
+        ask_raw: Any,
+        last_raw: Any,
+    ) -> None:
+        self.quotes_invalid_total += 1
+        self._bump_bounded_counter(
+            self.quotes_invalid_by_symbol, symbol, self._invalid_symbol_cap
+        )
+        self._bump_bounded_counter(
+            self.quotes_invalid_by_reason, reason, self._invalid_reason_cap
+        )
+        now = time.time()
+        log_key = (symbol, reason)
+        last_log = self._invalid_log_ts.get(log_key, 0.0)
+        if (now - last_log) >= self._invalid_log_interval_s:
+            self._invalid_log_ts[log_key] = now
+            logger.warning(
+                "Rejected Bybit quote for %s (%s): bid=%r ask=%r last=%r",
+                symbol,
+                reason,
+                bid_raw,
+                ask_raw,
+                last_raw,
+            )
+
+    @staticmethod
+    def _bump_bounded_counter(
+        store: "OrderedDict[str, int]",
+        key: str,
+        cap: int,
+    ) -> None:
+        if key in store:
+            store[key] += 1
+            store.move_to_end(key)
+            return
+        if len(store) >= cap:
+            store.popitem(last=False)
+        store[key] = 1
 
     def get_ticker(self, symbol: str) -> Optional[Dict]:
         normalized = self._normalize_symbol(symbol)
@@ -422,5 +517,8 @@ class BybitWebSocket:
                 "message_rate_per_min": round(self._message_rate_per_min, 2),
                 "close_code": self.last_close_code,
                 "close_reason": self.last_close_reason,
+                "quotes_invalid_total": self.quotes_invalid_total,
+                "quotes_invalid_by_symbol": dict(self.quotes_invalid_by_symbol),
+                "quotes_invalid_by_reason": dict(self.quotes_invalid_by_reason),
             },
         )

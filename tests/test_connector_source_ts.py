@@ -7,11 +7,13 @@ with valid source_ts fields that pass BarBuilder validation.
 Run with:  python -m pytest tests/test_connector_source_ts.py -v
 """
 
+import asyncio
 import time
 
 from src.core.bar_builder import BarBuilder, _minute_floor, _ts_sane
 from src.core.bus import EventBus
 from src.core.events import QuoteEvent, TOPIC_MARKET_BARS, TOPIC_MARKET_QUOTES
+from src.connectors.bybit_ws import BybitWebSocket
 from src.connectors.yahoo_client import _parse_yahoo_source_ts
 from src.connectors.deribit_client import DeribitClient
 
@@ -109,6 +111,46 @@ class TestBybitTimestampConversion:
             # No rejections
             status = bb.get_status()
             assert status["extras"]["quotes_rejected_total"] == 0
+        finally:
+            bus.stop()
+
+    def test_bybit_zero_quote_rejected(self):
+        """Zero bid/ask/last payloads are rejected before publishing quotes."""
+        bus = EventBus()
+        published = []
+        bus.subscribe(TOPIC_MARKET_QUOTES, lambda quote: published.append(quote))
+        bus.start()
+        bybit = BybitWebSocket(symbols=["BTCUSDT"], event_bus=bus)
+
+        try:
+            payload = {
+                "topic": "tickers.BTCUSDT",
+                "ts": 1_700_000_123_456,
+                "data": {
+                    "symbol": "BTCUSDT",
+                    "bid1Price": "0",
+                    "ask1Price": "0",
+                    "lastPrice": "0",
+                    "markPrice": "0",
+                    "indexPrice": "0",
+                    "volume24h": "0",
+                    "turnover24h": "0",
+                    "fundingRate": "0",
+                    "nextFundingTime": None,
+                    "openInterest": "0",
+                    "openInterestValue": "0",
+                    "price24hPcnt": "0",
+                },
+            }
+            asyncio.run(bybit._handle_ticker(payload))
+            _drain(bus)
+
+            assert not published
+            health = bybit.get_health_status()
+            extras = health["extras"]
+            assert extras["quotes_invalid_total"] == 1
+            assert extras["quotes_invalid_by_reason"]["zero_bidask"] == 1
+            assert extras["quotes_invalid_by_symbol"]["BTCUSDT"] == 1
         finally:
             bus.stop()
 
