@@ -49,6 +49,10 @@ from .analysis.uniformity_monitor import run_uniformity_check
 from .trading.paper_trader_farm import PaperTraderFarm
 from .core.query_layer import QueryLayer
 from .dashboard.web import ArgusWebDashboard
+from .soak.guards import SoakGuardian
+from .soak.tape import TapeRecorder
+from .soak.resource_monitor import ResourceMonitor
+from .soak.summary import build_soak_summary
 
 
 class CollectorModeViolation(RuntimeError):
@@ -211,6 +215,27 @@ class ArgusOrchestrator:
                 port=dash_cfg.get('port', 8777),
             )
 
+        # ── Soak-test hardening components ────────────────
+        soak_cfg = self.config.get('soak', {})
+        db_path = str(self.config.get('system', {}).get('database_path', 'data/argus.db'))
+        self.resource_monitor = ResourceMonitor(
+            db_path=db_path,
+            log_ring=self._recent_logs,
+        )
+        self.soak_guardian = SoakGuardian(
+            config=soak_cfg.get('guards', {}),
+            alert_callback=None,  # wired after telegram setup
+        )
+        tape_cfg = soak_cfg.get('tape', {})
+        tape_symbols = set(tape_cfg.get('symbols', [])) or None
+        self.tape_recorder = TapeRecorder(
+            enabled=tape_cfg.get('enabled', False),
+            symbols=tape_symbols,
+            maxlen=int(tape_cfg.get('maxlen', 100_000)),
+        )
+        # Last component heartbeat timestamps (for guard checks)
+        self._component_heartbeat_ts: Dict[str, float] = {}
+
         # Market hours config
         self._mh_cfg = self.config.get('market_hours', {})
 
@@ -250,6 +275,9 @@ class ArgusOrchestrator:
         self.persistence = PersistenceManager(self.event_bus, self.db, loop)
         self.persistence.start()
 
+        # Attach tape recorder to event bus (subscribes only if enabled)
+        self.tape_recorder.attach(self.event_bus)
+
         # Phase 2c: Intelligence pipeline (downstream-only, safe in collector mode)
         self.feature_builder = FeatureBuilder(self.event_bus)
         self.regime_detector = RegimeDetector(self.event_bus)
@@ -270,6 +298,10 @@ class ArgusOrchestrator:
 
         # Phase 6: Wire callbacks
         self._wire_telegram_callbacks()
+
+        # Wire soak guardian alerts to telegram
+        if self.telegram:
+            self.soak_guardian._alert_cb = self._send_soak_alert
 
         # Phase 7: Detectors (with bus attachment)
         await self._setup_detectors()
@@ -318,6 +350,7 @@ class ArgusOrchestrator:
                 get_providers=self._get_provider_statuses,
                 run_command=self._run_dashboard_command,
                 get_recent_logs=self._get_recent_logs_text,
+                get_soak_summary=self._get_soak_summary,
             )
             await self.dashboard.start()
             self.dashboard.set_boot_phases(self._format_boot_phases())
@@ -1907,6 +1940,68 @@ class ArgusOrchestrator:
             except Exception as e:
                 self.logger.error(f"DB maintenance error: {e}")
 
+    # ── Soak-test hardening helpers ─────────────────────────────────
+
+    async def _get_soak_summary(self) -> Dict[str, Any]:
+        """Build the soak summary for /debug/soak endpoint."""
+        connectors_map: Dict[str, Any] = {
+            "bybit": self.bybit_ws,
+            "deribit": self.deribit_client,
+            "yahoo": self.yahoo_client,
+        }
+        return build_soak_summary(
+            bus=self.event_bus,
+            bar_builder=self.bar_builder,
+            persistence=self.persistence,
+            resource_monitor=self.resource_monitor,
+            guardian=self.soak_guardian,
+            tape_recorder=self.tape_recorder,
+            connectors=connectors_map,
+            polymarket_gamma=getattr(self, 'polymarket_gamma', None),
+            polymarket_clob=getattr(self, 'polymarket_clob', None),
+            polymarket_watchlist=getattr(self, 'polymarket_watchlist', None),
+        )
+
+    async def _send_soak_alert(
+        self, severity: str, guard: str, message: str
+    ) -> None:
+        """Send a soak guard alert via Telegram (rate-limited by guardian)."""
+        if not self.telegram:
+            return
+        icon = "\u26a0\ufe0f" if severity == "WARN" else "\u274c"
+        text = (
+            f"{icon} <b>Soak Guard: {guard}</b>\n"
+            f"Severity: {severity}\n"
+            f"{message}"
+        )
+        try:
+            await self.telegram.send_message(text)
+        except Exception as e:
+            self.logger.warning(f"Failed to send soak alert: {e}")
+
+    async def _run_soak_guards(self) -> None:
+        """Periodically evaluate soak guards (every 30s)."""
+        interval = int(
+            self.config.get('soak', {}).get('guard_interval_s', 30)
+        )
+        while self._running:
+            await asyncio.sleep(interval)
+            try:
+                bus_stats = self.event_bus.get_status_summary()
+                bb_status = self.bar_builder.get_status() if self.bar_builder else {}
+                persist_status = self.persistence.get_status() if self.persistence else {}
+                resource_snap = self.resource_monitor.get_full_snapshot()
+
+                self.soak_guardian.evaluate(
+                    bus_stats=bus_stats,
+                    bar_builder_status=bb_status,
+                    persistence_status=persist_status,
+                    resource_snapshot=resource_snap,
+                    component_heartbeats=self._component_heartbeat_ts,
+                )
+            except Exception:
+                self.logger.debug("Soak guard evaluation failed", exc_info=True)
+
     async def run(self) -> None:
         """Start all components and run main loop."""
         self._running = True
@@ -1925,6 +2020,9 @@ class ArgusOrchestrator:
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._health_check()))
         self._tasks.append(asyncio.create_task(self._run_db_maintenance()))
+
+        # Soak guard evaluation loop
+        self._tasks.append(asyncio.create_task(self._run_soak_guards()))
 
         # Heartbeat publisher (drives persistence flush boundaries)
         self._tasks.append(asyncio.create_task(self._publish_heartbeats()))

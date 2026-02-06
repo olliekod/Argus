@@ -69,6 +69,18 @@ from .events import (
 
 logger = logging.getLogger("argus.bar_builder")
 
+# Timestamp sanity bounds (epoch seconds).
+# Anything outside this range is almost certainly a unit error (e.g. milliseconds).
+# 2020-01-01 00:00:00 UTC
+_TS_MIN = 1_577_836_800.0
+# 2035-01-01 00:00:00 UTC (generous upper bound)
+_TS_MAX = 2_051_222_400.0
+
+
+def _ts_sane(ts: float) -> bool:
+    """Return True if *ts* looks like a plausible epoch-seconds value."""
+    return _TS_MIN <= ts <= _TS_MAX
+
 
 class _BarAccumulator:
     """Mutable accumulator for a single in-progress bar."""
@@ -173,6 +185,37 @@ class BarBuilder:
             return
         if not event.source_ts or event.source_ts <= 0:
             self._reject_quote(event, "missing/invalid source_ts")
+            return
+
+        # Sanity-check timestamp units (detect ms-vs-seconds confusion)
+        if not _ts_sane(event.timestamp):
+            if event.timestamp > _TS_MAX:
+                # Likely milliseconds — auto-correct would hide the bug
+                self._reject_quote(
+                    event,
+                    f"timestamp={event.timestamp:.0f} looks like milliseconds "
+                    f"(expected seconds)",
+                )
+            else:
+                self._reject_quote(
+                    event,
+                    f"timestamp={event.timestamp:.0f} outside sane range "
+                    f"[{_TS_MIN:.0f}, {_TS_MAX:.0f}]",
+                )
+            return
+
+        if not _ts_sane(event.source_ts):
+            if event.source_ts > _TS_MAX:
+                self._reject_quote(
+                    event,
+                    f"source_ts={event.source_ts:.0f} looks like milliseconds "
+                    f"(expected seconds)",
+                )
+            else:
+                self._reject_quote(
+                    event,
+                    f"source_ts={event.source_ts:.0f} outside sane range",
+                )
             return
 
         ts = event.timestamp

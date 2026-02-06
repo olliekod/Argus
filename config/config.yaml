@@ -181,3 +181,58 @@ polymarket:
   max_watchlist: 50                       # max tokens to track
   min_volume: 10000                       # minimum USD volume to qualify
   keywords: []                            # keyword filter (empty = no filter)
+
+# -----------------------------------------------------------------------------
+# Soak Test Hardening
+# -----------------------------------------------------------------------------
+soak:
+  guard_interval_s: 30                    # How often guards evaluate (seconds)
+
+  guards:
+    # EventBus quote drops (should never happen)
+    quote_drops_alert_window_s: 300
+    quote_drops_alert_threshold: 1
+
+    # Rejected quotes (missing/invalid source_ts)
+    rejected_quotes_per_min_threshold: 5
+
+    # Heartbeat staleness
+    heartbeat_missing_intervals: 2
+    heartbeat_interval_s: 60
+
+    # Persistence write-queue depth
+    persist_queue_depth_warn: 5000
+    persist_queue_depth_alert: 8000
+    persist_queue_sustained_s: 30
+
+    # Persist lag
+    persist_lag_p95_warn_ms: 5000
+    persist_lag_p95_alert_ms: 15000
+    persist_lag_sustained_s: 60
+
+    # Bar flush failures
+    bar_flush_failure_threshold: 1
+
+    # Log flood
+    log_error_flood_threshold_per_min: 50
+    log_error_flood_window_min: 5
+
+    # Bar liveness (monitored symbols)
+    bar_liveness_symbols:
+      - "BTC/USDT:USDT"
+    bar_liveness_timeout_s: 180
+
+    # Disk fatigue
+    disk_free_warn_gb: 5.0
+    disk_free_alert_gb: 2.0
+    wal_size_warn_mb: 1024
+    wal_size_alert_mb: 2048
+
+    # Alert rate limiting
+    alert_cooldown_s: 300
+
+  # Tape recorder (determinism artifact capture)
+  tape:
+    enabled: false                        # Set true to activate
+    symbols: []                           # Empty = capture all symbols
+    maxlen: 100000                        # Max events in rolling buffer
