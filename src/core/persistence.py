@@ -46,6 +46,7 @@ from queue import Empty, Full, Queue
 from typing import Any, Dict, List, Optional
 
 from .bus import EventBus
+from .bar_builder import _ts_sane
 from .events import (
     BarEvent,
     ComponentHeartbeatEvent,
@@ -588,10 +589,19 @@ class PersistenceManager:
             now = time.time()
 
             # Compute persist_lag_ms from source timestamps
-            source_ts_values = [
-                b.source_ts for b in batch
-                if hasattr(b, 'source_ts') and b.source_ts > 0
-            ]
+            source_ts_values = []
+            for b in batch:
+                source_ts = getattr(b, 'source_ts', 0.0)
+                if not source_ts or source_ts <= 0:
+                    continue
+                if not _ts_sane(source_ts):
+                    logger.warning(
+                        "Ignoring bar source_ts with unexpected units: %r (symbol=%s)",
+                        source_ts,
+                        getattr(b, 'symbol', 'unknown'),
+                    )
+                    continue
+                source_ts_values.append(source_ts)
             if source_ts_values:
                 avg_source_ts = sum(source_ts_values) / len(source_ts_values)
                 persist_lag = (now - avg_source_ts) * 1000

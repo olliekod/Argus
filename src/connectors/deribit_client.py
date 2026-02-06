@@ -150,9 +150,19 @@ class DeribitClient:
 
         return None, "out_of_range"
 
+    @staticmethod
+    def _describe_payload(data: Any) -> str:
+        if isinstance(data, dict):
+            return f"dict keys={list(data.keys())}"
+        if isinstance(data, list):
+            return f"list len={len(data)}"
+        return f"{type(data).__name__}"
+
     @classmethod
-    def _extract_source_ts(cls, data: Dict[str, Any]) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[float]]:
+    def _extract_source_ts(cls, data: Any) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[float]]:
         """Extract a source timestamp from a Deribit API response."""
+        if not isinstance(data, dict):
+            return None, "missing", None, None
         candidates = [
             ("result.timestamp", data.get("result", {}).get("timestamp")),
             ("result.creation_timestamp", data.get("result", {}).get("creation_timestamp")),
@@ -164,6 +174,42 @@ class DeribitClient:
             if source_ts is not None:
                 return source_ts, reason, label, raw
         return None, "missing", None, None
+
+    @classmethod
+    def _coerce_result_list(cls, data: Any, context: str) -> List[Dict[str, Any]]:
+        """Return a list of result items, handling dict/list payloads safely."""
+        if isinstance(data, list):
+            logger.warning(
+                "Deribit %s response returned a list (%s)",
+                context,
+                cls._describe_payload(data),
+            )
+            return data
+        if not isinstance(data, dict):
+            logger.warning(
+                "Deribit %s response unexpected payload (%s)",
+                context,
+                cls._describe_payload(data),
+            )
+            return []
+
+        result = data.get("result", [])
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            logger.warning(
+                "Deribit %s response had dict result (%s)",
+                context,
+                cls._describe_payload(result),
+            )
+            return [result]
+
+        logger.warning(
+            "Deribit %s response had unexpected result (%s)",
+            context,
+            cls._describe_payload(result),
+        )
+        return []
     
     async def get_ticker(self, instrument_name: str) -> Optional[Dict]:
         """
@@ -220,8 +266,9 @@ class DeribitClient:
         )
         
         source_ts, ts_reason, ts_label, ts_raw = self._extract_source_ts(data)
+        result_items = self._coerce_result_list(data, "book_summary")
         result = []
-        for item in data.get('result', []):
+        for item in result_items:
             result.append({
                 'instrument': item.get('instrument_name'),
                 'currency': currency,
@@ -291,7 +338,14 @@ class DeribitClient:
         """
         data = await self._request('get_index_price', {'index_name': index_name})
         
-        if 'result' in data:
+        if isinstance(data, list):
+            logger.warning(
+                "Deribit index price response unexpected payload (%s)",
+                self._describe_payload(data),
+            )
+            return None
+
+        if isinstance(data, dict) and 'result' in data:
             source_ts, ts_reason, ts_label, ts_raw = self._extract_source_ts(data)
             return {
                 'index_name': index_name,
