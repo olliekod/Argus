@@ -204,6 +204,7 @@ def test_persist_lag_future_ts_clamps_to_now():
             status = pm.get_status()
 
             assert status["extras"]["source_ts_future_clamped_total"] == 1
+            assert status["extras"]["persist_lag_ms"] == 0.0
             assert status["extras"]["persist_lag_ema_ms"] is not None
             assert status["extras"]["persist_lag_ema_ms"] <= 5.0
     finally:
@@ -239,7 +240,9 @@ def test_persist_lag_future_within_skew_not_clamped():
             status = pm.get_status()
 
             assert status["extras"]["source_ts_future_clamped_total"] == 0
+            assert status["extras"]["persist_lag_ms"] == 0.0
             assert status["extras"]["persist_lag_ema_ms"] is not None
+            assert status["extras"]["persist_lag_ema_ms"] >= 0.0
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)

@@ -594,6 +594,8 @@ class PersistenceManager:
             return now
 
         age_seconds = now - source_ts
+        if age_seconds < 0:
+            return now
         if age_seconds > _PERSIST_LAG_MAX_AGE_SECONDS:
             with self._status_lock:
                 self._source_ts_stale_ignored_total += 1
