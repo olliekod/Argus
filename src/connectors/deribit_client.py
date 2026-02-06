@@ -8,11 +8,12 @@ No authentication required for public endpoints.
 
 import asyncio
 from datetime import datetime
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
 from ..core.logger import get_connector_logger
 from ..core.events import QuoteEvent, MetricEvent, TOPIC_MARKET_QUOTES, TOPIC_MARKET_METRICS
+from ..core.bar_builder import _ts_sane
 
 logger = get_connector_logger('deribit')
 
@@ -124,6 +125,91 @@ class DeribitClient:
             self.consecutive_failures += 1
             logger.error(f"Deribit request failed: {e}")
             return {'error': str(e)}
+
+    @staticmethod
+    def _normalize_source_ts(raw: Optional[float]) -> Tuple[Optional[float], Optional[str]]:
+        """Normalize Deribit timestamps to epoch seconds."""
+        if raw is None:
+            return None, "missing"
+        try:
+            raw_val = float(raw)
+        except (TypeError, ValueError):
+            return None, "invalid"
+
+        if _ts_sane(raw_val):
+            return raw_val, None
+
+        if raw_val > 10_000_000_000_000:
+            candidate = raw_val / 1_000_000.0
+            if _ts_sane(candidate):
+                return candidate, "converted_us"
+        elif raw_val > 10_000_000_000:
+            candidate = raw_val / 1000.0
+            if _ts_sane(candidate):
+                return candidate, "converted_ms"
+
+        return None, "out_of_range"
+
+    @staticmethod
+    def _describe_payload(data: Any) -> str:
+        if isinstance(data, dict):
+            return f"dict keys={list(data.keys())}"
+        if isinstance(data, list):
+            return f"list len={len(data)}"
+        return f"{type(data).__name__}"
+
+    @classmethod
+    def _extract_source_ts(cls, data: Any) -> Tuple[Optional[float], Optional[str], Optional[str], Optional[float]]:
+        """Extract a source timestamp from a Deribit API response."""
+        if not isinstance(data, dict):
+            return None, "missing", None, None
+        candidates = [
+            ("result.timestamp", data.get("result", {}).get("timestamp")),
+            ("result.creation_timestamp", data.get("result", {}).get("creation_timestamp")),
+            ("usOut", data.get("usOut")),
+            ("usIn", data.get("usIn")),
+        ]
+        for label, raw in candidates:
+            source_ts, reason = cls._normalize_source_ts(raw)
+            if source_ts is not None:
+                return source_ts, reason, label, raw
+        return None, "missing", None, None
+
+    @classmethod
+    def _coerce_result_list(cls, data: Any, context: str) -> List[Dict[str, Any]]:
+        """Return a list of result items, handling dict/list payloads safely."""
+        if isinstance(data, list):
+            logger.warning(
+                "Deribit %s response returned a list (%s)",
+                context,
+                cls._describe_payload(data),
+            )
+            return data
+        if not isinstance(data, dict):
+            logger.warning(
+                "Deribit %s response unexpected payload (%s)",
+                context,
+                cls._describe_payload(data),
+            )
+            return []
+
+        result = data.get("result", [])
+        if isinstance(result, list):
+            return result
+        if isinstance(result, dict):
+            logger.warning(
+                "Deribit %s response had dict result (%s)",
+                context,
+                cls._describe_payload(result),
+            )
+            return [result]
+
+        logger.warning(
+            "Deribit %s response had unexpected result (%s)",
+            context,
+            cls._describe_payload(result),
+        )
+        return []
     
     async def get_ticker(self, instrument_name: str) -> Optional[Dict]:
         """
@@ -179,8 +265,10 @@ class DeribitClient:
             {'currency': currency, 'kind': kind}
         )
         
+        source_ts, ts_reason, ts_label, ts_raw = self._extract_source_ts(data)
+        result_items = self._coerce_result_list(data, "book_summary")
         result = []
-        for item in data.get('result', []):
+        for item in result_items:
             result.append({
                 'instrument': item.get('instrument_name'),
                 'currency': currency,
@@ -193,6 +281,10 @@ class DeribitClient:
                 'open_interest': item.get('open_interest'),
                 'underlying_price': item.get('underlying_price'),
                 'timestamp': datetime.utcnow().isoformat(),
+                'source_ts': source_ts,
+                'source_ts_reason': ts_reason,
+                'source_ts_label': ts_label,
+                'source_ts_raw': ts_raw,
             })
         
         return result
@@ -246,12 +338,24 @@ class DeribitClient:
         """
         data = await self._request('get_index_price', {'index_name': index_name})
         
-        if 'result' in data:
+        if isinstance(data, list):
+            logger.warning(
+                "Deribit index price response unexpected payload (%s)",
+                self._describe_payload(data),
+            )
+            return None
+
+        if isinstance(data, dict) and 'result' in data:
+            source_ts, ts_reason, ts_label, ts_raw = self._extract_source_ts(data)
             return {
                 'index_name': index_name,
                 'index_price': data['result'].get('index_price'),
                 'estimated_delivery_price': data['result'].get('estimated_delivery_price'),
                 'timestamp': datetime.utcnow().isoformat(),
+                'source_ts': source_ts,
+                'source_ts_reason': ts_reason,
+                'source_ts_label': ts_label,
+                'source_ts_raw': ts_raw,
             }
         return None
     
@@ -342,12 +446,30 @@ class DeribitClient:
             'closest_iv': closest['mark_iv'],
             'sample_size': len(atm_iv_values),
             'timestamp': datetime.utcnow().isoformat(),
+            'source_ts': index_data.get('source_ts') if index_data else None,
+            'source_ts_reason': index_data.get('source_ts_reason') if index_data else None,
+            'source_ts_label': index_data.get('source_ts_label') if index_data else None,
+            'source_ts_raw': index_data.get('source_ts_raw') if index_data else None,
         }
 
         # Publish QuoteEvent for the underlying index (price-only)
         if self._event_bus is not None:
             import time as _time
             try:
+                source_ts = index_data.get("source_ts") if index_data else None
+                source_ts_raw = index_data.get("source_ts_raw") if index_data else None
+                source_ts_reason = index_data.get("source_ts_reason") if index_data else "missing"
+                source_ts_label = index_data.get("source_ts_label") if index_data else None
+                if source_ts is None:
+                    logger.warning(
+                        "Rejected Deribit quote for %s: %s (raw_ts=%r, field=%s)",
+                        f"{currency}-INDEX",
+                        source_ts_reason or "missing source_ts",
+                        source_ts_raw,
+                        source_ts_label,
+                    )
+                    source_ts = 0.0
+                timestamp = source_ts if source_ts else 0.0
                 now = _time.time()
                 quote = QuoteEvent(
                     symbol=f"{currency}-INDEX",
@@ -355,9 +477,9 @@ class DeribitClient:
                     ask=index_price,
                     mid=index_price,
                     last=index_price,
-                    timestamp=now,
+                    timestamp=timestamp,
                     source='deribit',
-                    source_ts=now,
+                    source_ts=source_ts,
                 )
                 self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
 

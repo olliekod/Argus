@@ -12,6 +12,8 @@ import time
 from src.core.bar_builder import BarBuilder, _minute_floor, _ts_sane
 from src.core.bus import EventBus
 from src.core.events import QuoteEvent, TOPIC_MARKET_BARS, TOPIC_MARKET_QUOTES
+from src.connectors.yahoo_client import _parse_yahoo_source_ts
+from src.connectors.deribit_client import DeribitClient
 
 
 def _drain(bus, timeout=0.5):
@@ -114,10 +116,14 @@ class TestBybitTimestampConversion:
 class TestDeribitTimestampConversion:
     """Verify Deribit REST timestamp handling."""
 
-    def test_deribit_time_time_is_sane(self):
-        """Deribit uses time.time() directly; it should be sane."""
-        now = time.time()
-        assert _ts_sane(now)
+    def test_deribit_us_out_microseconds_converted(self):
+        """Deribit usOut microseconds should convert to sane epoch seconds."""
+        data = {"usOut": 1_700_000_000_000_000}
+        source_ts, reason, label, raw = DeribitClient._extract_source_ts(data)
+        assert label == "usOut"
+        assert raw == 1_700_000_000_000_000
+        assert reason in (None, "converted_us")
+        assert _ts_sane(source_ts)
 
     def test_deribit_ms_api_timestamp_converted(self):
         """Deribit API returns timestamps in ms; conversion to seconds is sane."""
@@ -175,10 +181,19 @@ class TestDeribitTimestampConversion:
 class TestYahooTimestampConversion:
     """Verify Yahoo Finance timestamp handling."""
 
-    def test_yahoo_time_time_is_sane(self):
-        """Yahoo uses time.time() directly; it should be sane."""
-        now = time.time()
-        assert _ts_sane(now)
+    def test_yahoo_regular_market_time_seconds(self):
+        """Yahoo regularMarketTime should parse as epoch seconds."""
+        source_ts, reason, raw = _parse_yahoo_source_ts({"regularMarketTime": 1_700_000_123})
+        assert raw == 1_700_000_123
+        assert reason is None
+        assert _ts_sane(source_ts)
+
+    def test_yahoo_regular_market_time_ms_converted(self):
+        """Yahoo regularMarketTime in ms should be converted to seconds."""
+        source_ts, reason, raw = _parse_yahoo_source_ts({"regularMarketTime": 1_700_000_123_000})
+        assert raw == 1_700_000_123_000
+        assert reason == "converted_ms"
+        assert _ts_sane(source_ts)
 
     def test_yahoo_quote_accepted_by_bar_builder(self):
         """End-to-end: Yahoo-style quote with source_ts builds a bar."""

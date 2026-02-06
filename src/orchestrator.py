@@ -5,6 +5,7 @@ Argus Market Monitor - Module Loader / Orchestrator
 Coordinates all connectors, detectors, and alerts via a central
 Pub/Sub event bus.  Reads ``ARGUS_MODE`` once at boot to decide
 between **collector** (default — observe only) and **live** modes.
+This is the canonical orchestrator entrypoint; legacy variants have been removed.
 """
 
 import asyncio
