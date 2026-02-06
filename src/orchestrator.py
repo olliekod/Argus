@@ -466,6 +466,7 @@ class ArgusOrchestrator:
                 run_command=self._run_dashboard_command,
                 get_recent_logs=self._get_recent_logs_text,
                 get_soak_summary=self._get_soak_summary,
+                export_tape=self._export_tape,
             )
             await self.dashboard.start()
             self.dashboard.set_boot_phases(self._format_boot_phases())
@@ -2100,6 +2101,20 @@ class ArgusOrchestrator:
             await self.telegram.send_message(text)
         except Exception as e:
             self.logger.warning(f"Failed to send soak alert: {e}")
+
+    async def _export_tape(self, last_n_minutes: Optional[int] = None) -> List[Dict[str, Any]]:
+        """Extract a slice of recorded tape data for export."""
+        if not self.tape_recorder:
+            return []
+        with self.tape_recorder._lock:
+            snapshot = list(self.tape_recorder._tape)
+        
+        if not last_n_minutes:
+            return snapshot
+            
+        now = time.time()
+        cutoff = now - (last_n_minutes * 60)
+        return [e for e in snapshot if e.get("timestamp", 0) >= cutoff]
 
     async def _run_soak_guards(self) -> None:
         """Periodically evaluate soak guards (every 30s)."""

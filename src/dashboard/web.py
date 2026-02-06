@@ -175,6 +175,7 @@ class ArgusWebDashboard:
         self._app.router.add_get('/', self._handle_index)
         self._app.router.add_get('/api/status', self._handle_status)
         self._app.router.add_get('/debug/soak', self._handle_soak)
+        self._app.router.add_get('/debug/tape/export', self._handle_tape_export)
         self._app.router.add_post('/api/command', self._handle_command)
 
     def set_callbacks(
@@ -186,6 +187,7 @@ class ArgusWebDashboard:
         run_command=None,
         get_recent_logs=None,
         get_soak_summary=None,
+        export_tape=None,
     ):
         if get_status: self._get_status = get_status
         if get_pnl: self._get_pnl = get_pnl
@@ -194,6 +196,7 @@ class ArgusWebDashboard:
         if run_command: self._run_command = run_command
         if get_recent_logs: self._get_recent_logs = get_recent_logs
         if get_soak_summary: self._get_soak_summary = get_soak_summary
+        if export_tape: self._export_tape = export_tape
 
     def set_boot_phases(self, text: str):
         self._boot_phases = text
@@ -327,3 +330,23 @@ class ArgusWebDashboard:
                 return json.loads(json.dumps(payload, default=str))
 
         return web.json_response(_ensure_json_safe(result))
+
+    async def _handle_tape_export(self, request):
+        """GET /debug/tape/export?minutes=N — export tape to JSONL."""
+        start = time.perf_counter()
+        try:
+            minutes = request.query.get('minutes')
+            minutes = int(minutes) if minutes else None
+            
+            # Use the orchestrator callback to get the tape data
+            if hasattr(self, '_export_tape') and self._export_tape:
+                result = await self._export_tape(minutes)
+                return web.json_response(result)
+            else:
+                return web.json_response({"error": "Tape export not configured"}, status=501)
+        except Exception as e:
+            logger.error(f"/debug/tape/export error: {e}")
+            return web.json_response({"error": str(e)}, status=500)
+        finally:
+            duration_ms = (time.perf_counter() - start) * 1000
+            logger.info(f"/debug/tape/export in {duration_ms:.1f}ms")

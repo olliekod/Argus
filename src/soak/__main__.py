@@ -245,9 +245,36 @@ def _cmd_replay(args):
         print(f"\nPASS: {len(bars1)} bars are bit-identical across both runs")
 
 
+def _cmd_export_tape(args):
+    """Fetch tape data from running instance and save to JSONL."""
+    url = f"{args.url.rsplit('/', 1)[0]}/tape/export"
+    if args.minutes:
+        url += f"?minutes={args.minutes}"
+
+    print(f"Fetching tape from {url} ...")
+    try:
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read().decode())
+    except urllib.error.URLError as e:
+        print(f"ERROR: Cannot reach Argus tape endpoint at {url}", file=sys.stderr)
+        print(f"  {e}", file=sys.stderr)
+        sys.exit(1)
+
+    if not isinstance(data, list):
+        print(f"ERROR: Unexpected response from server: {data}", file=sys.stderr)
+        sys.exit(1)
+
+    print(f"Writing {len(data)} events to {args.output} ...")
+    with open(args.output, "w") as f:
+        for entry in data:
+            f.write(json.dumps(entry) + "\n")
+    print("Done.")
+
+
 def main():
     parser = argparse.ArgumentParser(
-        prog="python -m argus.soak",
+        prog="python -m src.soak",
         description="Argus Soak Summary — single-glance system health",
     )
     sub = parser.add_subparsers(dest="command")
@@ -267,10 +294,18 @@ def main():
     replay_p = sub.add_parser("replay", help="Replay a tape and verify determinism")
     replay_p.add_argument("--tape", required=True, help="Path to JSONL tape file")
 
+    # Export sub-command
+    export_p = sub.add_parser("export-tape", help="Export tape from running instance")
+    export_p.add_argument("--minutes", type=int, help="Only export last N minutes")
+    export_p.add_argument("--output", required=True, help="Output JSONL path")
+
     args = parser.parse_args()
 
     if args.command == "replay":
         _cmd_replay(args)
+        return
+    elif args.command == "export-tape":
+        _cmd_export_tape(args)
         return
 
     # Default: fetch summary
