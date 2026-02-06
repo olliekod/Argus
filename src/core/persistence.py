@@ -33,11 +33,15 @@ exposes it via status / heartbeat telemetry.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
+import os
 import threading
 import time
 from collections import deque
+from dataclasses import asdict
 from datetime import datetime, timezone
+from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Any, Dict, List, Optional
 
@@ -64,6 +68,11 @@ _TELEMETRY_QUEUE_MAXSIZE = 5_000  # Low priority (metrics / heartbeats)
 _BAR_FLUSH_MAX_RETRIES = 3        # Retry failed bar flushes
 _WRITE_STOP = object()
 
+# ── Bar buffer / spool limits ────────────────────────────────
+_BAR_BUFFER_MAX = 100_000         # Max bars held in memory
+_SPOOL_MAX_BYTES = 1 << 30        # 1 GB max spool file size
+_SPOOL_DRAIN_BATCH = 500          # Bars to drain from spool per flush cycle
+
 
 class PersistenceManager:
     """Async-safe persistence subscriber for the event bus.
@@ -84,18 +93,33 @@ class PersistenceManager:
         bus: EventBus,
         db: Any,
         loop: asyncio.AbstractEventLoop,
+        *,
+        spool_dir: Optional[str] = None,
+        bar_buffer_max: int = _BAR_BUFFER_MAX,
     ) -> None:
         self._bus = bus
         self._db = db
         self._loop = loop
 
-        # Bar buffer — unbounded list guarded by lock.
-        # Bars are NEVER dropped: on flush failure they're returned here.
+        # Bar buffer — bounded list guarded by lock.
+        # Bars are NEVER dropped: overflow spills to disk spool.
         self._bar_buffer: List[BarEvent] = []
+        self._bar_buffer_max: int = bar_buffer_max
         self._bar_lock = threading.Lock()
         self._flush_thread: Optional[threading.Thread] = None
         self._signal_write_thread: Optional[threading.Thread] = None
         self._telemetry_write_thread: Optional[threading.Thread] = None
+
+        # Disk spool for bar overflow (JSONL append-only file)
+        self._spool_dir = Path(spool_dir) if spool_dir else Path("data")
+        self._spool_path = self._spool_dir / "bar_spool.jsonl"
+        self._spool_active: bool = False
+        self._spool_write_handle: Optional[Any] = None
+        self._spool_read_offset: int = 0
+        self._spool_bytes_written: int = 0
+        self._bars_spooled_total: int = 0
+        self._spool_write_errors: int = 0
+        self._spool_bars_pending: int = 0
 
         # Priority queues: signals (medium) vs metrics/heartbeats (low)
         self._signal_queue: Queue = Queue(maxsize=_SIGNAL_QUEUE_MAXSIZE)
@@ -128,6 +152,9 @@ class PersistenceManager:
         self._last_persist_lag_ms: Optional[float] = None
         self._persist_lag_ema: Optional[float] = None
 
+        # Recover spool from previous crash (if any)
+        self._recover_spool()
+
         # Subscribe to relevant topics
         bus.subscribe(TOPIC_MARKET_BARS, self._on_bar)
         bus.subscribe(TOPIC_SIGNALS, self._on_signal)
@@ -135,7 +162,7 @@ class PersistenceManager:
         bus.subscribe(TOPIC_MARKET_METRICS, self._on_metric)
         bus.subscribe(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, self._on_component_heartbeat)
 
-        logger.info("PersistenceManager initialised")
+        logger.info("PersistenceManager initialised (bar_buffer_max=%d)", self._bar_buffer_max)
 
     # ── lifecycle ───────────────────────────────────────────
 
@@ -172,6 +199,14 @@ class PersistenceManager:
         self._running = False
         # Final flush
         self._do_flush()
+        # Close spool write handle if still open
+        with self._bar_lock:
+            if self._spool_write_handle:
+                try:
+                    self._spool_write_handle.close()
+                except OSError:
+                    pass
+                self._spool_write_handle = None
         for q in (self._signal_queue, self._telemetry_queue):
             try:
                 q.put_nowait(_WRITE_STOP)
@@ -185,12 +220,151 @@ class PersistenceManager:
             self._telemetry_write_thread.join(timeout=5.0)
         logger.info("PersistenceManager shut down (all bars flushed)")
 
+    # ── spool management ────────────────────────────────────
+
+    def _recover_spool(self) -> None:
+        """Detect and recover a leftover spool file from a previous crash."""
+        try:
+            if self._spool_path.exists():
+                size = self._spool_path.stat().st_size
+                if size > 0:
+                    count = 0
+                    with open(self._spool_path, "r") as f:
+                        for _ in f:
+                            count += 1
+                    self._spool_active = True
+                    self._spool_bytes_written = size
+                    self._spool_bars_pending = count
+                    self._bars_spooled_total = count
+                    logger.warning(
+                        "Recovered bar spool from previous session: "
+                        "%d bars, %d bytes",
+                        count, size,
+                    )
+                else:
+                    # Empty spool file — remove it
+                    self._spool_path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning("Failed to recover spool: %s", e)
+
+    def _spool_bar(self, bar: BarEvent) -> None:
+        """Write a single bar to the disk spool (JSONL). Called under _bar_lock."""
+        try:
+            if self._spool_write_handle is None:
+                self._spool_dir.mkdir(parents=True, exist_ok=True)
+                self._spool_write_handle = open(self._spool_path, "a")
+
+            line = json.dumps(asdict(bar), separators=(",", ":")) + "\n"
+            line_bytes = len(line.encode("utf-8"))
+
+            if self._spool_bytes_written + line_bytes > _SPOOL_MAX_BYTES:
+                # Spool is full — fall back to in-memory beyond max
+                self._bar_buffer.append(bar)
+                logger.critical(
+                    "Bar spool FULL (%d bytes, %d bars pending). "
+                    "Bar kept in memory (buffer=%d). "
+                    "DB recovery urgently needed!",
+                    self._spool_bytes_written,
+                    self._spool_bars_pending,
+                    len(self._bar_buffer),
+                )
+                return
+
+            self._spool_write_handle.write(line)
+            self._spool_write_handle.flush()
+            self._spool_bytes_written += line_bytes
+            self._spool_bars_pending += 1
+            self._bars_spooled_total += 1
+            self._spool_active = True
+        except OSError as e:
+            # Disk write failed — fall back to memory
+            self._bar_buffer.append(bar)
+            self._spool_write_errors += 1
+            logger.error(
+                "Failed to spool bar to disk: %s — kept in memory (buffer=%d)",
+                e, len(self._bar_buffer),
+            )
+
+    def _drain_spool_batch(self) -> List[BarEvent]:
+        """Read a batch of bars from the spool file. Called under _bar_lock."""
+        if not self._spool_active or self._spool_bars_pending <= 0:
+            return []
+
+        bars: List[BarEvent] = []
+        new_offset = self._spool_read_offset
+        try:
+            with open(self._spool_path, "r") as f:
+                f.seek(self._spool_read_offset)
+                for _ in range(_SPOOL_DRAIN_BATCH):
+                    line = f.readline()
+                    if not line or not line.strip():
+                        break
+                    data = json.loads(line)
+                    bars.append(BarEvent(**data))
+                new_offset = f.tell()
+        except (OSError, json.JSONDecodeError, TypeError) as e:
+            logger.error("Failed to read bar spool: %s", e)
+
+        if bars:
+            self._spool_read_offset = new_offset
+            self._spool_bars_pending -= len(bars)
+
+            if self._spool_bars_pending <= 0:
+                self._cleanup_spool()
+
+        return bars
+
+    def _drain_spool_to_db(self) -> None:
+        """Attempt to drain one batch from the disk spool to the database."""
+        with self._bar_lock:
+            spool_batch = self._drain_spool_batch()
+
+        if not spool_batch:
+            return
+
+        try:
+            future = asyncio.run_coroutine_threadsafe(
+                self._write_bars(spool_batch), self._loop
+            )
+            future.result(timeout=30.0)
+            logger.info(
+                "Drained %d bars from spool to DB (%d still pending)",
+                len(spool_batch), self._spool_bars_pending,
+            )
+        except Exception:
+            logger.warning(
+                "Failed to drain spool batch (%d bars) — returned to buffer",
+                len(spool_batch),
+            )
+            with self._bar_lock:
+                self._bar_buffer = spool_batch + self._bar_buffer
+
+    def _cleanup_spool(self) -> None:
+        """Remove the spool file after full drain. Called under _bar_lock."""
+        try:
+            if self._spool_write_handle:
+                self._spool_write_handle.close()
+                self._spool_write_handle = None
+            if self._spool_path.exists():
+                self._spool_path.unlink()
+        except OSError as e:
+            logger.warning("Failed to cleanup spool file: %s", e)
+
+        self._spool_active = False
+        self._spool_read_offset = 0
+        self._spool_bytes_written = 0
+        self._spool_bars_pending = 0
+        logger.info("Bar spool fully drained and cleaned up")
+
     # ── handlers (run on bus worker threads) ────────────────
 
     def _on_bar(self, event: BarEvent) -> None:
-        """Buffer bar for batched write.  O(1), never drops."""
+        """Buffer bar for batched write. Bounded with disk spool overflow."""
         with self._bar_lock:
-            self._bar_buffer.append(event)
+            if self._spool_active or len(self._bar_buffer) >= self._bar_buffer_max:
+                self._spool_bar(event)
+            else:
+                self._bar_buffer.append(event)
 
     def _on_signal(self, event: SignalEvent) -> None:
         """Persist signal via medium-priority queue."""
@@ -267,14 +441,19 @@ class PersistenceManager:
 
         On failure, bars are returned to the buffer for retry so that
         bars are **never silently dropped**.
+
+        After a successful buffer flush, drains a batch from the disk
+        spool (if active) to steadily recover spooled bars.
         """
         with self._bar_lock:
-            if not self._bar_buffer:
+            if not self._bar_buffer and not self._spool_active:
                 return
             batch = list(self._bar_buffer)
             self._bar_buffer.clear()
 
         if not batch:
+            # Buffer was empty but spool is active — drain spool directly
+            self._drain_spool_to_db()
             return
 
         start = time.perf_counter()
@@ -329,6 +508,10 @@ class PersistenceManager:
                         persist_lag if self._persist_lag_ema is None
                         else (persist_lag * 0.2) + (self._persist_lag_ema * 0.8)
                     )
+
+            # After successful buffer flush, drain spool if active
+            if self._spool_active:
+                self._drain_spool_to_db()
         else:
             # All retries failed — return bars to buffer (never drop)
             with self._bar_lock:
@@ -489,6 +672,8 @@ class PersistenceManager:
                 "signal_queue_depth": self._signal_queue.qsize(),
                 "telemetry_queue_depth": self._telemetry_queue.qsize(),
                 "persist_lag_ema_ms": round(self._persist_lag_ema, 1) if self._persist_lag_ema else None,
+                "spool_active": self._spool_active,
+                "spool_bars_pending": self._spool_bars_pending,
             },
         )
         self._bus.publish(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, hb)
@@ -497,6 +682,11 @@ class PersistenceManager:
     def get_status(self) -> Dict[str, Any]:
         with self._bar_lock:
             bar_buffer_size = len(self._bar_buffer)
+            spool_active = self._spool_active
+            spool_bars_pending = self._spool_bars_pending
+            spool_bytes_written = self._spool_bytes_written
+            bars_spooled_total = self._bars_spooled_total
+            spool_write_errors = self._spool_write_errors
         with self._status_lock:
             last_flush_ts = self._last_flush_ts
             last_flush_ms = self._last_flush_ms
@@ -543,6 +733,7 @@ class PersistenceManager:
             age_seconds=round(age_seconds, 1) if age_seconds is not None else None,
             extras={
                 "bar_buffer_size": bar_buffer_size,
+                "bar_buffer_max": self._bar_buffer_max,
                 "last_flush_ts": (
                     datetime.fromtimestamp(last_flush_ts, tz=timezone.utc).isoformat()
                     if last_flush_ts
@@ -563,5 +754,11 @@ class PersistenceManager:
                 "write_queue_depth": self._signal_queue.qsize() + self._telemetry_queue.qsize(),
                 "persist_lag_ms": round(persist_lag_ms, 1) if persist_lag_ms is not None else None,
                 "persist_lag_ema_ms": round(persist_lag_ema, 1) if persist_lag_ema is not None else None,
+                # Spool metrics
+                "spool_active": spool_active,
+                "spool_bars_pending": spool_bars_pending,
+                "spool_file_size": spool_bytes_written,
+                "bars_spooled_total": bars_spooled_total,
+                "spool_write_errors": spool_write_errors,
             },
         )

@@ -1,10 +1,14 @@
 """
 Tests for persistence priority behavior: bars never dropped, retry on failure.
+Also tests bounded bar buffer with disk spool overflow.
 
 Run with:  python -m pytest tests/test_persistence_priority.py -v
 """
 
 import asyncio
+import json
+import os
+import tempfile
 import threading
 import time
 
@@ -57,20 +61,23 @@ def _make_bar(symbol="BTC", ts=None):
 
 
 class TestBarNeverDropped:
-    def test_bars_buffered_in_unbounded_list(self):
-        """Bar buffer is an unbounded list — no maxlen truncation."""
+    def test_bars_buffered_within_limit(self):
+        """Bars fit in bounded buffer when under max."""
         loop = asyncio.new_event_loop()
         thread = _start_loop(loop)
         try:
             bus = EventBus()
             db = _DummyDB()
-            pm = PersistenceManager(bus, db, loop)
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td,
+                                        bar_buffer_max=5000)
 
-            # Add many bars
-            for i in range(1000):
-                pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
+                # Add many bars (under limit)
+                for i in range(1000):
+                    pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
 
-            assert len(pm._bar_buffer) == 1000
+                assert len(pm._bar_buffer) == 1000
+                assert not pm._spool_active
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -81,17 +88,18 @@ class TestBarNeverDropped:
         try:
             bus = EventBus()
             db = _DummyDB()
-            pm = PersistenceManager(bus, db, loop)
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td)
 
-            pm._on_bar(_make_bar(ts=1_700_000_000.0))
-            pm._on_bar(_make_bar(ts=1_700_000_060.0))
-            assert len(pm._bar_buffer) == 2
+                pm._on_bar(_make_bar(ts=1_700_000_000.0))
+                pm._on_bar(_make_bar(ts=1_700_000_060.0))
+                assert len(pm._bar_buffer) == 2
 
-            pm._do_flush()
+                pm._do_flush()
 
-            assert len(pm._bar_buffer) == 0
-            assert pm._bars_dropped_total == 0
-            assert pm._bar_flush_success_total == 1
+                assert len(pm._bar_buffer) == 0
+                assert pm._bars_dropped_total == 0
+                assert pm._bar_flush_success_total == 1
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -103,16 +111,17 @@ class TestBarNeverDropped:
         try:
             bus = EventBus()
             db = _DummyDB(fail_count=999)  # Always fail
-            pm = PersistenceManager(bus, db, loop)
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td)
 
-            pm._on_bar(_make_bar(ts=1_700_000_000.0))
-            pm._on_bar(_make_bar(ts=1_700_000_060.0))
-            pm._do_flush()
+                pm._on_bar(_make_bar(ts=1_700_000_000.0))
+                pm._on_bar(_make_bar(ts=1_700_000_060.0))
+                pm._do_flush()
 
-            # Bars should be returned to the buffer
-            assert len(pm._bar_buffer) == 2
-            assert pm._bars_dropped_total == 0
-            assert pm._bar_flush_failure_total == 1
+                # Bars should be returned to the buffer
+                assert len(pm._bar_buffer) == 2
+                assert pm._bars_dropped_total == 0
+                assert pm._bar_flush_failure_total == 1
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -124,15 +133,16 @@ class TestBarNeverDropped:
         try:
             bus = EventBus()
             db = _DummyDB(fail_count=1)  # Fail first attempt, succeed on retry
-            pm = PersistenceManager(bus, db, loop)
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td)
 
-            pm._on_bar(_make_bar(ts=1_700_000_000.0))
-            pm._do_flush()
+                pm._on_bar(_make_bar(ts=1_700_000_000.0))
+                pm._do_flush()
 
-            assert len(pm._bar_buffer) == 0
-            assert pm._bars_dropped_total == 0
-            assert pm._bar_retry_count >= 1
-            assert pm._bar_flush_success_total == 1
+                assert len(pm._bar_buffer) == 0
+                assert pm._bars_dropped_total == 0
+                assert pm._bar_retry_count >= 1
+                assert pm._bar_flush_success_total == 1
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -144,15 +154,161 @@ class TestBarNeverDropped:
         try:
             bus = EventBus()
             db = _DummyDB()
-            pm = PersistenceManager(bus, db, loop)
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td)
 
-            for i in range(100):
-                pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
-            pm._do_flush()
+                for i in range(100):
+                    pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
+                pm._do_flush()
 
-            assert pm._bars_dropped_total == 0
-            status = pm.get_status()
-            assert status["extras"]["bars_dropped_total"] == 0
+                assert pm._bars_dropped_total == 0
+                status = pm.get_status()
+                assert status["extras"]["bars_dropped_total"] == 0
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+
+
+class TestSpoolOverflow:
+    def test_overflow_spools_to_disk(self):
+        """When buffer is full, bars spill to disk spool."""
+        loop = asyncio.new_event_loop()
+        thread = _start_loop(loop)
+        try:
+            bus = EventBus()
+            db = _DummyDB()
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td,
+                                        bar_buffer_max=10)
+
+                # Fill buffer to max
+                for i in range(10):
+                    pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
+                assert len(pm._bar_buffer) == 10
+                assert not pm._spool_active
+
+                # Next bar should go to spool
+                pm._on_bar(_make_bar(ts=1_700_000_600.0))
+                assert pm._spool_active
+                assert pm._spool_bars_pending == 1
+                assert pm._bars_spooled_total == 1
+                assert len(pm._bar_buffer) == 10  # buffer unchanged
+
+                # Add more to spool
+                pm._on_bar(_make_bar(ts=1_700_000_660.0))
+                assert pm._spool_bars_pending == 2
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+
+    def test_spool_drained_after_flush(self):
+        """After buffer flush, spool is drained to DB."""
+        loop = asyncio.new_event_loop()
+        thread = _start_loop(loop)
+        try:
+            bus = EventBus()
+            db = _DummyDB()
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td,
+                                        bar_buffer_max=5)
+
+                # Fill buffer + overflow to spool
+                for i in range(8):
+                    pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
+
+                assert len(pm._bar_buffer) == 5
+                assert pm._spool_bars_pending == 3
+
+                # Flush should drain buffer then spool
+                pm._do_flush()
+
+                assert len(pm._bar_buffer) == 0
+                assert pm._bars_dropped_total == 0
+                # Spool should be drained (3 bars < drain batch of 500)
+                assert not pm._spool_active
+                assert pm._spool_bars_pending == 0
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+
+    def test_no_bars_dropped_during_overflow(self):
+        """Zero bars are dropped even during overflow."""
+        loop = asyncio.new_event_loop()
+        thread = _start_loop(loop)
+        try:
+            bus = EventBus()
+            db = _DummyDB()
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td,
+                                        bar_buffer_max=5)
+
+                for i in range(20):
+                    pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
+
+                # All bars accounted for: buffer + spool
+                total = len(pm._bar_buffer) + pm._spool_bars_pending
+                assert total == 20
+                assert pm._bars_dropped_total == 0
+
+                # Flush everything
+                pm._do_flush()
+                assert pm._bars_dropped_total == 0
+                # All bars written to DB
+                total_written = sum(len(b) for b in db.bar_batches)
+                assert total_written == 20
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+
+    def test_spool_recovery_on_restart(self):
+        """Leftover spool from previous crash is detected."""
+        loop = asyncio.new_event_loop()
+        thread = _start_loop(loop)
+        try:
+            bus = EventBus()
+            db = _DummyDB()
+            with tempfile.TemporaryDirectory() as td:
+                # Simulate a leftover spool file
+                spool_path = os.path.join(td, "bar_spool.jsonl")
+                bar = _make_bar(ts=1_700_000_000.0)
+                from dataclasses import asdict
+                with open(spool_path, "w") as f:
+                    f.write(json.dumps(asdict(bar)) + "\n")
+                    f.write(json.dumps(asdict(bar)) + "\n")
+
+                pm = PersistenceManager(bus, db, loop, spool_dir=td)
+                assert pm._spool_active
+                assert pm._spool_bars_pending == 2
+
+                # Flush should drain the recovered spool
+                pm._do_flush()
+                assert not pm._spool_active
+                assert pm._spool_bars_pending == 0
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+
+    def test_status_includes_spool_metrics(self):
+        """Status dict exposes spool state."""
+        loop = asyncio.new_event_loop()
+        thread = _start_loop(loop)
+        try:
+            bus = EventBus()
+            db = _DummyDB()
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td,
+                                        bar_buffer_max=5)
+                # Trigger spool
+                for i in range(7):
+                    pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
+
+                status = pm.get_status()
+                extras = status["extras"]
+                assert extras["spool_active"] is True
+                assert extras["spool_bars_pending"] == 2
+                assert extras["bars_spooled_total"] == 2
+                assert extras["spool_file_size"] > 0
+                assert extras["bar_buffer_max"] == 5
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -166,12 +322,13 @@ class TestPriorityQueues:
         try:
             bus = EventBus()
             db = _DummyDB()
-            pm = PersistenceManager(bus, db, loop)
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td)
 
-            # Verify separate queues exist
-            assert pm._signal_queue is not pm._telemetry_queue
-            assert pm._signal_queue.maxsize > 0
-            assert pm._telemetry_queue.maxsize > 0
+                # Verify separate queues exist
+                assert pm._signal_queue is not pm._telemetry_queue
+                assert pm._signal_queue.maxsize > 0
+                assert pm._telemetry_queue.maxsize > 0
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -183,24 +340,25 @@ class TestPriorityQueues:
         try:
             bus = EventBus()
             db = _DummyDB()
-            pm = PersistenceManager(bus, db, loop)
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td)
 
-            # Fill the signal queue manually
-            from queue import Full
-            for _ in range(pm._signal_queue.maxsize):
-                pm._signal_queue.put_nowait(("signal", None))
+                # Fill the signal queue manually
+                from queue import Full
+                for _ in range(pm._signal_queue.maxsize):
+                    pm._signal_queue.put_nowait(("signal", None))
 
-            # This should trigger a drop
-            signal = SignalEvent(
-                detector="test",
-                symbol="BTC",
-                signal_type="test",
-                priority=1,
-                data={},
-                timestamp=time.time(),
-            )
-            pm._on_signal(signal)
-            assert pm._signals_dropped_total == 1
+                # This should trigger a drop
+                signal = SignalEvent(
+                    detector="test",
+                    symbol="BTC",
+                    signal_type="test",
+                    priority=1,
+                    data={},
+                    timestamp=time.time(),
+                )
+                pm._on_signal(signal)
+                assert pm._signals_dropped_total == 1
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -212,21 +370,22 @@ class TestPriorityQueues:
         try:
             bus = EventBus()
             db = _DummyDB()
-            pm = PersistenceManager(bus, db, loop)
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td)
 
-            # Fill the telemetry queue
-            for _ in range(pm._telemetry_queue.maxsize):
-                pm._telemetry_queue.put_nowait(("metric", None))
+                # Fill the telemetry queue
+                for _ in range(pm._telemetry_queue.maxsize):
+                    pm._telemetry_queue.put_nowait(("metric", None))
 
-            metric = MetricEvent(
-                symbol="BTC",
-                metric="test",
-                value=1.0,
-                source="test",
-                timestamp=time.time(),
-            )
-            pm._on_metric(metric)
-            assert pm._metrics_dropped_total == 1
+                metric = MetricEvent(
+                    symbol="BTC",
+                    metric="test",
+                    value=1.0,
+                    source="test",
+                    timestamp=time.time(),
+                )
+                pm._on_metric(metric)
+                assert pm._metrics_dropped_total == 1
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -239,17 +398,22 @@ class TestStatusCounters:
         try:
             bus = EventBus()
             db = _DummyDB()
-            pm = PersistenceManager(bus, db, loop)
-            status = pm.get_status()
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(bus, db, loop, spool_dir=td)
+                status = pm.get_status()
 
-            extras = status["extras"]
-            assert "bars_dropped_total" in extras
-            assert "bar_flush_success_total" in extras
-            assert "bar_flush_failure_total" in extras
-            assert "bar_retry_count" in extras
-            assert "signal_queue_depth" in extras
-            assert "telemetry_queue_depth" in extras
-            assert extras["bars_dropped_total"] == 0
+                extras = status["extras"]
+                assert "bars_dropped_total" in extras
+                assert "bar_flush_success_total" in extras
+                assert "bar_flush_failure_total" in extras
+                assert "bar_retry_count" in extras
+                assert "signal_queue_depth" in extras
+                assert "telemetry_queue_depth" in extras
+                assert extras["bars_dropped_total"] == 0
+                # Spool metrics present
+                assert "spool_active" in extras
+                assert "spool_bars_pending" in extras
+                assert "bars_spooled_total" in extras
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)

@@ -88,6 +88,12 @@ def build_soak_summary(
                 "bar_flush_retries": getattr(persistence, "_bar_retry_count", 0),
                 "persist_lag_ms": ps.get("extras", {}).get("persist_lag_ms"),
                 "persist_lag_ema_ms": ps.get("extras", {}).get("persist_lag_ema_ms"),
+                # Spool overflow metrics
+                "spool_active": ps.get("extras", {}).get("spool_active", False),
+                "spool_bars_pending": ps.get("extras", {}).get("spool_bars_pending", 0),
+                "spool_file_size": ps.get("extras", {}).get("spool_file_size", 0),
+                "bars_spooled_total": ps.get("extras", {}).get("bars_spooled_total", 0),
+                "spool_write_errors": ps.get("extras", {}).get("spool_write_errors", 0),
             }
         except Exception as e:
             summary["persistence_telemetry"] = {"error": str(e)}
@@ -106,6 +112,10 @@ def build_soak_summary(
                 "bars_emitted_by_symbol": extras.get("bars_emitted_by_symbol", {}),
                 "bars_emitted_recent_by_symbol": extras.get("bars_emitted_recent_by_symbol", {}),
                 "bar_invariant_violations": extras.get("bar_invariant_violations", 0),
+                # Rolling bars/minute (5-minute window)
+                "bars_per_minute_by_symbol": extras.get("bars_per_minute_by_symbol", {}),
+                "bars_per_minute_p50": extras.get("bars_per_minute_p50", 0.0),
+                "bars_per_minute_p95": extras.get("bars_per_minute_p95", 0.0),
             }
         except Exception as e:
             summary["data_integrity"] = {"error": str(e)}

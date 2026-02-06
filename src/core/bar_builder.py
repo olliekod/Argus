@@ -419,6 +419,19 @@ class BarBuilder:
                 symbol: sum(1 for ts in timestamps if (now - ts) <= (self._bars_emitted_window_minutes * 60))
                 for symbol, timestamps in self._bars_emitted_timestamps_by_symbol.items()
             }
+            # Rolling bars/minute (last 5 minutes)
+            _bpm_window = 300  # 5 minutes
+            bars_per_minute_by_symbol = {}
+            for symbol, timestamps in self._bars_emitted_timestamps_by_symbol.items():
+                recent = sum(1 for ts in timestamps if (now - ts) <= _bpm_window)
+                bars_per_minute_by_symbol[symbol] = round(recent / 5.0, 2)
+            # Aggregate stats across symbols
+            all_rates = sorted(bars_per_minute_by_symbol.values()) if bars_per_minute_by_symbol else []
+            bars_per_minute_p50 = all_rates[len(all_rates) // 2] if all_rates else 0.0
+            bars_per_minute_p95 = (
+                all_rates[min(int(len(all_rates) * 0.95), len(all_rates) - 1)]
+                if all_rates else 0.0
+            )
 
         ages = {
             symbol: round(now - ts, 1)
@@ -454,6 +467,9 @@ class BarBuilder:
                 "bars_emitted_by_symbol": bars_emitted_by_symbol,
                 "bars_emitted_recent_by_symbol": bars_emitted_recent_by_symbol,
                 "bars_emitted_recent_window_minutes": self._bars_emitted_window_minutes,
+                "bars_per_minute_by_symbol": bars_per_minute_by_symbol,
+                "bars_per_minute_p50": bars_per_minute_p50,
+                "bars_per_minute_p95": bars_per_minute_p95,
                 "last_bar_ts_by_symbol": {
                     symbol: datetime.fromtimestamp(ts, tz=timezone.utc).isoformat()
                     for symbol, ts in last_bar_ts.items()

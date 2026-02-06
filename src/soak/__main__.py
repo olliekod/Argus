@@ -117,6 +117,14 @@ def _print_summary(data: dict) -> None:
         lag = pt.get("persist_lag_ema_ms")
         if lag is not None:
             print(f"    persist_lag_ema: {lag:.0f}ms")
+        # Spool overflow status
+        if pt.get("spool_active"):
+            pending = pt.get("spool_bars_pending", 0)
+            size_mb = pt.get("spool_file_size", 0) / (1024 * 1024)
+            total = pt.get("bars_spooled_total", 0)
+            errors = pt.get("spool_write_errors", 0)
+            print(f"    [!!] SPOOL ACTIVE: {pending} bars pending ({size_mb:.1f}MB)")
+            print(f"         bars_spooled_total: {total}  write_errors: {errors}")
 
     # Data integrity
     di = data.get("data_integrity", {})
@@ -130,6 +138,14 @@ def _print_summary(data: dict) -> None:
             print(f"      by_symbol: {rejected}")
         print(f"    late_ticks_dropped_total: {di.get('late_ticks_dropped_total', 0)}")
         print(f"    bar_invariant_violations: {di.get('bar_invariant_violations', 0)}")
+        # Rolling bars/minute
+        bpm = di.get("bars_per_minute_by_symbol", {})
+        if bpm:
+            p50 = di.get("bars_per_minute_p50", 0)
+            p95 = di.get("bars_per_minute_p95", 0)
+            print(f"    bars/min (5m window): p50={p50:.2f}  p95={p95:.2f}")
+            for sym, rate in sorted(bpm.items()):
+                print(f"      {sym}: {rate:.2f}/min")
 
     # Resources
     res = data.get("resources", {})

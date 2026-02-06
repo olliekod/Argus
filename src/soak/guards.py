@@ -67,6 +67,10 @@ _DEFAULTS: Dict[str, Any] = {
     "wal_size_warn_mb": 1024,
     "wal_size_alert_mb": 2048,
 
+    # Bar buffer pressure / spool
+    "bar_buffer_pressure_warn_pct": 70,   # % of buffer max
+    "bar_buffer_pressure_alert_pct": 90,  # % of buffer max
+
     # Alert rate limiting
     "alert_cooldown_s": 300,
 }
@@ -176,6 +180,7 @@ class SoakGuardian:
         triggered += self._check_bar_liveness(bar_builder_status, now)
         triggered += self._check_disk_fatigue(resource_snapshot, now)
         triggered += self._check_bars_dropped(now)
+        triggered += self._check_bar_buffer_pressure(persistence_status, now)
 
         # Update previous state
         self._prev_bus_stats = {
@@ -456,6 +461,48 @@ class SoakGuardian:
                 f"This should never happen.",
                 now,
             )
+        self._set_health(guard, "ok")
+        return []
+
+    def _check_bar_buffer_pressure(
+        self, persist_status: Dict, now: float
+    ) -> List[Dict[str, Any]]:
+        guard = "bar_buffer_pressure"
+        extras = persist_status.get("extras", {})
+        buf_size = extras.get("bar_buffer_size", 0)
+        buf_max = extras.get("bar_buffer_max", 1)
+        spool_active = extras.get("spool_active", False)
+        spool_pending = extras.get("spool_bars_pending", 0)
+        spool_bytes = extras.get("spool_file_size", 0)
+
+        # Spool active is an immediate alert
+        if spool_active:
+            return self._fire(
+                ALERT, guard,
+                f"Bar spool ACTIVE — {spool_pending} bars pending on disk "
+                f"({spool_bytes / (1024*1024):.1f}MB). "
+                f"In-memory buffer={buf_size}/{buf_max}",
+                now,
+            )
+
+        pct = (buf_size / max(1, buf_max)) * 100
+        alert_pct = self._cfg["bar_buffer_pressure_alert_pct"]
+        warn_pct = self._cfg["bar_buffer_pressure_warn_pct"]
+
+        if pct >= alert_pct:
+            return self._fire(
+                ALERT, guard,
+                f"Bar buffer at {pct:.0f}% ({buf_size}/{buf_max}) — "
+                f"approaching spool threshold",
+                now,
+            )
+        if pct >= warn_pct:
+            return self._fire(
+                WARN, guard,
+                f"Bar buffer at {pct:.0f}% ({buf_size}/{buf_max})",
+                now,
+            )
+
         self._set_health(guard, "ok")
         return []
 
