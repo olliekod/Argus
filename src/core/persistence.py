@@ -80,6 +80,7 @@ _PERSIST_LAG_MAX_AGE_SECONDS = 300.0  # Ignore bar timestamps older than this
 _PERSIST_LAG_MAX_FUTURE_SKEW_SECONDS = 2.0  # Clamp if timestamp too far in future
 _SOURCE_TS_LOG_INTERVAL_SECONDS = 60.0
 _SOURCE_TS_SYMBOL_MAX = 200
+_SOURCE_TS_LOG_SYMBOL_MAX = 200
 
 _CRYPTO_SOURCES = {"bybit", "binance", "coinbase", "okx"}
 _DERIBIT_SOURCES = {"deribit"}
@@ -253,7 +254,7 @@ class PersistenceManager:
         self._source_ts_stale_ignored_by_symbol: "OrderedDict[str, int]" = OrderedDict()
         self._source_ts_units_discarded_by_symbol: "OrderedDict[str, int]" = OrderedDict()
         self._source_ts_missing_by_symbol: "OrderedDict[str, int]" = OrderedDict()
-        self._source_ts_future_log_ts_by_symbol: Dict[str, float] = {}
+        self._source_ts_future_log_ts_by_symbol: "OrderedDict[str, float]" = OrderedDict()
 
         # Recover spool from previous crash (if any)
         self._recover_spool()
@@ -539,6 +540,18 @@ class PersistenceManager:
             store.popitem(last=False)
         store[symbol] = 1
 
+    def _record_future_log_ts(self, symbol: str, now: float) -> None:
+        if not symbol:
+            symbol = "unknown"
+        store = self._source_ts_future_log_ts_by_symbol
+        if symbol in store:
+            store[symbol] = now
+            store.move_to_end(symbol)
+            return
+        if len(store) >= _SOURCE_TS_LOG_SYMBOL_MAX:
+            store.popitem(last=False)
+        store[symbol] = now
+
     def _extract_source_ts_for_lag(
         self, bar: BarEvent, now: float
     ) -> Optional[float]:
@@ -571,7 +584,7 @@ class PersistenceManager:
                 )
                 last_log = self._source_ts_future_log_ts_by_symbol.get(symbol, 0.0)
                 if (now - last_log) >= _SOURCE_TS_LOG_INTERVAL_SECONDS:
-                    self._source_ts_future_log_ts_by_symbol[symbol] = now
+                    self._record_future_log_ts(symbol, now)
                     logger.info(
                         "Clamped future bar source_ts for %s: %.3f > now+%.1fs",
                         symbol,

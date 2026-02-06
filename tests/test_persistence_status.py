@@ -5,7 +5,7 @@ import time
 
 from src.core.bus import EventBus
 from src.core.events import BarEvent
-from src.core.persistence import PersistenceManager
+from src.core.persistence import PersistenceManager, _SOURCE_TS_LOG_SYMBOL_MAX
 
 
 class _DummyDB:
@@ -240,6 +240,38 @@ def test_persist_lag_future_within_skew_not_clamped():
 
             assert status["extras"]["source_ts_future_clamped_total"] == 0
             assert status["extras"]["persist_lag_ema_ms"] is not None
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+
+
+def test_future_log_tracking_is_bounded():
+    loop = asyncio.new_event_loop()
+    thread = _start_loop(loop)
+
+    try:
+        bus = EventBus()
+        with tempfile.TemporaryDirectory() as td:
+            pm = PersistenceManager(bus, _DummyDB(), loop, spool_dir=td)
+            now = time.time()
+            for i in range(_SOURCE_TS_LOG_SYMBOL_MAX + 10):
+                bar = BarEvent(
+                    symbol=f"SYM{i}",
+                    open=100.0,
+                    high=101.0,
+                    low=99.0,
+                    close=100.5,
+                    volume=10.0,
+                    timestamp=now,
+                    source="bybit",
+                    bar_duration=60,
+                    tick_count=1,
+                    source_ts=now + 10.0,
+                    last_source_ts=now + 10.0,
+                )
+                pm._extract_source_ts_for_lag(bar, now)
+
+            assert len(pm._source_ts_future_log_ts_by_symbol) <= _SOURCE_TS_LOG_SYMBOL_MAX
     finally:
         loop.call_soon_threadsafe(loop.stop)
         thread.join(timeout=2)
