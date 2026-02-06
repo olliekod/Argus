@@ -270,7 +270,6 @@ class TestPersistLagGuard:
         })
         assert g._cfg["persist_lag_use_crypto_only"] is True
 
-
 class TestBarLivenessGuard:
     def test_active_bars_ok(self):
         g = SoakGuardian(config={

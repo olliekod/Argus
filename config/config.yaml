@@ -237,6 +237,6 @@ soak:
 
   # Tape recorder (determinism artifact capture)
   tape:
-    enabled: false                        # Set true to activate
-    symbols: []                           # Empty = capture all symbols
+    enabled: true                        # Set true to activate
+    symbols: ["BTCUSDT", "ETHUSDT", "BTC-INDEX", "IBIT", "BITO"]  # Empty = capture all symbols
     maxlen: 100000                        # Max events in rolling buffer
