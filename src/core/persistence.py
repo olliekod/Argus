@@ -56,9 +56,11 @@ from .events import (
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_METRICS,
     TOPIC_SIGNALS,
+    TOPIC_SIGNALS_RAW,
     TOPIC_SYSTEM_HEARTBEAT,
     TOPIC_SYSTEM_COMPONENT_HEARTBEAT,
 )
+from .signals import SignalEvent as Phase3SignalEvent
 
 logger = logging.getLogger("argus.persistence")
 
@@ -262,6 +264,7 @@ class PersistenceManager:
         # Subscribe to relevant topics
         bus.subscribe(TOPIC_MARKET_BARS, self._on_bar)
         bus.subscribe(TOPIC_SIGNALS, self._on_signal)
+        bus.subscribe(TOPIC_SIGNALS_RAW, self._on_signal_raw)
         bus.subscribe(TOPIC_SYSTEM_HEARTBEAT, self._on_heartbeat)
         bus.subscribe(TOPIC_MARKET_METRICS, self._on_metric)
         bus.subscribe(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, self._on_component_heartbeat)
@@ -654,6 +657,15 @@ class PersistenceManager:
                 self._signals_dropped_total += 1
             logger.warning("Signal queue full — dropping signal event")
 
+    def _on_signal_raw(self, event: Phase3SignalEvent) -> None:
+        """Persist Phase 3 signals via medium-priority queue."""
+        try:
+            self._signal_queue.put_nowait(("signal_raw", event))
+        except Full:
+            with self._status_lock:
+                self._signals_dropped_total += 1
+            logger.warning("Signal queue full — dropping raw signal event")
+
     def _on_heartbeat(self, event: HeartbeatEvent) -> None:
         """Flush buffered bars on heartbeat boundary."""
         self._do_flush()
@@ -698,6 +710,10 @@ class PersistenceManager:
                 if kind == "signal":
                     future = asyncio.run_coroutine_threadsafe(
                         self._write_signal(event), self._loop
+                    )
+                elif kind == "signal_raw":
+                    future = asyncio.run_coroutine_threadsafe(
+                        self._write_phase3_signal(event), self._loop
                     )
                 elif kind == "metric":
                     future = asyncio.run_coroutine_threadsafe(
@@ -908,6 +924,46 @@ class PersistenceManager:
             self._last_write_ts = now
             self._consecutive_failures = 0
         logger.debug("Persisted signal: %s %s", event.detector, event.signal_type)
+
+    async def _write_phase3_signal(self, event: Phase3SignalEvent) -> None:
+        """Write a Phase 3 signal event immediately."""
+        regime_json = (
+            json.dumps(event.regime_snapshot, sort_keys=True)
+            if event.regime_snapshot
+            else None
+        )
+        features_json = (
+            json.dumps(event.features_snapshot, sort_keys=True)
+            if event.features_snapshot
+            else None
+        )
+        await self._db.write_signal(
+            idempotency_key=event.idempotency_key,
+            timestamp_ms=event.timestamp_ms,
+            strategy_id=event.strategy_id,
+            config_hash=event.config_hash,
+            symbol=event.symbol,
+            direction=event.direction,
+            signal_type=event.signal_type,
+            timeframe=event.timeframe,
+            entry_type=event.entry_type,
+            entry_price=event.entry_price,
+            stop_price=event.stop_price,
+            tp_price=event.tp_price,
+            horizon=event.horizon,
+            confidence=event.confidence,
+            quality_score=event.quality_score,
+            data_quality_flags=event.data_quality_flags,
+            regime_snapshot_json=regime_json,
+            features_snapshot_json=features_json,
+            explain=event.explain,
+        )
+        now = time.time()
+        with self._status_lock:
+            self._signals_writes_total += 1
+            self._last_write_ts = now
+            self._consecutive_failures = 0
+        logger.debug("Persisted Phase 3 signal: %s", event.strategy_id)
 
     async def _write_metric(self, event: MetricEvent) -> None:
         """Generic DB writer for market metrics."""

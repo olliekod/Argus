@@ -53,6 +53,8 @@ SIGNAL_TYPE_FILTER = "FILTER"  # e.g., "market window open"
 
 def _round_float(val: float, decimals: int = 8) -> float:
     """Round float to fixed decimals for stable serialization."""
+    if not isinstance(val, (int, float)):
+        return val
     return round(val, decimals)
 
 
