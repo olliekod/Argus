@@ -72,20 +72,7 @@ VOL_WINDOW = 20
 # ~525600 minutes per year → sqrt ≈ 725
 ANNUALIZE_1M = 725.0
 
-# Session time boundaries (UTC hour)
-# Equities
-EQUITIES_PRE_START = 9      # 4 AM ET = 9 UTC
-EQUITIES_RTH_START = 14     # 9:30 AM ET ≈ 14 UTC (simplified)
-EQUITIES_RTH_END = 21       # 4 PM ET = 21 UTC
-EQUITIES_POST_END = 1       # 8 PM ET = 1 UTC next day
-
-# Crypto
-CRYPTO_ASIA_START = 0       # 00:00 UTC
-CRYPTO_ASIA_END = 8         # 08:00 UTC
-CRYPTO_EU_START = 8         # 08:00 UTC
-CRYPTO_EU_END = 14          # 14:00 UTC
-CRYPTO_US_START = 14        # 14:00 UTC
-CRYPTO_US_END = 22          # 22:00 UTC
+from .sessions import get_session_regime
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -512,28 +499,7 @@ class RegimeDetector:
 
     def _get_session_regime(self, market: str, ts_ms: int) -> str:
         """Determine session from timestamp (no wall clock)."""
-        # Convert ms to hour of day (UTC)
-        seconds = ts_ms // 1000
-        hour = (seconds // 3600) % 24
-        
-        if market == "EQUITIES":
-            if EQUITIES_RTH_START <= hour < EQUITIES_RTH_END:
-                return "RTH"
-            elif EQUITIES_PRE_START <= hour < EQUITIES_RTH_START:
-                return "PRE"
-            elif hour >= EQUITIES_RTH_END or hour < EQUITIES_POST_END:
-                return "POST"
-            else:
-                return "CLOSED"
-        else:  # CRYPTO
-            if CRYPTO_ASIA_START <= hour < CRYPTO_ASIA_END:
-                return "ASIA"
-            elif CRYPTO_EU_START <= hour < CRYPTO_EU_END:
-                return "EU"
-            elif CRYPTO_US_START <= hour < CRYPTO_US_END:
-                return "US"
-            else:
-                return "OFFPEAK"
+        return get_session_regime(market, ts_ms)
 
     # ─── Public API ───────────────────────────────────────────────────────
 

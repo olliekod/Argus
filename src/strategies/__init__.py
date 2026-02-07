@@ -9,10 +9,12 @@ Phase 3 deterministic strategy framework.
 """
 
 from .base import BaseStrategy
+from .dow_regime_timing import DowRegimeTimingGateStrategy
 from .router import SignalRouter, DEFAULT_RANKER_CONFIG
 
 __all__ = [
     "BaseStrategy",
+    "DowRegimeTimingGateStrategy",
     "SignalRouter",
     "DEFAULT_RANKER_CONFIG",
 ]
