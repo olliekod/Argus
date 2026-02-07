@@ -163,11 +163,32 @@ class FeatureBuilder:
         return hb
 
     def get_status(self) -> Dict[str, Any]:
+        from .status import build_status
+        
+        now = time.time()
         with self._lock:
-            return {
-                "name": "feature_builder",
-                "bars_processed": self._bars_processed,
-                "metrics_emitted": self._metrics_emitted,
-                "symbols_tracked": len(self._last_close),
-                "uptime_seconds": round(time.time() - self._start_time, 1),
-            }
+            bars_processed = self._bars_processed
+            metrics_emitted = self._metrics_emitted
+            symbols_tracked = len(self._last_close)
+        
+        # Determine health status
+        uptime = now - self._start_time
+        if bars_processed > 0:
+            status = "ok"
+        elif uptime > 120:
+            status = "down"  # No data after 2 minutes
+        else:
+            status = "ok"  # Still starting up
+        
+        return build_status(
+            name="feature_builder",
+            type="internal",
+            status=status,
+            request_count=bars_processed,
+            extras={
+                "bars_processed": bars_processed,
+                "metrics_emitted": metrics_emitted,
+                "symbols_tracked": symbols_tracked,
+                "uptime_seconds": round(uptime, 1),
+            },
+        )

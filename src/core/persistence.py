@@ -843,7 +843,11 @@ class PersistenceManager:
     # ── async DB writers ────────────────────────────────────
 
     async def _write_bars(self, bars: List[BarEvent]) -> None:
-        """Batch-insert 1-minute bars into the ``market_bars`` table."""
+        """Batch-insert 1-minute bars into the ``market_bars`` table.
+        
+        Uses INSERT OR REPLACE for idempotent upsert behavior. Unique constraint
+        is on (source, symbol, bar_duration, timestamp).
+        """
         rows = [
             (
                 datetime.fromtimestamp(b.timestamp, tz=timezone.utc).isoformat(),
@@ -860,6 +864,7 @@ class PersistenceManager:
                 getattr(b, 'last_source_ts', None),
                 getattr(b, 'late_ticks_dropped', 0),
                 getattr(b, 'close_reason', 0),
+                getattr(b, 'bar_duration', 60),
             )
             for b in bars
             if b.bar_duration == 60  # only 1m bars
@@ -867,11 +872,11 @@ class PersistenceManager:
         if not rows:
             return
         await self._db.execute_many(
-            """INSERT OR IGNORE INTO market_bars
+            """INSERT OR REPLACE INTO market_bars
                (timestamp, symbol, source, open, high, low, close, volume,
                 tick_count, n_ticks, first_source_ts, last_source_ts,
-                late_ticks_dropped, close_reason)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                late_ticks_dropped, close_reason, bar_duration)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             rows,
         )
         now = time.time()
@@ -880,6 +885,7 @@ class PersistenceManager:
             self._last_write_ts = now
             self._consecutive_failures = 0
         logger.debug("Flushed %d bars to market_bars", len(rows))
+
 
     async def _write_signal(self, event: SignalEvent) -> None:
         """Write a signal event immediately."""

@@ -225,11 +225,32 @@ class RegimeDetector:
         return hb
 
     def get_status(self) -> Dict[str, Any]:
+        from .status import build_status
+        
+        now = time.time()
         with self._lock:
-            return {
-                "name": "regime_detector",
-                "events_processed": self._events_processed,
-                "regime_changes_total": self._regime_changes,
-                "current_regimes": dict(self._current_regime),
-                "uptime_seconds": round(time.time() - self._start_time, 1),
-            }
+            events_processed = self._events_processed
+            regime_changes = self._regime_changes
+            current_regimes = dict(self._current_regime)
+        
+        # Determine health status
+        uptime = now - self._start_time
+        if events_processed > 0:
+            status = "ok"
+        elif uptime > 120:
+            status = "down"  # No data after 2 minutes
+        else:
+            status = "ok"  # Still starting up
+        
+        return build_status(
+            name="regime_detector",
+            type="internal",
+            status=status,
+            request_count=events_processed,
+            extras={
+                "events_processed": events_processed,
+                "regime_changes_total": regime_changes,
+                "current_regimes": current_regimes,
+                "uptime_seconds": round(uptime, 1),
+            },
+        )

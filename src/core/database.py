@@ -335,9 +335,8 @@ class Database:
             )
         """)
 
-        # ── Event-bus tables ──────────────────────────────
-
         # 1-minute OHLCV bars (from BarBuilder → PersistenceManager)
+        # Unique constraint: (source, symbol, bar_duration, timestamp) for idempotent upserts
         await self._connection.execute("""
             CREATE TABLE IF NOT EXISTS market_bars (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -355,12 +354,17 @@ class Database:
                 last_source_ts REAL,
                 late_ticks_dropped INTEGER DEFAULT 0,
                 close_reason INTEGER DEFAULT 0,
-                UNIQUE(timestamp, symbol, source)
+                bar_duration INTEGER DEFAULT 60,
+                UNIQUE(source, symbol, bar_duration, timestamp)
             )
         """)
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_bars_ts_sym "
             "ON market_bars(timestamp, symbol)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bars_source_sym_ts "
+            "ON market_bars(source, symbol, timestamp)"
         )
 
         # ── Provenance column migration (safe ALTER for existing DBs) ──
@@ -370,6 +374,7 @@ class Database:
             ("last_source_ts", "REAL", "NULL"),
             ("late_ticks_dropped", "INTEGER", "0"),
             ("close_reason", "INTEGER", "0"),
+            ("bar_duration", "INTEGER", "60"),
         ]:
             try:
                 await self._connection.execute(
@@ -1099,6 +1104,49 @@ class Database:
         await self._connection.execute("PRAGMA optimize")
         logger.info("PRAGMA optimize completed")
         return await self.get_db_stats()
+
+    # =========================================================================
+    # Bar Query Operations (for restart dedupe)
+    # =========================================================================
+
+    async def get_latest_bar_ts(
+        self, source: str, symbol: str, bar_duration: int = 60
+    ) -> Optional[int]:
+        """Get the latest bar timestamp (ms) for a provider+symbol+timeframe.
+        
+        Used by connectors on startup to initialize last_bar_ts for dedupe.
+        
+        Parameters
+        ----------
+        source : str
+            Provider name (e.g., 'alpaca', 'bybit').
+        symbol : str
+            Trading symbol.
+        bar_duration : int
+            Bar duration in seconds (default 60 for 1m bars).
+        
+        Returns
+        -------
+        int or None
+            Latest bar timestamp in milliseconds (bar open time), or None if no bars.
+        """
+        cursor = await self._connection.execute(
+            """
+            SELECT timestamp FROM market_bars
+            WHERE source = ? AND symbol = ? AND bar_duration = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (source, symbol, bar_duration),
+        )
+        row = await cursor.fetchone()
+        if row and row['timestamp']:
+            # Parse ISO timestamp to ms
+            from datetime import timezone
+            ts_str = row['timestamp']
+            dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+            return int(dt.timestamp() * 1000)
+        return None
 
     async def get_db_stats(self) -> Dict[str, Any]:
         """Get database size and table row counts."""

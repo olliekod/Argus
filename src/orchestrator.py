@@ -48,6 +48,7 @@ from .core.conditions_monitor import ConditionsMonitor
 from .connectors.bybit_ws import BybitWebSocket
 from .connectors.deribit_client import DeribitClient
 from .connectors.yahoo_client import YahooFinanceClient
+from .connectors.alpaca_client import AlpacaDataClient
 from .connectors.polymarket_gamma import PolymarketGammaClient
 from .connectors.polymarket_clob import PolymarketCLOBClient
 from .connectors.polymarket_watchlist import PolymarketWatchlistService
@@ -148,6 +149,7 @@ class ArgusOrchestrator:
             "bybit",
             "deribit",
             "yahoo",
+            "alpaca",
             "binance",
             "okx",
             "coinglass",
@@ -176,6 +178,7 @@ class ArgusOrchestrator:
         self.bybit_ws: Optional[BybitWebSocket] = None
         self.deribit_client: Optional[DeribitClient] = None
         self.yahoo_client: Optional[YahooFinanceClient] = None
+        self.alpaca_client: Optional[AlpacaDataClient] = None
         self.telegram: Optional[TelegramBot] = None
         
         # Off-hours monitoring
@@ -355,6 +358,7 @@ class ArgusOrchestrator:
             "bybit": self.bybit_ws,
             "deribit": self.deribit_client,
             "yahoo": self.yahoo_client,
+            "alpaca": self.alpaca_client,
             "binance": getattr(self, "binance_ws", None),
             "okx": getattr(self, "okx_client", None),
             "coinglass": getattr(self, "coinglass_client", None),
@@ -519,6 +523,32 @@ class ArgusOrchestrator:
             event_bus=self.event_bus,
         )
         self.logger.info("Yahoo Finance client configured for IBIT/BITO")
+
+        # Alpaca Data Client for IBIT/BITO bars (runs in ALL modes - data only, no execution)
+        alpaca_cfg = self.config.get('exchanges', {}).get('alpaca', {})
+        if alpaca_cfg.get('enabled', False):
+            alpaca_api_key = get_secret(self.secrets, 'alpaca', 'api_key')
+            alpaca_api_secret = get_secret(self.secrets, 'alpaca', 'api_secret')
+            if alpaca_api_key and alpaca_api_secret:
+                self.alpaca_client = AlpacaDataClient(
+                    api_key=alpaca_api_key,
+                    api_secret=alpaca_api_secret,
+                    symbols=alpaca_cfg.get('symbols', ['IBIT', 'BITO']),
+                    event_bus=self.event_bus,
+                    db=self.db,  # For restart dedupe initialization
+                    poll_interval=int(alpaca_cfg.get('poll_interval_seconds', 60)),
+                    overlap_seconds=int(alpaca_cfg.get('overlap_seconds', 120)),
+                )
+                self.logger.info(
+                    "Alpaca Data client configured for %s (fixed poll_interval=%ds, overlap=%ds)",
+                    alpaca_cfg.get('symbols', ['IBIT', 'BITO']),
+                    alpaca_cfg.get('poll_interval_seconds', 60),
+                    alpaca_cfg.get('overlap_seconds', 120),
+                )
+            else:
+                self.logger.warning("Alpaca enabled but API keys not found in secrets.yaml")
+        else:
+            self.logger.info("Alpaca Data client disabled (set exchanges.alpaca.enabled=true to activate)")
 
     async def _setup_polymarket(self) -> None:
         """Initialize Polymarket connectors (optional, fail-soft)."""
@@ -2155,6 +2185,11 @@ class ArgusOrchestrator:
         if self.yahoo_client:
             self._tasks.append(asyncio.create_task(self._poll_yahoo_market_hours_aware()))
 
+        # Alpaca bars polling (runs in ALL modes - data only, no execution)
+        # Uses FIXED INTERVAL polling - no market-hours gating for determinism
+        if self.alpaca_client:
+            self._tasks.append(asyncio.create_task(self.alpaca_client.poll()))
+
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._health_check()))
         self._tasks.append(asyncio.create_task(self._run_db_maintenance()))
@@ -2241,6 +2276,37 @@ class ArgusOrchestrator:
                 await asyncio.sleep(interval)
             except Exception as e:
                 self.logger.error(f"Yahoo market-hours poll error: {e}")
+                await asyncio.sleep(60)
+
+    async def _poll_alpaca_market_hours_aware(self) -> None:
+        """Poll Alpaca for IBIT/BITO bars with market-hours awareness.
+
+        During US market hours: poll every poll_interval (config, default 60s).
+        Off-hours: poll every off_hours_sample_interval_seconds (default 600s).
+
+        NOTE: Runs in ALL modes (collector, paper, live) - this is DATA only, no execution.
+        """
+        if not self.alpaca_client:
+            return
+            
+        alpaca_cfg = self.config.get('exchanges', {}).get('alpaca', {})
+        on_interval = int(alpaca_cfg.get('poll_interval_seconds', 60))
+        off_interval = int(self._mh_cfg.get('off_hours_sample_interval_seconds', 600))
+
+        while self._running:
+            try:
+                market_open = self._is_us_market_open()
+                interval = on_interval if market_open else off_interval
+
+                # One poll cycle
+                await self.alpaca_client.poll_once()
+
+                if not market_open:
+                    self.logger.debug(f"US market closed, next Alpaca poll in {interval}s")
+
+                await asyncio.sleep(interval)
+            except Exception as e:
+                self.logger.error(f"Alpaca market-hours poll error: {e}")
                 await asyncio.sleep(60)
 
     # ── Heartbeat publisher ───────────────────────────────

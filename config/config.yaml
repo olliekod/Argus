@@ -49,6 +49,12 @@ exchanges:
     testnet: true  # Start with testnet for safety
     rate_limit: 5
 
+  alpaca:
+    enabled: true
+    symbols: ["IBIT", "BITO"]
+    poll_interval_seconds: 60
+    bar_timeframe: "1Min"
+
 # -----------------------------------------------------------------------------
 # Alert Configuration
 # -----------------------------------------------------------------------------

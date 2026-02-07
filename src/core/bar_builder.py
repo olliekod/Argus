@@ -154,6 +154,11 @@ class BarBuilder:
         self._quotes_rejected_invalid_price_by_symbol: "OrderedDict[str, int]" = OrderedDict()
         self._quotes_rejected_invalid_price_cap = 100
         self._start_time = time.time()
+        
+        # Rate limiting for rejection logs (wall-clock only for logging, not event processing)
+        self._reject_log_last_ts: Dict[str, float] = {}  # key → last wall-clock log time
+        self._reject_log_interval = 60.0  # seconds between identical rejection logs
+        
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
         bus.subscribe(TOPIC_SYSTEM_MINUTE_TICK, self._on_minute_tick)
         logger.info("BarBuilder initialised — subscribed to %s", TOPIC_MARKET_QUOTES)
@@ -507,15 +512,23 @@ class BarBuilder:
         self._quotes_rejected_by_symbol[event.symbol] = (
             self._quotes_rejected_by_symbol.get(event.symbol, 0) + 1
         )
-        logger.warning(
-            "Rejected quote for %s [connector=%s]: %s "
-            "(timestamp=%r, source_ts=%r)",
-            event.symbol,
-            event.source,
-            reason,
-            event.timestamp,
-            event.source_ts,
-        )
+        # Rate-limited logging: only log if interval elapsed (wall-clock only for logging hygiene)
+        log_key = f"reject:{event.symbol}:{reason}"
+        now_wall = time.time()  # wall-clock for log throttling ONLY
+        last_log = self._reject_log_last_ts.get(log_key, 0)
+        if (now_wall - last_log) >= self._reject_log_interval:
+            self._reject_log_last_ts[log_key] = now_wall
+            total = self._quotes_rejected_by_symbol.get(event.symbol, 0)
+            logger.warning(
+                "Rejected quote for %s [connector=%s]: %s "
+                "(timestamp=%r, source_ts=%r) [%d total for symbol]",
+                event.symbol,
+                event.source,
+                reason,
+                event.timestamp,
+                event.source_ts,
+                total,
+            )
 
     def _reject_invalid_price(self, event: QuoteEvent, reason: str) -> None:
         self._quotes_rejected_invalid_price_total += 1
@@ -524,17 +537,23 @@ class BarBuilder:
             event.symbol,
             self._quotes_rejected_invalid_price_cap,
         )
-        logger.warning(
-            "Rejected quote for %s [connector=%s]: %s "
-            "(bid=%r, ask=%r, timestamp=%r, source_ts=%r)",
-            event.symbol,
-            event.source,
-            reason,
-            event.bid,
-            event.ask,
-            event.timestamp,
-            event.source_ts,
-        )
+        # Rate-limited logging: only log if interval elapsed (wall-clock only for logging hygiene)
+        log_key = f"reject_price:{event.symbol}:{reason}"
+        now_wall = time.time()  # wall-clock for log throttling ONLY
+        last_log = self._reject_log_last_ts.get(log_key, 0)
+        if (now_wall - last_log) >= self._reject_log_interval:
+            self._reject_log_last_ts[log_key] = now_wall
+            total = self._quotes_rejected_invalid_price_by_symbol.get(event.symbol, 0)
+            logger.warning(
+                "Rejected quote for %s [connector=%s]: %s "
+                "(bid=%r, ask=%r) [%d total for symbol]",
+                event.symbol,
+                event.source,
+                reason,
+                event.bid,
+                event.ask,
+                total,
+            )
 
     @staticmethod
     def _bump_bounded_counter(
