@@ -8,7 +8,7 @@ Supports commands: /help, /status, /positions, /pnl
 
 import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, List, Optional
 from telegram import Bot, Update
@@ -761,7 +761,7 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
             return
         
         # Check if signal is still valid (within 2 hours)
-        if datetime.utcnow() - self._last_signal_time > timedelta(hours=2):
+        if datetime.now(timezone.utc) - self._last_signal_time > timedelta(hours=2):
             await update.message.reply_text(
                 "⚠️ Last signal expired (>2 hours ago). Wait for a new alert."
             )
@@ -793,7 +793,7 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
     def set_last_signal(self, signal_id: str) -> None:
         """Set the last signal ID for yes/no confirmation."""
         self._last_signal_id = signal_id
-        self._last_signal_time = datetime.utcnow()
+        self._last_signal_time = datetime.now(timezone.utc)
     
     # -------------------------------------------------------------------------
     # EXISTING SENDING METHODS
@@ -813,7 +813,7 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         # Tier 1: 30 minute minimum cooldown per alert type
         # Tier 2+: Uses configured rate_limit_seconds
         key = f"{tier}_{alert_type}"
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         
         # Tier 1 gets longer cooldown to prevent spam
         if tier == 1:

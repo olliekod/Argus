@@ -13,7 +13,7 @@ Generates 4 PM ET daily summary including:
 
 import asyncio
 from dataclasses import dataclass, field
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from typing import Any, Callable, Dict, List, Optional
 import logging
 
@@ -169,7 +169,7 @@ class DailyReview:
     def _should_run_review(self) -> bool:
         """Check if it's time for daily review (DST-aware)."""
         # Get current time in ET with proper DST handling
-        now_utc = datetime.utcnow().replace(tzinfo=ZoneInfo("UTC"))
+        now_utc = datetime.now(timezone.utc).replace(tzinfo=ZoneInfo("UTC"))
         now_et = now_utc.astimezone(self.ET_TIMEZONE)
         today = now_et.date()
         

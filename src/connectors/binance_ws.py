@@ -8,7 +8,7 @@ WebSocket client for Binance spot market data.
 import asyncio
 import json
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 import websockets
 from websockets.exceptions import ConnectionClosed
@@ -191,7 +191,7 @@ class BinanceWebSocket:
             parsed = {
                 'symbol': symbol,
                 'exchange': 'binance',
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'last_price': float(data.get('c', 0)),
                 'bid_price': float(data.get('b', 0)),
                 'ask_price': float(data.get('a', 0)),

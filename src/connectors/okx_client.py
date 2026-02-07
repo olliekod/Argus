@@ -10,7 +10,7 @@ import hmac
 import hashlib
 import base64
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import aiohttp
 
@@ -113,8 +113,8 @@ class OKXClient:
         }
         
         if signed and self.api_key:
-            timestamp = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%S.') + \
-                       f'{datetime.utcnow().microsecond // 1000:03d}Z'
+            timestamp = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.') + \
+                       f'{datetime.now(timezone.utc).microsecond // 1000:03d}Z'
             signature = self._sign_request(timestamp, method.upper(), path)
             headers.update({
                 "OK-ACCESS-KEY": self.api_key,
@@ -181,7 +181,7 @@ class OKXClient:
                 'funding_rate': float(item.get('fundingRate', 0)),
                 'next_funding_rate': float(item.get('nextFundingRate', 0)) if item.get('nextFundingRate') else None,
                 'funding_time': item.get('fundingTime'),
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
             }
         return None
     
@@ -250,7 +250,7 @@ class OKXClient:
                 'volume_24h_ccy': float(item.get('volCcy24h', 0)),
                 'high_24h': float(item.get('high24h', 0)),
                 'low_24h': float(item.get('low24h', 0)),
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
             }
         return None
     
@@ -279,7 +279,7 @@ class OKXClient:
                 'exchange': 'okx',
                 'open_interest': float(item.get('oi', 0)),
                 'open_interest_ccy': float(item.get('oiCcy', 0)),
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
             }
         return None
     
