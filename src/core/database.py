@@ -9,7 +9,7 @@ Uses aiosqlite for async operations.
 import aiosqlite
 import json
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 import logging
@@ -556,7 +556,7 @@ class Database:
                 alert_tier, notes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            detection.get('timestamp', datetime.utcnow().isoformat()),
+            detection.get('timestamp', datetime.now(timezone.utc).isoformat()),
             detection.get('opportunity_type'),
             detection.get('asset'),
             detection.get('exchange'),
@@ -606,7 +606,7 @@ class Database:
                 hypothetical_pnl_usd = ?
             WHERE id = ?
         """, (
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
             outcome,
             pnl_percent,
             pnl_usd,
@@ -638,7 +638,7 @@ class Database:
         Returns:
             List of detection dictionaries
         """
-        cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(hours=hours)).isoformat()
         
         if opportunity_type:
             cursor = await self._connection.execute("""
@@ -685,7 +685,7 @@ class Database:
                 predicted_rate, open_interest, volume_24h, mark_price, index_price
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            kwargs.get('timestamp', datetime.utcnow().isoformat()),
+            kwargs.get('timestamp', datetime.now(timezone.utc).isoformat()),
             exchange,
             asset,
             funding_rate,
@@ -753,7 +753,7 @@ class Database:
                 mark_price, underlying_price
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
-            kwargs.get('timestamp', datetime.utcnow().isoformat()),
+            kwargs.get('timestamp', datetime.now(timezone.utc).isoformat()),
             asset,
             expiry,
             strike,
@@ -774,7 +774,7 @@ class Database:
         days: int = 30
     ) -> List[Dict]:
         """Get IV history for an asset."""
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         cursor = await self._connection.execute("""
             SELECT * FROM options_iv
             WHERE asset = ? AND timestamp > ?
@@ -801,7 +801,7 @@ class Database:
             INSERT INTO liquidations (timestamp, exchange, asset, side, liquidation_amount_usd, price)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
-            timestamp or datetime.utcnow().isoformat(),
+            timestamp or datetime.now(timezone.utc).isoformat(),
             exchange,
             asset,
             side,
@@ -816,7 +816,7 @@ class Database:
         minutes: int = 5
     ) -> List[Dict]:
         """Get recent liquidations for cascade detection."""
-        cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
         cursor = await self._connection.execute("""
             SELECT * FROM liquidations
             WHERE asset = ? AND timestamp > ?
@@ -842,7 +842,7 @@ class Database:
             INSERT INTO price_snapshots (timestamp, exchange, asset, price_type, price, volume)
             VALUES (?, ?, ?, ?, ?, ?)
         """, (
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
             exchange,
             asset,
             price_type,
@@ -859,7 +859,7 @@ class Database:
         minutes: int = 60
     ) -> List[float]:
         """Get price history for volatility calculations."""
-        cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
         cursor = await self._connection.execute("""
             SELECT price FROM price_snapshots
             WHERE asset = ? AND exchange = ? AND price_type = ? AND timestamp > ?
@@ -884,7 +884,7 @@ class Database:
             INSERT INTO system_health (timestamp, component, status, error_message, latency_ms)
             VALUES (?, ?, ?, ?, ?)
         """, (
-            datetime.utcnow().isoformat(),
+            datetime.now(timezone.utc).isoformat(),
             component,
             status,
             error_message,
@@ -1022,7 +1022,7 @@ class Database:
         """Mark a list of trades as zombie (expired with reason)."""
         if not trade_ids:
             return 0
-        now = datetime.utcnow().isoformat()
+        now = datetime.now(timezone.utc).isoformat()
         placeholders = ','.join(['?'] * len(trade_ids))
         await self._connection.execute(f"""
             UPDATE paper_trades
@@ -1056,7 +1056,7 @@ class Database:
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (
                 t['trader_id'],
-                t.get('followed_at', datetime.utcnow().isoformat()),
+                t.get('followed_at', datetime.now(timezone.utc).isoformat()),
                 t.get('score'),
                 t.get('scoring_method'),
                 t.get('window_days'),
@@ -1094,7 +1094,7 @@ class Database:
         - detections_by_type
         - trade_statistics
         """
-        cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         
         # Total detections
         cursor = await self._connection.execute("""
@@ -1159,7 +1159,7 @@ class Database:
             retention_days: Dict mapping table names to retention days
         """
         for table, days in retention_days.items():
-            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
             await self._connection.execute(
                 f"DELETE FROM {table} WHERE timestamp < ?",
                 (cutoff,)
@@ -1171,7 +1171,7 @@ class Database:
         # Clean up old closed paper trades (keep open ones)
         if 'paper_trades' in retention_days:
             days = retention_days['paper_trades']
-            cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
             await self._connection.execute(
                 "DELETE FROM paper_trades WHERE status != 'open' AND close_timestamp < ?",
                 (cutoff,)
@@ -1227,7 +1227,6 @@ class Database:
         row = await cursor.fetchone()
         if row and row['timestamp']:
             # Parse ISO timestamp to ms
-            from datetime import timezone
             ts_str = row['timestamp']
             dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
             return int(dt.timestamp() * 1000)
@@ -1274,7 +1273,7 @@ class Database:
 
     async def reset_paper_epoch(self, starting_equity: float, scope: str = 'all', reason: str = 'manual_reset') -> str:
         """Start a new paper equity epoch. Old data remains but is excluded from current metrics."""
-        epoch_start = datetime.utcnow().isoformat()
+        epoch_start = datetime.now(timezone.utc).isoformat()
         await self._connection.execute("""
             INSERT INTO paper_equity_epochs (epoch_start, starting_equity, reason, scope)
             VALUES (?, ?, ?, ?)
@@ -1501,4 +1500,3 @@ class Database:
             await self._connection.backup(backup)
         
         logger.info(f"Database backed up to {backup_path}")
-

@@ -253,10 +253,10 @@ def get_total_combinations() -> Dict[str, int]:
 def save_configs_to_file(configs: List[TraderConfig], filepath: str) -> None:
     """Save configs to JSON file for persistence."""
     import json
-    from datetime import datetime
+    from datetime import datetime, timezone
     
     data = {
-        'generated_at': datetime.utcnow().isoformat(),
+        'generated_at': datetime.now(timezone.utc).isoformat(),
         'total_traders': len(configs),
         'configs': [c.to_dict() for c in configs],
     }

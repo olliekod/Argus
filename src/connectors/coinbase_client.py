@@ -8,7 +8,7 @@ Replaces Binance WebSocket which blocks US IPs.
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional
 import aiohttp
 
@@ -99,7 +99,7 @@ class CoinbaseClient:
         url = f"{self.EXCHANGE_URL}/products/{symbol}/ticker"
         
         start = asyncio.get_running_loop().time()
-        self.last_poll_ts = datetime.utcnow().timestamp()
+        self.last_poll_ts = datetime.now(timezone.utc).timestamp()
         self.request_count += 1
         try:
             async with session.get(url) as resp:
@@ -110,7 +110,7 @@ class CoinbaseClient:
                     parsed = {
                         'symbol': symbol.replace('-', ''),
                         'exchange': 'coinbase',
-                        'timestamp': datetime.utcnow().isoformat(),
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
                         'last_price': float(data.get('price', 0)),
                         'bid_price': float(data.get('bid', 0)),
                         'ask_price': float(data.get('ask', 0)),

@@ -7,7 +7,7 @@ Helper functions for statistical calculations, formatting, and common operations
 
 import math
 from typing import List, Optional, Union
-from datetime import datetime
+from datetime import datetime, timezone
 
 
 def calculate_z_score(value: float, values: List[float]) -> float:
@@ -294,13 +294,13 @@ def parse_symbol(symbol: str) -> dict:
 
 def timestamp_now() -> str:
     """Get current UTC timestamp as ISO string."""
-    return datetime.utcnow().isoformat()
+    return datetime.now(timezone.utc).isoformat()
 
 
 def timestamp_ago(minutes: int = 0, hours: int = 0, days: int = 0) -> str:
     """Get timestamp from some time ago."""
     from datetime import timedelta
-    dt = datetime.utcnow() - timedelta(minutes=minutes, hours=hours, days=days)
+    dt = datetime.now(timezone.utc) - timedelta(minutes=minutes, hours=hours, days=days)
     return dt.isoformat()
 
 

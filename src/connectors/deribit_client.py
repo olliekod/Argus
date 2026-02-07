@@ -7,7 +7,7 @@ No authentication required for public endpoints.
 """
 
 import asyncio
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 import aiohttp
 
@@ -45,7 +45,7 @@ class DeribitClient:
         self._session: Optional[aiohttp.ClientSession] = None
         self._rate_limit = 20  # public rate limit: 20/min unauthenticated
         self._request_count = 0
-        self._last_reset = datetime.utcnow()
+        self._last_reset = datetime.now(timezone.utc)
         self._event_bus = event_bus
         self.last_message_ts: Optional[float] = None
         self.reconnect_attempts = 0  # REST doesn't "reconnect", but we track errors
@@ -75,7 +75,7 @@ class DeribitClient:
     async def _request(self, method: str, params: Dict = None) -> Dict:
         """Make a public API request."""
         # Simple rate limiting
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if (now - self._last_reset).seconds >= 60:
             self._request_count = 0
             self._last_reset = now
@@ -85,14 +85,14 @@ class DeribitClient:
             logger.warning(f"Rate limit reached, waiting {wait_time}s")
             await asyncio.sleep(wait_time)
             self._request_count = 0
-            self._last_reset = datetime.utcnow()
+            self._last_reset = datetime.now(timezone.utc)
         
         self._request_count += 1
         
         session = await self._get_session()
         url = f"{self.base_url}/public/{method}"
         start = asyncio.get_running_loop().time()
-        self.last_poll_ts = datetime.utcnow().timestamp()
+        self.last_poll_ts = datetime.now(timezone.utc).timestamp()
         self._request_count_total += 1
         
         try:
@@ -235,7 +235,7 @@ class DeribitClient:
         if isinstance(result, dict):
             return {
                 'instrument': instrument_name,
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'last_price': result.get('last_price'),
                 'mark_price': result.get('mark_price'),
                 'mark_iv': result.get('mark_iv'),  # Implied volatility for mark price
@@ -299,7 +299,7 @@ class DeribitClient:
                 'volume_24h': item.get('volume'),
                 'open_interest': item.get('open_interest'),
                 'underlying_price': item.get('underlying_price'),
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'source_ts': source_ts,
                 'source_ts_reason': ts_reason,
                 'source_ts_label': ts_label,
@@ -384,7 +384,7 @@ class DeribitClient:
                 'index_name': index_name,
                 'index_price': data['result'].get('index_price'),
                 'estimated_delivery_price': data['result'].get('estimated_delivery_price'),
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'source_ts': source_ts,
                 'source_ts_reason': ts_reason,
                 'source_ts_label': ts_label,
@@ -416,7 +416,7 @@ class DeribitClient:
                 'currency': currency,
                 'data': data['result'],
                 'latest_hv': data['result'][-1][1] if data['result'] else None,
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
             }
         return None
     
@@ -478,7 +478,7 @@ class DeribitClient:
             'closest_strike': closest['strike'],
             'closest_iv': closest['mark_iv'],
             'sample_size': len(atm_iv_values),
-            'timestamp': datetime.utcnow().isoformat(),
+            'timestamp': datetime.now(timezone.utc).isoformat(),
             'source_ts': index_data.get('source_ts') if index_data else None,
             'source_ts_reason': index_data.get('source_ts_reason') if index_data else None,
             'source_ts_label': index_data.get('source_ts_label') if index_data else None,

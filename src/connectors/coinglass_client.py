@@ -7,7 +7,7 @@ REST client for Coinglass liquidation data.
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 import aiohttp
 
@@ -69,7 +69,7 @@ class CoinglassClient:
         session = await self._get_session()
         url = f"{self.BASE_URL}/{endpoint}"
         start = asyncio.get_running_loop().time()
-        self.last_poll_ts = datetime.utcnow().timestamp()
+        self.last_poll_ts = datetime.now(timezone.utc).timestamp()
         self.request_count += 1
         
         headers = {
@@ -186,7 +186,7 @@ class CoinglassClient:
             
             return {
                 'symbol': symbol,
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'total_long_usd': total_long,
                 'total_short_usd': total_short,
                 'total_usd': total_long + total_short,
@@ -256,7 +256,7 @@ class CoinglassClient:
             
             return {
                 'symbol': symbol,
-                'timestamp': datetime.utcnow().isoformat(),
+                'timestamp': datetime.now(timezone.utc).isoformat(),
                 'cascade_detected': True,
                 'total_liquidations_usd': recent['total_liquidations'],
                 'long_liquidations_usd': recent['long_liquidations'],

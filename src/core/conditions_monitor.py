@@ -202,7 +202,7 @@ class ConditionsMonitor:
     
     async def calculate_conditions(self) -> ConditionsSnapshot:
         """Calculate current market conditions."""
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         market_open = self._is_market_open()
         
         # Gather data from sources

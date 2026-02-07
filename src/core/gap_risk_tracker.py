@@ -8,7 +8,7 @@ Alerts when significant moves occur that could impact IBIT/BITO at market open.
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 from zoneinfo import ZoneInfo
@@ -246,7 +246,7 @@ class GapRiskTracker:
         market_date = now.strftime('%Y-%m-%d')
         
         snapshot = GapSnapshot(
-            timestamp=datetime.utcnow().isoformat(),
+            timestamp=datetime.now(timezone.utc).isoformat(),
             btc_price=btc_price,
             ibit_price=ibit_price,
             bito_price=bito_price,
@@ -316,7 +316,9 @@ class GapRiskTracker:
         # Calculate hours since close
         try:
             close_time = datetime.fromisoformat(self._last_close_snapshot.timestamp)
-            hours_since = (datetime.utcnow() - close_time).total_seconds() / 3600
+            if close_time.tzinfo is None:
+                close_time = close_time.replace(tzinfo=timezone.utc)
+            hours_since = (datetime.now(timezone.utc) - close_time).total_seconds() / 3600
         except:
             hours_since = 0
         
@@ -458,7 +460,7 @@ async def test_gap_tracker():
     
     # Create a mock snapshot
     tracker._last_close_snapshot = GapSnapshot(
-        timestamp=datetime.utcnow().isoformat(),
+        timestamp=datetime.now(timezone.utc).isoformat(),
         btc_price=90000,
         ibit_price=52.50,
         bito_price=18.30,

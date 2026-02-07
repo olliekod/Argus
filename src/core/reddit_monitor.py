@@ -8,7 +8,7 @@ Uses strict bot filtering: account >= 90 days, karma >= 500.
 
 import asyncio
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, List, Optional, Tuple
 from dataclasses import dataclass, field
 from collections import Counter
@@ -166,8 +166,8 @@ class RedditMonitor:
         
         try:
             # Check account age
-            created_utc = datetime.utcfromtimestamp(author.created_utc)
-            account_age_days = (datetime.utcnow() - created_utc).days
+            created_utc = datetime.fromtimestamp(author.created_utc, tz=timezone.utc)
+            account_age_days = (datetime.now(timezone.utc) - created_utc).days
             
             if account_age_days < self.MIN_ACCOUNT_AGE_DAYS:
                 return False, f"account_too_new_{account_age_days}d"
@@ -327,7 +327,7 @@ class RedditMonitor:
             self._total_filtered += users_filtered
             
             sentiment = RedditSentiment(
-                timestamp=datetime.utcnow().isoformat(),
+                timestamp=datetime.now(timezone.utc).isoformat(),
                 posts_analyzed=posts_analyzed,
                 comments_analyzed=comments_analyzed,
                 users_filtered_out=users_filtered,

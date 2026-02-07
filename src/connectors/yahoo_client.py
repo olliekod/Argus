@@ -7,7 +7,7 @@ Fetches IBIT ETF price data for options monitoring.
 
 import asyncio
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
 import aiohttp
 import math
@@ -196,7 +196,7 @@ class YahooFinanceClient:
                     source_ts, ts_reason, ts_raw = _parse_yahoo_source_ts(meta)
                     parsed = {
                         'symbol': symbol,
-                        'timestamp': datetime.utcnow().isoformat(),
+                        'timestamp': datetime.now(timezone.utc).isoformat(),
                         'price': current_price,
                         'previous_close': prev_close,
                         'price_change': price_change,
