@@ -130,6 +130,37 @@ class TestRestartDedupe:
         assert "IBIT" not in client._last_bar_ts
         assert "BITO" not in client._last_bar_ts
         assert client._initialized is True
+
+    @pytest.mark.asyncio
+    async def test_init_from_db_calls_get_latest_bar_ts_with_bar_duration(self, mock_bus):
+        """init_from_db should call get_latest_bar_ts with bar_duration."""
+        from src.connectors.alpaca_client import AlpacaDataClient
+
+        mock_db = MagicMock()
+        mock_db.get_latest_bar_ts = AsyncMock(return_value=None)
+
+        client = AlpacaDataClient(
+            api_key="test_key",
+            api_secret="test_secret",
+            symbols=["IBIT", "BITO"],
+            event_bus=mock_bus,
+            db=mock_db,
+            poll_interval=60,
+        )
+
+        await client.init_from_db()
+
+        mock_db.get_latest_bar_ts.assert_any_await(
+            source="alpaca",
+            symbol="IBIT",
+            bar_duration=60,
+        )
+        mock_db.get_latest_bar_ts.assert_any_await(
+            source="alpaca",
+            symbol="BITO",
+            bar_duration=60,
+        )
+        assert mock_db.get_latest_bar_ts.await_count == 2
     
     @pytest.mark.asyncio
     async def test_dedupe_only_emits_new_bars(self, mock_db, mock_bus):

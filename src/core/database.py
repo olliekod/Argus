@@ -1358,19 +1358,19 @@ class Database:
         self,
         source: str,
         symbol: str,
-        timeframe: int,
+        bar_duration: int = 60,
     ) -> Optional[int]:
         """
         Get the latest bar timestamp in milliseconds.
         
-        Returns None if no bars exist for this source/symbol/timeframe.
+        Returns None if no bars exist for this source/symbol/bar_duration.
         """
         cursor = await self._connection.execute("""
             SELECT timestamp FROM market_bars
             WHERE source = ? AND symbol = ? AND bar_duration = ?
             ORDER BY timestamp DESC
             LIMIT 1
-        """, (source, symbol, timeframe))
+        """, (source, symbol, bar_duration))
         row = await cursor.fetchone()
         if row is None:
             return None
@@ -1501,5 +1501,4 @@ class Database:
             await self._connection.backup(backup)
         
         logger.info(f"Database backed up to {backup_path}")
-
 
