@@ -266,6 +266,39 @@ def _canonical_sort_key(entry: Dict[str, Any]) -> Tuple[int, int, int, str, int]
     return (event_ts, provider_priority, event_type_priority, symbol, sequence_id)
 
 
+def _bar_sort_key(bar: BarEvent) -> Tuple[int, str, str, int]:
+    """Deterministic sort key for emitted bars."""
+    return (
+        _to_ms(bar.timestamp),
+        bar.symbol,
+        bar.source or "unknown",
+        getattr(bar, "bar_duration", 60),
+    )
+
+
+class _ReplayBus:
+    """Synchronous event bus for deterministic tape replay."""
+
+    def __init__(self) -> None:
+        self._subscribers: Dict[str, List] = {}
+
+    def subscribe(self, topic: str, handler) -> None:
+        self._subscribers.setdefault(topic, []).append(handler)
+
+    def publish(self, topic: str, event: Any) -> None:
+        for handler in self._subscribers.get(topic, []):
+            handler(event)
+
+    def start(self) -> None:
+        return None
+
+    def stop(self) -> None:
+        return None
+
+    def get_queue_depths(self) -> Dict[str, int]:
+        return {topic: 0 for topic in self._subscribers}
+
+
 # ══════════════════════════════════════════════════════════════
 # TAPE RECORDER
 # ══════════════════════════════════════════════════════════════
@@ -467,14 +500,12 @@ class TapeRecorder:
             tape = sorted(tape, key=_faithful_sort_key)
 
         from ..core.bar_builder import BarBuilder
-        from ..core.bus import EventBus
         from ..core.events import BarEvent as BE, TOPIC_MARKET_BARS
 
-        bus = EventBus()
+        bus = _ReplayBus()
         emitted: list = []
         bus.subscribe(TOPIC_MARKET_BARS, lambda bar: emitted.append(bar))
         bb = BarBuilder(bus)
-        bus.start()
 
         try:
             for entry in tape:
@@ -485,20 +516,13 @@ class TapeRecorder:
                     bb._on_minute_tick(event)
                 elif isinstance(event, BE):
                     # Pre-aggregated bars are passed through directly
-                    emitted.append(event)
+                    bus.publish(TOPIC_MARKET_BARS, event)
 
-            flushed = bb.flush()
-            # Drain bus
-            deadline = time.monotonic() + 0.5
-            while time.monotonic() < deadline:
-                depths = bus.get_queue_depths()
-                if all(d == 0 for d in depths.values()):
-                    break
-                time.sleep(0.01)
+            bb.flush()
         finally:
             bus.stop()
 
-        return emitted + flushed
+        return sorted(emitted, key=_bar_sort_key)
 
     @staticmethod
     def replay_tape_events(
