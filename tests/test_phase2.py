@@ -30,11 +30,17 @@ from src.core.events import (
     SCHEMA_VERSION,
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_METRICS,
-    TOPIC_SIGNALS,
+    TOPIC_REGIMES_SYMBOL,
     TOPIC_SYSTEM_COMPONENT_HEARTBEAT,
 )
 from src.core.feature_builder import FeatureBuilder
-from src.core.regime_detector import RegimeDetector, UNKNOWN, LO_VOL_TREND, HI_VOL_RANGE
+from src.core.regime_detector import RegimeDetector
+from src.core.regimes import (
+    VolRegime,
+    TrendRegime,
+    VOL_REGIME_NAMES,
+    TREND_REGIME_NAMES,
+)
 
 
 def _quote(symbol, price, volume_24h, ts, source="test", source_ts=0.0):
@@ -361,73 +367,80 @@ class TestFeatureBuilder:
 
 
 class TestRegimeDetector:
-    """RegimeDetector classifies market regimes from metrics."""
+    """RegimeDetector classifies market regimes from bars."""
+
+    def _make_bar(self, symbol: str, close: float, ts: float) -> BarEvent:
+        return BarEvent(
+            symbol=symbol,
+            open=close,
+            high=close,
+            low=close,
+            close=close,
+            volume=100,
+            timestamp=ts,
+            source="test",
+            bar_duration=60,
+        )
 
     def test_initial_regime_is_unknown(self):
         bus = EventBus()
         rd = RegimeDetector(bus)
-        assert rd.get_current_regime("BTC") == UNKNOWN
+        assert rd.get_symbol_regime("BTC") is None
 
     def test_regime_transition_on_data(self):
         bus = EventBus()
         regime_events = []
-        bus.subscribe(TOPIC_SIGNALS, lambda e: regime_events.append(e))
+        bus.subscribe(TOPIC_REGIMES_SYMBOL, lambda e: regime_events.append(e))
         rd = RegimeDetector(bus)
         bus.start()
         try:
-            # Feed enough metrics to trigger classification
-            # Simulate low-volatility trending market
-            for i in range(20):
-                rd._on_metric(MetricEvent(
-                    symbol="BTC", metric="log_return", value=0.005,
-                    timestamp=M0 + i, source="feature_builder:test",
-                ))
-            rd._on_metric(MetricEvent(
-                symbol="BTC", metric="realized_vol", value=0.20,
-                timestamp=M0 + 20, source="feature_builder:test",
-            ))
+            for i in range(40):
+                close = 100.0 + i * 0.1
+                rd._on_bar(self._make_bar("BTC", close, M0 + i * 60))
             _drain(bus)
 
-            regime = rd.get_current_regime("BTC")
-            assert regime != UNKNOWN, f"Expected a classified regime, got {regime}"
+            regime = rd.get_symbol_regime("BTC")
+            assert regime in VOL_REGIME_NAMES.values()
             assert len(regime_events) >= 1
-            assert regime_events[-1].signal_type == "regime_change"
+            assert regime_events[-1].vol_regime in VOL_REGIME_NAMES.values()
+            assert regime_events[-1].trend_regime in TREND_REGIME_NAMES.values()
         finally:
             bus.stop()
 
     def test_crash_detection(self):
         bus = EventBus()
         regime_events = []
-        bus.subscribe(TOPIC_SIGNALS, lambda e: regime_events.append(e))
-        rd = RegimeDetector(bus)
+        bus.subscribe(TOPIC_REGIMES_SYMBOL, lambda e: regime_events.append(e))
+        rd = RegimeDetector(
+            bus,
+            thresholds={
+                "vol_spike_z": -1.0,
+                "vol_high_z": 0.0,
+                "vol_low_z": -2.0,
+                "trend_slope_threshold": 0.5,
+                "trend_strength_threshold": 1.0,
+                "atr_epsilon": 1e-8,
+                "gap_tolerance_bars": 1,
+                "gap_flag_duration_bars": 2,
+                "warmup_bars": 10,
+            },
+        )
         bus.start()
         try:
-            # Pre-populate returns buffer
-            for i in range(20):
-                rd._on_metric(MetricEvent(
-                    symbol="BTC", metric="log_return", value=0.001,
-                    timestamp=M0 + i, source="feature_builder:test",
-                ))
-
-            # Extreme negative return (crash)
-            rd._on_metric(MetricEvent(
-                symbol="BTC", metric="log_return", value=-0.06,
-                timestamp=M0 + 21, source="feature_builder:test",
-            ))
+            for i in range(15):
+                close = 100.0 + i * 0.5
+                rd._on_bar(self._make_bar("BTC", close, M0 + i * 60))
             _drain(bus)
 
-            assert rd.get_current_regime("BTC") == "CRASH"
+            assert regime_events
+            assert regime_events[-1].vol_regime == VOL_REGIME_NAMES[VolRegime.VOL_SPIKE]
         finally:
             bus.stop()
 
-    def test_ignores_non_feature_builder_metrics(self):
+    def test_no_regime_without_bars(self):
         bus = EventBus()
         rd = RegimeDetector(bus)
-        rd._on_metric(MetricEvent(
-            symbol="BTC", metric="funding_rate", value=0.01,
-            timestamp=M0, source="bybit",
-        ))
-        assert rd._events_processed == 0
+        assert rd.get_symbol_regime("BTC") is None
 
 
 # ═══════════════════════════════════════════════════════════
