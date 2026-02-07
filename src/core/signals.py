@@ -58,6 +58,39 @@ def _round_float(val: float, decimals: int = 8) -> float:
     return round(val, decimals)
 
 
+def _normalize_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return _round_float(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(k): _normalize_json_value(v)
+            for k, v in sorted(value.items(), key=lambda item: str(item[0]))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_json_value(v) for v in value]
+    raise TypeError(f"Unsupported snapshot value type: {type(value)}")
+
+
+def _normalize_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        str(k): _normalize_json_value(v)
+        for k, v in sorted(snapshot.items(), key=lambda item: str(item[0]))
+    }
+
+
+def _sorted_dict(data: Dict[str, Any]) -> Dict[str, Any]:
+    return {k: data[k] for k in sorted(data)}
+
+
+def normalize_snapshot(snapshot: Dict[str, Any]) -> Dict[str, Any]:
+    """Normalize snapshot data to JSON-safe deterministic values."""
+    return _normalize_snapshot(snapshot)
+
+
 def _to_int_ms(ts: Any) -> int:
     """Convert timestamp to int milliseconds (backwards compat)."""
     if isinstance(ts, int):
@@ -192,7 +225,7 @@ class SignalOutcomeEvent:
 
 def signal_to_dict(event: SignalEvent) -> Dict[str, Any]:
     """Serialize SignalEvent to dict for tape/persistence."""
-    return {
+    data = {
         "event_type": "signal",
         "timestamp_ms": event.timestamp_ms,
         "strategy_id": event.strategy_id,
@@ -202,21 +235,32 @@ def signal_to_dict(event: SignalEvent) -> Dict[str, Any]:
         "signal_type": event.signal_type,
         "timeframe": event.timeframe,
         "entry_type": event.entry_type,
-        "entry_price": _round_float(event.entry_price) if event.entry_price else None,
-        "stop_price": _round_float(event.stop_price) if event.stop_price else None,
-        "tp_price": _round_float(event.tp_price) if event.tp_price else None,
+        "entry_price": (
+            _round_float(event.entry_price)
+            if event.entry_price is not None
+            else None
+        ),
+        "stop_price": (
+            _round_float(event.stop_price)
+            if event.stop_price is not None
+            else None
+        ),
+        "tp_price": (
+            _round_float(event.tp_price)
+            if event.tp_price is not None
+            else None
+        ),
         "horizon": event.horizon,
         "confidence": _round_float(event.confidence),
         "quality_score": event.quality_score,
         "data_quality_flags": event.data_quality_flags,
-        "regime_snapshot": event.regime_snapshot,
-        "features_snapshot": {
-            k: _round_float(v) for k, v in event.features_snapshot.items()
-        },
+        "regime_snapshot": _normalize_snapshot(event.regime_snapshot),
+        "features_snapshot": _normalize_snapshot(event.features_snapshot),
         "explain": event.explain,
         "idempotency_key": event.idempotency_key,
         "v": event.v,
     }
+    return _sorted_dict(data)
 
 
 def dict_to_signal(d: Dict[str, Any]) -> SignalEvent:
@@ -230,9 +274,15 @@ def dict_to_signal(d: Dict[str, Any]) -> SignalEvent:
         signal_type=str(d["signal_type"]),
         timeframe=int(d["timeframe"]),
         entry_type=str(d.get("entry_type", ENTRY_MARKET)),
-        entry_price=float(d["entry_price"]) if d.get("entry_price") else None,
-        stop_price=float(d["stop_price"]) if d.get("stop_price") else None,
-        tp_price=float(d["tp_price"]) if d.get("tp_price") else None,
+        entry_price=(
+            float(d["entry_price"]) if d.get("entry_price") is not None else None
+        ),
+        stop_price=(
+            float(d["stop_price"]) if d.get("stop_price") is not None else None
+        ),
+        tp_price=(
+            float(d["tp_price"]) if d.get("tp_price") is not None else None
+        ),
         horizon=str(d.get("horizon", "intraday")),
         confidence=float(d.get("confidence", 1.0)),
         quality_score=int(d.get("quality_score", 50)),
@@ -249,17 +299,16 @@ def dict_to_signal(d: Dict[str, Any]) -> SignalEvent:
 
 def ranked_signal_to_dict(event: RankedSignalEvent) -> Dict[str, Any]:
     """Serialize RankedSignalEvent to dict."""
-    return {
+    data = {
         "event_type": "ranked_signal",
         "signal": signal_to_dict(event.signal),
         "rank": event.rank,
         "final_score": _round_float(event.final_score),
-        "score_breakdown": {
-            k: _round_float(v) for k, v in event.score_breakdown.items()
-        },
+        "score_breakdown": _normalize_snapshot(event.score_breakdown),
         "suppressed": event.suppressed,
         "suppression_reason": event.suppression_reason,
     }
+    return _sorted_dict(data)
 
 
 def dict_to_ranked_signal(d: Dict[str, Any]) -> RankedSignalEvent:
@@ -278,7 +327,7 @@ def dict_to_ranked_signal(d: Dict[str, Any]) -> RankedSignalEvent:
 
 def outcome_to_dict(event: SignalOutcomeEvent) -> Dict[str, Any]:
     """Serialize SignalOutcomeEvent to dict."""
-    return {
+    data = {
         "event_type": "signal_outcome",
         "idempotency_key": event.idempotency_key,
         "timestamp_ms": event.timestamp_ms,
@@ -292,6 +341,7 @@ def outcome_to_dict(event: SignalOutcomeEvent) -> Dict[str, Any]:
         "pnl_5bar": _round_float(event.pnl_5bar) if event.pnl_5bar is not None else None,
         "v": event.v,
     }
+    return _sorted_dict(data)
 
 
 def dict_to_outcome(d: Dict[str, Any]) -> SignalOutcomeEvent:
