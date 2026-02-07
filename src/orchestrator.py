@@ -487,13 +487,18 @@ class ArgusOrchestrator:
             eastern = ZoneInfo("America/New_York")
             now_et = datetime.now(eastern).strftime('%H:%M:%S %Z')
             farm_count = len(self.paper_trader_farm.trader_configs) if self.paper_trader_farm else 0
+            dash_port = None
+            if self.dashboard:
+                dash_port = self.dashboard.port
+            if dash_port is None:
+                dash_port = self.config.get('dashboard', {}).get('port', 8777)
             startup_msg = (
                 f"<b>Argus Online</b>\n"
                 f"<i>{now_et}</i>\n\n"
                 f"Detectors: {len(self.detectors)}\n"
                 f"Farm: {farm_count:,} configs\n"
                 f"Boot: {total:.1f}s\n"
-                f"Dashboard: http://127.0.0.1:{self.config.get('dashboard', {}).get('port', 8777)}"
+                f"Dashboard: http://127.0.0.1:{dash_port}"
             )
             await self.telegram.send_message(startup_msg)
 
@@ -1812,6 +1817,8 @@ class ArgusOrchestrator:
                 snapshot['internal'] = {}
                 snapshot['bus'] = {}
                 snapshot['db'] = {}
+            if self.telegram:
+                snapshot['internal']['telegram'] = self.telegram.get_status()
 
             try:
                 snapshot['pnl'] = await self._compute_pnl_summary()

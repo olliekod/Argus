@@ -7,17 +7,27 @@ Supports commands: /help, /status, /positions, /pnl
 """
 
 import asyncio
+import random
 import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 from typing import Any, Callable, Dict, List, Optional
+import httpx
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.error import TelegramError
+from telegram.error import TelegramError, NetworkError, TimedOut
 
 from ..core.logger import get_alert_logger
+from ..core.status import build_status
 
 logger = get_alert_logger()
+
+
+class _PollingRestart(Exception):
+    """Internal signal to restart the polling loop."""
+    def __init__(self, error: Optional[BaseException]) -> None:
+        super().__init__()
+        self.error = error
 
 
 class TelegramBot:
@@ -131,6 +141,17 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         # Application for two-way communication
         self._app: Optional[Application] = None
         self._polling_task: Optional[asyncio.Task] = None
+        self._polling_stop_event = asyncio.Event()
+        self._polling_restart_event = asyncio.Event()
+        self._polling_last_exception: Optional[BaseException] = None
+        self._polling_last_error: Optional[str] = None
+        self._polling_consecutive_failures = 0
+        self._polling_error_log_interval = 60.0
+        self._polling_error_log_last_ts = 0.0
+        self._polling_error_log_count = 0
+
+        self.telegram_failures_total = 0
+        self.telegram_last_success_ts: Optional[float] = None
         
         logger.info("Telegram bot initialized (two-way enabled)")
     
@@ -161,50 +182,191 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
     
     async def start_polling(self) -> None:
         """Start listening for incoming messages."""
-        try:
-            self._app = Application.builder().token(self.bot_token).build()
-            
-            # Add command handlers
-            self._app.add_handler(CommandHandler("help", self._cmd_help))
-            self._app.add_handler(CommandHandler("dashboard", self._cmd_dashboard))
-            self._app.add_handler(CommandHandler("status", self._cmd_status))
-            self._app.add_handler(CommandHandler("positions", self._cmd_positions))
-            self._app.add_handler(CommandHandler("pnl", self._cmd_pnl))
-            self._app.add_handler(CommandHandler("signals", self._cmd_signal_status))
-            self._app.add_handler(CommandHandler("signal_status", self._cmd_signal_status))
-            self._app.add_handler(CommandHandler("farm_status", self._cmd_farm_status))
-            self._app.add_handler(CommandHandler("research_status", self._cmd_research_status))
-            self._app.add_handler(CommandHandler("zombies", self._cmd_zombies))
-            self._app.add_handler(CommandHandler("zombie_clean", self._cmd_zombie_clean))
-            self._app.add_handler(CommandHandler("reset_paper", self._cmd_reset_paper))
-            self._app.add_handler(CommandHandler("db_stats", self._cmd_db_stats))
-            self._app.add_handler(CommandHandler("follow", self._cmd_follow))
-            
-            # Add message handler for yes/no responses
-            self._app.add_handler(MessageHandler(
-                filters.TEXT & ~filters.COMMAND,
-                self._handle_message
-            ))
-            
-            # Initialize and start polling
-            await self._app.initialize()
-            await self._app.start()
-            await self._app.updater.start_polling(drop_pending_updates=True)
-            
-            logger.info("Telegram bot polling started")
-        except Exception as e:
-            logger.error(f"Failed to start Telegram polling: {e}")
+        if self._polling_task and not self._polling_task.done():
+            logger.debug("Telegram polling already running")
+            return
+        self._polling_stop_event.clear()
+        self._polling_task = asyncio.create_task(self._polling_loop())
     
     async def stop_polling(self) -> None:
         """Stop listening for incoming messages."""
-        if self._app:
+        if self._polling_task and not self._polling_task.done():
+            self._polling_stop_event.set()
+            self._polling_restart_event.set()
+            await self._polling_task
+        await self._shutdown_application()
+
+    def _build_application(self) -> Application:
+        app = Application.builder().token(self.bot_token).build()
+
+        # Add command handlers
+        app.add_handler(CommandHandler("help", self._cmd_help))
+        app.add_handler(CommandHandler("dashboard", self._cmd_dashboard))
+        app.add_handler(CommandHandler("status", self._cmd_status))
+        app.add_handler(CommandHandler("positions", self._cmd_positions))
+        app.add_handler(CommandHandler("pnl", self._cmd_pnl))
+        app.add_handler(CommandHandler("signals", self._cmd_signal_status))
+        app.add_handler(CommandHandler("signal_status", self._cmd_signal_status))
+        app.add_handler(CommandHandler("farm_status", self._cmd_farm_status))
+        app.add_handler(CommandHandler("research_status", self._cmd_research_status))
+        app.add_handler(CommandHandler("zombies", self._cmd_zombies))
+        app.add_handler(CommandHandler("zombie_clean", self._cmd_zombie_clean))
+        app.add_handler(CommandHandler("reset_paper", self._cmd_reset_paper))
+        app.add_handler(CommandHandler("db_stats", self._cmd_db_stats))
+        app.add_handler(CommandHandler("follow", self._cmd_follow))
+
+        # Add message handler for yes/no responses
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_message
+        ))
+
+        return app
+
+    async def _start_application(self) -> None:
+        if self._app is None:
+            self._app = self._build_application()
+        await self._app.initialize()
+        await self._app.start()
+        await self._app.updater.start_polling(
+            drop_pending_updates=True,
+            error_callback=self._on_polling_error,
+        )
+
+    async def _shutdown_application(self) -> None:
+        if not self._app:
+            return
+        try:
+            await self._app.updater.stop()
+            await self._app.stop()
+            await self._app.shutdown()
+            logger.info("Telegram bot polling stopped")
+        except Exception as e:
+            logger.warning(f"Error stopping Telegram polling: {e}")
+        finally:
+            self._app = None
+
+    def _on_polling_error(self, error: TelegramError) -> None:
+        self._polling_last_exception = error
+        try:
+            loop = asyncio.get_running_loop()
+            loop.call_soon_threadsafe(self._polling_restart_event.set)
+        except RuntimeError:
+            self._polling_restart_event.set()
+
+    async def _polling_loop(self) -> None:
+        attempt = 0
+        while not self._polling_stop_event.is_set():
+            delay = 0.0
+            self._polling_restart_event.clear()
+            self._polling_last_exception = None
             try:
-                await self._app.updater.stop()
-                await self._app.stop()
-                await self._app.shutdown()
-                logger.info("Telegram bot polling stopped")
-            except Exception as e:
-                logger.error(f"Error stopping Telegram polling: {e}")
+                await self._start_application()
+                self._record_polling_success()
+                attempt = 0
+                await self._wait_for_polling_signal()
+            except _PollingRestart as exc:
+                attempt += 1
+                delay = await self._handle_polling_failure(exc.error, attempt)
+            except self._polling_retry_exceptions() as exc:
+                attempt += 1
+                delay = await self._handle_polling_failure(exc, attempt)
+            except Exception as exc:
+                attempt += 1
+                delay = await self._handle_polling_failure(exc, attempt)
+            finally:
+                await self._shutdown_application()
+
+            if self._polling_stop_event.is_set():
+                break
+
+            await self._sleep_with_stop(delay)
+
+    async def _wait_for_polling_signal(self) -> None:
+        done, _ = await asyncio.wait(
+            [self._polling_stop_event.wait(), self._polling_restart_event.wait()],
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        if self._polling_stop_event.is_set():
+            return
+        if self._polling_restart_event.is_set():
+            raise _PollingRestart(self._polling_last_exception)
+        if done:
+            return
+
+    async def _sleep_with_stop(self, delay: float) -> None:
+        if delay <= 0:
+            return
+        try:
+            await asyncio.wait_for(self._polling_stop_event.wait(), timeout=delay)
+        except asyncio.TimeoutError:
+            return
+
+    @staticmethod
+    def _polling_retry_exceptions():
+        return (NetworkError, TimedOut, httpx.RemoteProtocolError, httpx.TimeoutException, asyncio.TimeoutError, TimeoutError)
+
+    @staticmethod
+    def _compute_backoff(attempt: int) -> float:
+        base_delay = min(2 ** attempt, 60)
+        jitter = random.uniform(0.0, 1.0)
+        return base_delay + jitter
+
+    def _record_polling_success(self) -> None:
+        self.telegram_last_success_ts = time.time()
+        self._polling_consecutive_failures = 0
+        self._polling_last_error = None
+        logger.info("Telegram bot polling started")
+
+    async def _handle_polling_failure(self, error: Optional[BaseException], attempt: int) -> float:
+        self.telegram_failures_total += 1
+        self._polling_consecutive_failures += 1
+        if error is not None:
+            self._polling_last_error = str(error)
+        delay = self._compute_backoff(attempt)
+        self._rate_limited_polling_warning(error, delay)
+        return delay
+
+    def _rate_limited_polling_warning(self, error: Optional[BaseException], delay: float) -> None:
+        now = time.time()
+        self._polling_error_log_count += 1
+        if (now - self._polling_error_log_last_ts) < self._polling_error_log_interval:
+            return
+        self._polling_error_log_last_ts = now
+        count = self._polling_error_log_count
+        self._polling_error_log_count = 0
+        error_text = str(error) if error is not None else "unknown error"
+        suffix = f" ({count} failures in last {int(self._polling_error_log_interval)}s)" if count > 1 else ""
+        logger.warning(
+            "Telegram polling failed: %s; retrying in %.1fs%s",
+            error_text,
+            delay,
+            suffix,
+        )
+
+    def get_status(self) -> Dict[str, Any]:
+        running = self._polling_task is not None and not self._polling_task.done()
+        if running and self._polling_consecutive_failures == 0:
+            status = "ok"
+        elif running:
+            status = "degraded"
+        else:
+            status = "down"
+        return build_status(
+            name="telegram",
+            type="alerts",
+            status=status,
+            last_success_ts=self.telegram_last_success_ts,
+            last_error=self._polling_last_error,
+            consecutive_failures=self._polling_consecutive_failures,
+            request_count=0,
+            error_count=self.telegram_failures_total,
+            extras={
+                "telegram_failures_total": self.telegram_failures_total,
+                "telegram_last_success_ts": self.telegram_last_success_ts,
+                "polling_running": running,
+            },
+        )
     
     # -------------------------------------------------------------------------
     # COMMAND HANDLERS
