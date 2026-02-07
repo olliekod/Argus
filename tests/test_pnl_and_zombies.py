@@ -69,7 +69,7 @@ analyze_variable = _um_mod.analyze_variable
 
 def run(coro):
     """Run an async function synchronously."""
-    return asyncio.get_event_loop().run_until_complete(coro)
+    return asyncio.run(coro)
 
 
 async def make_db():

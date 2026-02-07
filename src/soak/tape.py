@@ -142,8 +142,13 @@ def _validate_ms(ts: int, field_name: str) -> None:
 # SERIALIZATION
 # ══════════════════════════════════════════════════════════════
 
-def _quote_to_dict(q: QuoteEvent, sequence_id: int) -> Dict[str, Any]:
-    """Serialize a QuoteEvent to a tape envelope."""
+def _quote_to_dict(q: QuoteEvent, sequence_id: int = 0) -> Dict[str, Any]:
+    """Serialize a QuoteEvent to a tape envelope.
+    
+    Args:
+        q: QuoteEvent to serialize
+        sequence_id: Monotonic sequence ID (default 0 for backward compat)
+    """
     event_ts_ms = _to_ms(getattr(q, 'event_ts', 0) or q.timestamp)
     return {
         # Envelope fields (required for all events)
@@ -151,6 +156,7 @@ def _quote_to_dict(q: QuoteEvent, sequence_id: int) -> Dict[str, Any]:
         "event_ts": event_ts_ms,
         "provider": q.source or "unknown",
         "event_type": "quote",
+        "type": "quote",  # Backward compat alias
         "symbol": q.symbol,
         "timeframe": 0,  # N/A for quotes
         # Quote-specific fields
@@ -166,14 +172,20 @@ def _quote_to_dict(q: QuoteEvent, sequence_id: int) -> Dict[str, Any]:
     }
 
 
-def _tick_to_dict(t: MinuteTickEvent, sequence_id: int) -> Dict[str, Any]:
-    """Serialize a MinuteTickEvent to a tape envelope."""
+def _tick_to_dict(t: MinuteTickEvent, sequence_id: int = 0) -> Dict[str, Any]:
+    """Serialize a MinuteTickEvent to a tape envelope.
+    
+    Args:
+        t: MinuteTickEvent to serialize
+        sequence_id: Monotonic sequence ID (default 0 for backward compat)
+    """
     return {
         # Envelope fields
         "sequence_id": sequence_id,
         "event_ts": _to_ms(t.timestamp),
         "provider": "system",
         "event_type": "minute_tick",
+        "type": "minute_tick",  # Backward compat alias
         "symbol": "",
         "timeframe": 0,
         # Tick-specific fields
@@ -181,8 +193,13 @@ def _tick_to_dict(t: MinuteTickEvent, sequence_id: int) -> Dict[str, Any]:
     }
 
 
-def _bar_to_dict(b: BarEvent, sequence_id: int) -> Dict[str, Any]:
-    """Serialize a BarEvent to a tape envelope."""
+def _bar_to_dict(b: BarEvent, sequence_id: int = 0) -> Dict[str, Any]:
+    """Serialize a BarEvent to a tape envelope.
+    
+    Args:
+        b: BarEvent to serialize
+        sequence_id: Monotonic sequence ID (default 0 for backward compat)
+    """
     event_ts_ms = _to_ms(getattr(b, 'event_ts', 0) or b.timestamp)
     return {
         # Envelope fields (required for all events)
@@ -190,6 +207,7 @@ def _bar_to_dict(b: BarEvent, sequence_id: int) -> Dict[str, Any]:
         "event_ts": event_ts_ms,
         "provider": b.source or "unknown",
         "event_type": "bar",
+        "type": "bar",  # Backward compat alias
         "symbol": b.symbol,
         "timeframe": getattr(b, 'bar_duration', 60),
         # Bar-specific fields
@@ -208,25 +226,45 @@ def _bar_to_dict(b: BarEvent, sequence_id: int) -> Dict[str, Any]:
     }
 
 
+def _from_tape_ts(ts: float) -> float:
+    """Convert tape timestamp to float seconds.
+    
+    Handles both legacy tapes (seconds) and new tapes (ms).
+    Same heuristic as _to_ms: if ts < 2e10, it's seconds.
+    """
+    if ts < 2e10:
+        return ts  # Already seconds
+    return ts / 1000.0  # Convert ms to seconds
+
+
 def _dict_to_quote(d: Dict[str, Any]) -> QuoteEvent:
-    """Deserialize a dict back to a QuoteEvent."""
+    """Deserialize a dict back to a QuoteEvent.
+    
+    Handles both legacy tapes (seconds) and new tapes (ms).
+    """
+    ts = d["timestamp"]
     return QuoteEvent(
         symbol=d["symbol"],
         bid=d["bid"],
         ask=d["ask"],
         mid=d["mid"],
         last=d["last"],
-        timestamp=d["timestamp"] / 1000.0,  # Convert ms back to seconds for event
+        timestamp=_from_tape_ts(ts),
         source=d["source"],
         volume_24h=d.get("volume_24h", 0.0),
-        source_ts=d.get("source_ts", 0) / 1000.0 if d.get("source_ts") else 0.0,
-        event_ts=d.get("event_ts", d["timestamp"]) / 1000.0,
-        receive_time=d.get("receive_time", d["timestamp"]) / 1000.0,
+        source_ts=_from_tape_ts(d.get("source_ts", 0)) if d.get("source_ts") else 0.0,
+        event_ts=_from_tape_ts(d.get("event_ts", ts)),
+        receive_time=_from_tape_ts(d.get("receive_time", ts)),
     )
 
 
+
 def _dict_to_bar(d: Dict[str, Any]) -> BarEvent:
-    """Deserialize a dict back to a BarEvent."""
+    """Deserialize a dict back to a BarEvent.
+    
+    Handles both legacy tapes (seconds) and new tapes (ms).
+    """
+    ts = d["timestamp"]
     return BarEvent(
         symbol=d["symbol"],
         open=d["open"],
@@ -234,26 +272,30 @@ def _dict_to_bar(d: Dict[str, Any]) -> BarEvent:
         low=d["low"],
         close=d["close"],
         volume=d["volume"],
-        timestamp=d["timestamp"] / 1000.0,  # Convert ms back to seconds
+        timestamp=_from_tape_ts(ts),
         source=d["source"],
         bar_duration=d.get("bar_duration", 60),
         n_ticks=d.get("n_ticks", 1),
-        first_source_ts=d.get("first_source_ts", d["timestamp"]) / 1000.0,
-        last_source_ts=d.get("last_source_ts", d["timestamp"]) / 1000.0,
-        source_ts=d.get("source_ts", d["timestamp"]) / 1000.0,
-        event_ts=d.get("event_ts", d["timestamp"]) / 1000.0,
+        first_source_ts=_from_tape_ts(d.get("first_source_ts", ts)),
+        last_source_ts=_from_tape_ts(d.get("last_source_ts", ts)),
+        source_ts=_from_tape_ts(d.get("source_ts", ts)),
+        event_ts=_from_tape_ts(d.get("event_ts", ts)),
     )
 
 
 def _dict_to_event(d: Dict[str, Any]):
-    """Deserialize a dict to the appropriate event type."""
+    """Deserialize a dict to the appropriate event type.
+    
+    Handles both legacy tapes (seconds) and new tapes (ms).
+    """
     event_type = d.get("event_type") or d.get("type")
     if event_type == "quote":
         return _dict_to_quote(d)
     elif event_type == "minute_tick":
-        ts_ms = d["timestamp"]
-        return MinuteTickEvent(timestamp=ts_ms / 1000.0)
+        ts = d["timestamp"]
+        return MinuteTickEvent(timestamp=_from_tape_ts(ts))
     elif event_type == "bar":
+
         return _dict_to_bar(d)
     raise ValueError(f"Unknown event type: {event_type}")
 

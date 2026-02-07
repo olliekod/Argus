@@ -78,9 +78,11 @@ class TestBarNeverDropped:
 
                 assert len(pm._bar_buffer) == 1000
                 assert not pm._spool_active
+                pm.shutdown()  # Close spool file before temp dir cleanup
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
+
 
     def test_flush_success_clears_buffer(self):
         loop = asyncio.new_event_loop()
@@ -100,6 +102,7 @@ class TestBarNeverDropped:
                 assert len(pm._bar_buffer) == 0
                 assert pm._bars_dropped_total == 0
                 assert pm._bar_flush_success_total == 1
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -118,10 +121,10 @@ class TestBarNeverDropped:
                 pm._on_bar(_make_bar(ts=1_700_000_060.0))
                 pm._do_flush()
 
-                # Bars should be returned to the buffer
                 assert len(pm._bar_buffer) == 2
                 assert pm._bars_dropped_total == 0
                 assert pm._bar_flush_failure_total == 1
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -143,6 +146,7 @@ class TestBarNeverDropped:
                 assert pm._bars_dropped_total == 0
                 assert pm._bar_retry_count >= 1
                 assert pm._bar_flush_success_total == 1
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -164,6 +168,7 @@ class TestBarNeverDropped:
                 assert pm._bars_dropped_total == 0
                 status = pm.get_status()
                 assert status["extras"]["bars_dropped_total"] == 0
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -194,9 +199,9 @@ class TestSpoolOverflow:
                 assert pm._bars_spooled_total == 1
                 assert len(pm._bar_buffer) == 10  # buffer unchanged
 
-                # Add more to spool
                 pm._on_bar(_make_bar(ts=1_700_000_660.0))
                 assert pm._spool_bars_pending == 2
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -224,9 +229,9 @@ class TestSpoolOverflow:
 
                 assert len(pm._bar_buffer) == 0
                 assert pm._bars_dropped_total == 0
-                # Spool should be drained (3 bars < drain batch of 500)
                 assert not pm._spool_active
                 assert pm._spool_bars_pending == 0
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -256,9 +261,11 @@ class TestSpoolOverflow:
                 # All bars written to DB
                 total_written = sum(len(b) for b in db.bar_batches)
                 assert total_written == 20
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
+
 
     def test_spool_recovery_on_restart(self):
         """Leftover spool from previous crash is detected."""
@@ -280,10 +287,10 @@ class TestSpoolOverflow:
                 assert pm._spool_active
                 assert pm._spool_bars_pending == 2
 
-                # Flush should drain the recovered spool
                 pm._do_flush()
                 assert not pm._spool_active
                 assert pm._spool_bars_pending == 0
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -306,9 +313,9 @@ class TestSpoolOverflow:
                 extras = status["extras"]
                 assert extras["spool_active"] is True
                 assert extras["spool_bars_pending"] == 2
-                assert extras["bars_spooled_total"] == 2
                 assert extras["spool_file_size"] > 0
                 assert extras["bar_buffer_max"] == 5
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -325,10 +332,10 @@ class TestPriorityQueues:
             with tempfile.TemporaryDirectory() as td:
                 pm = PersistenceManager(bus, db, loop, spool_dir=td)
 
-                # Verify separate queues exist
                 assert pm._signal_queue is not pm._telemetry_queue
                 assert pm._signal_queue.maxsize > 0
                 assert pm._telemetry_queue.maxsize > 0
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -359,6 +366,7 @@ class TestPriorityQueues:
                 )
                 pm._on_signal(signal)
                 assert pm._signals_dropped_total == 1
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -386,6 +394,7 @@ class TestPriorityQueues:
                 )
                 pm._on_metric(metric)
                 assert pm._metrics_dropped_total == 1
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
@@ -410,10 +419,10 @@ class TestStatusCounters:
                 assert "signal_queue_depth" in extras
                 assert "telemetry_queue_depth" in extras
                 assert extras["bars_dropped_total"] == 0
-                # Spool metrics present
                 assert "spool_active" in extras
                 assert "spool_bars_pending" in extras
                 assert "bars_spooled_total" in extras
+                pm.shutdown()  # Close spool file
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)

@@ -760,3 +760,100 @@ class TestEndToEnd:
         finally:
             loop.call_soon_threadsafe(loop.stop)
             thread.join(timeout=2)
+
+
+# ── Test: Windows Spool File Handle Release ─────────────
+
+
+class TestWindowsSpoolFileRelease:
+    """Regression test: spool file must be renameable/removable immediately.
+    
+    This catches WinError 32 (file in use) issues where a file handle
+    is held open, preventing temp directory cleanup on Windows.
+    """
+
+    def test_spool_file_not_locked_after_writes(self):
+        """After spooling bars, the spool file handle must be released.
+        
+        Uses os.rename as a proxy for "no open handle" — Windows won't
+        allow renaming a file if another process has it open.
+        """
+        loop = asyncio.new_event_loop()
+        thread = _start_loop(loop)
+        try:
+            bus = EventBus()
+            db = _DummyDB(always_fail=True)
+            line_size = _bar_line_bytes()
+            spool_max = line_size * 10  # generous
+
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(
+                    bus, db, loop,
+                    spool_dir=td,
+                    bar_buffer_max=2,
+                    spool_max_bytes=spool_max,
+                    pause_on_spool_full=False,  # don't pause, just spool
+                )
+
+                # Trigger spooling by overflowing the buffer
+                for i in range(5):
+                    pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
+
+                assert pm._spool_active
+                assert pm._spool_bars_pending >= 1
+
+                # Spool file must exist
+                spool_path = pm._spool_path
+                assert spool_path.exists()
+
+                # Key assertion: file must be renameable (no open handle)
+                # On Windows, this fails with WinError 32 if handle is open
+                renamed_path = spool_path.with_suffix(".moved")
+                os.rename(spool_path, renamed_path)
+                assert renamed_path.exists()
+                assert not spool_path.exists()
+
+                # Rename back for cleanup
+                os.rename(renamed_path, spool_path)
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+
+    def test_tempdir_cleanup_succeeds_after_spooling(self):
+        """TemporaryDirectory cleanup must succeed after spooling.
+        
+        This is the actual failure scenario from the bug report.
+        """
+        loop = asyncio.new_event_loop()
+        thread = _start_loop(loop)
+        try:
+            bus = EventBus()
+            db = _DummyDB(always_fail=True)
+            line_size = _bar_line_bytes()
+            spool_max = line_size * 5
+
+            # If cleanup fails, TemporaryDirectory will raise PermissionError
+            with tempfile.TemporaryDirectory() as td:
+                pm = PersistenceManager(
+                    bus, db, loop,
+                    spool_dir=td,
+                    bar_buffer_max=2,
+                    spool_max_bytes=spool_max,
+                    pause_on_spool_full=True,
+                )
+
+                # Fill buffer then spool
+                for i in range(4):
+                    pm._on_bar(_make_bar(ts=1_700_000_000.0 + i * 60))
+
+                # Ingestion may or may not be paused depending on spool size
+                # Either way, spool should be active
+                assert pm._spool_active or len(pm._bar_buffer) > 0
+
+            # If we get here, cleanup succeeded
+            # On Windows with lingering handle, this would fail with:
+            # PermissionError: [WinError 32] The process cannot access the file
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=2)
+

@@ -200,7 +200,7 @@ class PersistenceManager:
         self._spool_path = self._spool_dir / "bar_spool.jsonl"
         self._spool_max_bytes: int = spool_max_bytes
         self._spool_active: bool = False
-        self._spool_write_handle: Optional[Any] = None
+        # Note: per-append pattern used — no persistent file handle stored
         self._spool_read_offset: int = 0
         self._spool_bytes_written: int = 0
         self._bars_spooled_total: int = 0
@@ -302,18 +302,13 @@ class PersistenceManager:
         """Flush all remaining bars and stop the flush thread.
 
         Called on SIGINT / Ctrl-C from the orchestrator.
+        Idempotent: safe to call multiple times.
         """
         self._running = False
         # Final flush
         self._do_flush()
-        # Close spool write handle if still open
-        with self._bar_lock:
-            if self._spool_write_handle:
-                try:
-                    self._spool_write_handle.close()
-                except OSError:
-                    pass
-                self._spool_write_handle = None
+        # Note: spool file handles are closed after each write (per-append pattern)
+        # so no file handle cleanup needed here.
         for q in (self._signal_queue, self._telemetry_queue):
             try:
                 q.put_nowait(_WRITE_STOP)
@@ -355,11 +350,14 @@ class PersistenceManager:
             logger.warning("Failed to recover spool: %s", e)
 
     def _spool_bar(self, bar: BarEvent) -> None:
-        """Write a single bar to the disk spool (JSONL). Called under _bar_lock."""
+        """Write a single bar to the disk spool (JSONL). Called under _bar_lock.
+        
+        Uses per-append open/write/close pattern for Windows compatibility.
+        This ensures no file handle is held open between calls, preventing
+        WinError 32 (file in use) during temp directory cleanup in tests.
+        """
         try:
-            if self._spool_write_handle is None:
-                self._spool_dir.mkdir(parents=True, exist_ok=True)
-                self._spool_write_handle = open(self._spool_path, "a")
+            self._spool_dir.mkdir(parents=True, exist_ok=True)
 
             line = json.dumps(asdict(bar), separators=(",", ":")) + "\n"
             line_bytes = len(line.encode("utf-8"))
@@ -382,8 +380,12 @@ class PersistenceManager:
                 )
                 return
 
-            self._spool_write_handle.write(line)
-            self._spool_write_handle.flush()
+            # Per-append open/write/close — Windows-safe (no lingering handle)
+            with open(self._spool_path, "a", encoding="utf-8", newline="\n") as f:
+                f.write(line)
+                f.flush()
+                os.fsync(f.fileno())
+
             self._spool_bytes_written += line_bytes
             self._spool_bars_pending += 1
             self._bars_spooled_total += 1
@@ -460,11 +462,12 @@ class PersistenceManager:
                 self._bar_buffer = spool_batch + self._bar_buffer
 
     def _cleanup_spool(self) -> None:
-        """Remove the spool file after full drain. Called under _bar_lock."""
+        """Remove the spool file after full drain. Called under _bar_lock.
+        
+        Note: spool file handles are closed after each write (per-append pattern)
+        so no file handle cleanup needed here.
+        """
         try:
-            if self._spool_write_handle:
-                self._spool_write_handle.close()
-                self._spool_write_handle = None
             if self._spool_path.exists():
                 self._spool_path.unlink()
         except OSError as e:

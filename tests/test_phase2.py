@@ -482,7 +482,7 @@ class TestPolymarketWatchlist:
             min_volume=10000,
         )
 
-        tokens = asyncio.get_event_loop().run_until_complete(ws.sync())
+        tokens = asyncio.run(ws.sync())
         # Only c1 passes (active=True, volume=50000 > 10000)
         assert "tok1" in tokens
         assert "tok2" not in tokens  # too low volume
@@ -515,7 +515,7 @@ class TestPolymarketWatchlist:
             gamma_client=gamma_mock, clob_client=clob_mock,
             min_volume=1000, keywords=["bitcoin"],
         )
-        tokens = asyncio.get_event_loop().run_until_complete(ws.sync())
+        tokens = asyncio.run(ws.sync())
         assert "tok1" in tokens
         assert "tok2" not in tokens
 
