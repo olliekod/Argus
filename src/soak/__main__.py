@@ -220,7 +220,7 @@ def _print_summary(data: dict) -> None:
 
 def _cmd_replay(args):
     """Replay a tape file twice and compare bars."""
-    from .tape import TapeRecorder
+    from .tape import TapeRecorder, _to_ms
 
     tape = TapeRecorder.load_tape(args.tape)
     print(f"Loaded {len(tape)} events from {args.tape}")
@@ -239,18 +239,58 @@ def _cmd_replay(args):
 
     def _bar_key(bar):
         return (
-            bar.symbol, bar.open, bar.high, bar.low, bar.close,
-            bar.volume, bar.timestamp, bar.source, bar.bar_duration,
-            bar.tick_count, bar.n_ticks, bar.first_source_ts,
-            bar.last_source_ts, bar.late_ticks_dropped,
-            bar.close_reason, bar.source_ts, bar.repaired,
+            bar.source or "unknown",
+            bar.symbol,
+            getattr(bar, "bar_duration", 60),
+            _to_ms(bar.timestamp),
         )
 
+    def _bar_payload(bar):
+        return {
+            "open": bar.open,
+            "high": bar.high,
+            "low": bar.low,
+            "close": bar.close,
+            "volume": bar.volume,
+            "tick_count": bar.tick_count,
+            "n_ticks": bar.n_ticks,
+            "first_source_ts": _to_ms(bar.first_source_ts) if bar.first_source_ts else 0,
+            "last_source_ts": _to_ms(bar.last_source_ts) if bar.last_source_ts else 0,
+            "late_ticks_dropped": bar.late_ticks_dropped,
+            "close_reason": bar.close_reason,
+            "source_ts": _to_ms(bar.source_ts) if bar.source_ts else 0,
+            "repaired": bar.repaired,
+        }
+
+    bars1_map = {_bar_key(bar): _bar_payload(bar) for bar in bars1}
+    bars2_map = {_bar_key(bar): _bar_payload(bar) for bar in bars2}
+
+    keys1 = set(bars1_map)
+    keys2 = set(bars2_map)
     mismatches = 0
-    for i, (b1, b2) in enumerate(zip(bars1, bars2)):
-        if _bar_key(b1) != _bar_key(b2):
-            print(f"MISMATCH at bar {i}: {b1.symbol} ts={b1.timestamp}")
-            mismatches += 1
+
+    if keys1 != keys2:
+        missing_in_2 = sorted(keys1 - keys2)
+        missing_in_1 = sorted(keys2 - keys1)
+        if missing_in_2:
+            key = missing_in_2[0]
+            print(f"MISMATCH key missing in Run2: {key}")
+            print(f"  Run1 payload: {json.dumps(bars1_map[key], sort_keys=True)}")
+            print("  Run2 payload: <missing>")
+        else:
+            key = missing_in_1[0]
+            print(f"MISMATCH key missing in Run1: {key}")
+            print("  Run1 payload: <missing>")
+            print(f"  Run2 payload: {json.dumps(bars2_map[key], sort_keys=True)}")
+        mismatches = len(missing_in_2) + len(missing_in_1)
+    else:
+        for key in sorted(keys1):
+            if bars1_map[key] != bars2_map[key]:
+                print(f"MISMATCH at key: {key}")
+                print(f"  Run1 payload: {json.dumps(bars1_map[key], sort_keys=True)}")
+                print(f"  Run2 payload: {json.dumps(bars2_map[key], sort_keys=True)}")
+                mismatches += 1
+                break
 
     if mismatches:
         print(f"\nFAIL: {mismatches} bar mismatches")
