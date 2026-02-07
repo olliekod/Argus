@@ -7,6 +7,7 @@ Runs alongside the headless main process, reading status via callbacks.
 """
 
 import asyncio
+import errno
 import json
 import logging
 import os
@@ -156,9 +157,10 @@ load();setInterval(load,30000);
 class ArgusWebDashboard:
     """Lightweight local web dashboard for Argus."""
 
-    def __init__(self, host: str = '127.0.0.1', port: int = 8777):
+    def __init__(self, host: str = '127.0.0.1', port: int = 8777, port_scan_range: int = 5):
         self.host = host
         self.port = port
+        self._port_scan_range = max(1, port_scan_range)
         self._app = web.Application()
         self._runner = None
 
@@ -204,9 +206,31 @@ class ArgusWebDashboard:
     async def start(self):
         self._runner = web.AppRunner(self._app)
         await self._runner.setup()
-        site = web.TCPSite(self._runner, self.host, self.port)
-        await site.start()
-        logger.info(f"Dashboard running at http://{self.host}:{self.port}")
+        base_port = self.port
+        last_error = None
+        for offset in range(self._port_scan_range):
+            candidate_port = base_port + offset
+            try:
+                site = web.TCPSite(self._runner, self.host, candidate_port)
+                await site.start()
+                if candidate_port != base_port:
+                    logger.warning(
+                        "Dashboard port %s in use; using %s instead",
+                        base_port,
+                        candidate_port,
+                    )
+                self.port = candidate_port
+                logger.info(f"Dashboard running at http://{self.host}:{self.port}")
+                return
+            except OSError as exc:
+                last_error = exc
+                if exc.errno == errno.EADDRINUSE:
+                    continue
+                raise
+        await self._runner.cleanup()
+        message = "Dashboard port already in use. Stop previous Argus instance or change port."
+        logger.error(message)
+        raise OSError(message) from last_error
 
     async def stop(self):
         if self._runner:
