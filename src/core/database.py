@@ -436,9 +436,94 @@ class Database:
             "ON market_metrics(symbol, metric, timestamp)"
         )
 
+        # Regime events (from RegimeDetector)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS regimes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                scope TEXT NOT NULL,
+                timeframe INTEGER NOT NULL,
+                timestamp INTEGER NOT NULL,
+                config_hash TEXT NOT NULL,
+                vol_regime TEXT,
+                trend_regime TEXT,
+                session_regime TEXT,
+                risk_regime TEXT,
+                confidence REAL,
+                is_warm INTEGER,
+                data_quality_flags INTEGER,
+                metrics_json TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                UNIQUE(event_type, scope, timeframe, timestamp, config_hash)
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_regimes_lookup "
+            "ON regimes(event_type, scope, timeframe, timestamp DESC)"
+        )
+
+        # Phase 3: Trading signals (from strategy modules)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                timestamp_ms INTEGER NOT NULL,
+                strategy_id TEXT NOT NULL,
+                config_hash TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                signal_type TEXT NOT NULL,
+                timeframe INTEGER NOT NULL,
+                entry_type TEXT,
+                entry_price REAL,
+                stop_price REAL,
+                tp_price REAL,
+                horizon TEXT,
+                confidence REAL,
+                quality_score INTEGER,
+                data_quality_flags INTEGER,
+                regime_snapshot_json TEXT,
+                features_snapshot_json TEXT,
+                explain TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_lookup "
+            "ON signals(strategy_id, symbol, timestamp_ms DESC)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_signals_time "
+            "ON signals(timestamp_ms DESC)"
+        )
+
+        # Phase 3: Signal outcomes (markouts)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS signal_outcomes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                idempotency_key TEXT NOT NULL UNIQUE,
+                timestamp_ms INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                strategy_id TEXT NOT NULL,
+                ret_1bar REAL,
+                ret_5bar REAL,
+                ret_10bar REAL,
+                ret_60bar REAL,
+                pnl_1bar REAL,
+                pnl_5bar REAL,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_outcomes_lookup "
+            "ON signal_outcomes(strategy_id, timestamp_ms DESC)"
+        )
+
         await self._connection.commit()
 
         logger.debug("Database tables created/verified")
+
+
     
     # =========================================================================
     # Detection Operations
@@ -1206,6 +1291,207 @@ class Database:
         row = await cursor.fetchone()
         return row['epoch_start'] if row else None
 
+    # =========================================================================
+    # Regime Operations
+    # =========================================================================
+
+    async def write_regime(
+        self,
+        event_type: str,
+        scope: str,
+        timeframe: int,
+        timestamp_ms: int,
+        config_hash: str,
+        vol_regime: Optional[str] = None,
+        trend_regime: Optional[str] = None,
+        session_regime: Optional[str] = None,
+        risk_regime: Optional[str] = None,
+        confidence: float = 0.0,
+        is_warm: bool = False,
+        data_quality_flags: int = 0,
+        metrics_json: Optional[str] = None,
+    ) -> None:
+        """
+        Upsert a regime event.
+        
+        Uses INSERT OR REPLACE for idempotency.
+        """
+        await self._connection.execute("""
+            INSERT OR REPLACE INTO regimes (
+                event_type, scope, timeframe, timestamp, config_hash,
+                vol_regime, trend_regime, session_regime, risk_regime,
+                confidence, is_warm, data_quality_flags, metrics_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            event_type, scope, timeframe, timestamp_ms, config_hash,
+            vol_regime, trend_regime, session_regime, risk_regime,
+            confidence, 1 if is_warm else 0, data_quality_flags, metrics_json,
+        ))
+        await self._connection.commit()
+
+    async def get_recent_bars(
+        self,
+        source: str,
+        symbol: str,
+        timeframe: int,
+        n: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get the most recent N bars for warmup.
+        
+        Returns bars in ascending timestamp order (oldest first).
+        """
+        cursor = await self._connection.execute("""
+            SELECT * FROM market_bars
+            WHERE source = ? AND symbol = ? AND bar_duration = ?
+            ORDER BY timestamp DESC
+            LIMIT ?
+        """, (source, symbol, timeframe, n))
+        rows = await cursor.fetchall()
+        
+        # Convert to dicts and reverse to get ascending order
+        bars = [dict(row) for row in rows]
+        bars.reverse()
+        return bars
+
+    async def get_latest_bar_ts(
+        self,
+        source: str,
+        symbol: str,
+        timeframe: int,
+    ) -> Optional[int]:
+        """
+        Get the latest bar timestamp in milliseconds.
+        
+        Returns None if no bars exist for this source/symbol/timeframe.
+        """
+        cursor = await self._connection.execute("""
+            SELECT timestamp FROM market_bars
+            WHERE source = ? AND symbol = ? AND bar_duration = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+        """, (source, symbol, timeframe))
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        # timestamp is stored as ISO string, convert to ms
+        from datetime import datetime
+        ts_str = row['timestamp']
+        try:
+            dt = datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
+            return int(dt.timestamp() * 1000)
+        except Exception:
+            return None
+
+    # =========================================================================
+    # Signal Operations (Phase 3)
+    # =========================================================================
+
+    async def write_signal(
+        self,
+        idempotency_key: str,
+        timestamp_ms: int,
+        strategy_id: str,
+        config_hash: str,
+        symbol: str,
+        direction: str,
+        signal_type: str,
+        timeframe: int,
+        entry_type: Optional[str] = None,
+        entry_price: Optional[float] = None,
+        stop_price: Optional[float] = None,
+        tp_price: Optional[float] = None,
+        horizon: Optional[str] = None,
+        confidence: float = 1.0,
+        quality_score: int = 50,
+        data_quality_flags: int = 0,
+        regime_snapshot_json: Optional[str] = None,
+        features_snapshot_json: Optional[str] = None,
+        explain: str = "",
+    ) -> None:
+        """
+        Upsert a signal event.
+        
+        Uses INSERT OR IGNORE for idempotency (idempotency_key is UNIQUE).
+        """
+        await self._connection.execute("""
+            INSERT OR IGNORE INTO signals (
+                idempotency_key, timestamp_ms, strategy_id, config_hash,
+                symbol, direction, signal_type, timeframe,
+                entry_type, entry_price, stop_price, tp_price, horizon,
+                confidence, quality_score, data_quality_flags,
+                regime_snapshot_json, features_snapshot_json, explain
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            idempotency_key, timestamp_ms, strategy_id, config_hash,
+            symbol, direction, signal_type, timeframe,
+            entry_type, entry_price, stop_price, tp_price, horizon,
+            confidence, quality_score, data_quality_flags,
+            regime_snapshot_json, features_snapshot_json, explain,
+        ))
+        await self._connection.commit()
+
+    async def write_signal_outcome(
+        self,
+        idempotency_key: str,
+        timestamp_ms: int,
+        symbol: str,
+        strategy_id: str,
+        ret_1bar: Optional[float] = None,
+        ret_5bar: Optional[float] = None,
+        ret_10bar: Optional[float] = None,
+        ret_60bar: Optional[float] = None,
+        pnl_1bar: Optional[float] = None,
+        pnl_5bar: Optional[float] = None,
+    ) -> None:
+        """
+        Upsert a signal outcome (markout).
+        
+        Uses INSERT OR REPLACE for updating partial markouts.
+        """
+        await self._connection.execute("""
+            INSERT OR REPLACE INTO signal_outcomes (
+                idempotency_key, timestamp_ms, symbol, strategy_id,
+                ret_1bar, ret_5bar, ret_10bar, ret_60bar,
+                pnl_1bar, pnl_5bar
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            idempotency_key, timestamp_ms, symbol, strategy_id,
+            ret_1bar, ret_5bar, ret_10bar, ret_60bar,
+            pnl_1bar, pnl_5bar,
+        ))
+        await self._connection.commit()
+
+    async def get_pending_markouts(
+        self,
+        strategy_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        """
+        Get signals that need markout computation.
+        
+        Returns signals without corresponding outcomes.
+        """
+        if strategy_id:
+            cursor = await self._connection.execute("""
+                SELECT s.* FROM signals s
+                LEFT JOIN signal_outcomes o ON s.idempotency_key = o.idempotency_key
+                WHERE o.idempotency_key IS NULL
+                AND s.strategy_id = ?
+                ORDER BY s.timestamp_ms DESC
+                LIMIT ?
+            """, (strategy_id, limit))
+        else:
+            cursor = await self._connection.execute("""
+                SELECT s.* FROM signals s
+                LEFT JOIN signal_outcomes o ON s.idempotency_key = o.idempotency_key
+                WHERE o.idempotency_key IS NULL
+                ORDER BY s.timestamp_ms DESC
+                LIMIT ?
+            """, (limit,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
     async def backup(self, backup_path: str) -> None:
         """Create a database backup."""
         backup_db = Path(backup_path)
@@ -1215,3 +1501,5 @@ class Database:
             await self._connection.backup(backup)
         
         logger.info(f"Database backed up to {backup_path}")
+
+

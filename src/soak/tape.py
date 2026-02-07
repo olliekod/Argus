@@ -61,6 +61,26 @@ from ..core.events import (
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_QUOTES,
     TOPIC_SYSTEM_MINUTE_TICK,
+    TOPIC_REGIMES_SYMBOL,
+    TOPIC_REGIMES_MARKET,
+    TOPIC_SIGNALS_RAW,
+    TOPIC_SIGNALS_RANKED,
+)
+from ..core.regimes import (
+    SymbolRegimeEvent,
+    MarketRegimeEvent,
+    symbol_regime_to_dict,
+    market_regime_to_dict,
+    dict_to_symbol_regime,
+    dict_to_market_regime,
+)
+from ..core.signals import (
+    SignalEvent as Phase3SignalEvent,
+    RankedSignalEvent,
+    signal_to_dict,
+    dict_to_signal,
+    ranked_signal_to_dict,
+    dict_to_ranked_signal,
 )
 
 logger = logging.getLogger("argus.soak.tape")
@@ -88,6 +108,8 @@ EVENT_TYPE_PRIORITY: Dict[str, int] = {
     "minute_tick": 4,
     "signal": 5,
     "heartbeat": 6,
+    "symbol_regime": 7,
+    "market_regime": 8,
 }
 
 
@@ -350,10 +372,15 @@ class TapeRecorder:
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
         bus.subscribe(TOPIC_MARKET_BARS, self._on_bar)
         bus.subscribe(TOPIC_SYSTEM_MINUTE_TICK, self._on_minute_tick)
+        bus.subscribe(TOPIC_REGIMES_SYMBOL, self._on_symbol_regime)
+        bus.subscribe(TOPIC_REGIMES_MARKET, self._on_market_regime)
+        bus.subscribe(TOPIC_SIGNALS_RAW, self._on_raw_signal)
+        bus.subscribe(TOPIC_SIGNALS_RANKED, self._on_ranked_signal)
         logger.info(
             "TapeRecorder attached (maxlen=%d, symbols=%s)",
             self._maxlen,
             self._symbols or "ALL",
+
         )
 
     def _on_quote(self, event: QuoteEvent) -> None:
@@ -396,7 +423,79 @@ class TapeRecorder:
             if was_full:
                 self._events_evicted += 1
 
+    def _on_symbol_regime(self, event: SymbolRegimeEvent) -> None:
+        if not self._enabled:
+            return
+        if self._symbols and event.symbol not in self._symbols:
+            return
+        with self._lock:
+            seq_id = self._get_next_sequence_id()
+            d = symbol_regime_to_dict(event)
+            d["sequence_id"] = seq_id
+            d["event_ts"] = event.timestamp_ms
+            d["provider"] = "regime_detector"
+            was_full = len(self._tape) == self._tape.maxlen
+            self._tape.append(d)
+            self._events_captured += 1
+            if was_full:
+                self._events_evicted += 1
+
+    def _on_market_regime(self, event: MarketRegimeEvent) -> None:
+        if not self._enabled:
+            return
+        with self._lock:
+            seq_id = self._get_next_sequence_id()
+            d = market_regime_to_dict(event)
+            d["sequence_id"] = seq_id
+            d["event_ts"] = event.timestamp_ms
+            d["provider"] = "regime_detector"
+            d["symbol"] = event.market  # Use market as "symbol" for sorting
+            d["timeframe"] = event.timeframe
+            was_full = len(self._tape) == self._tape.maxlen
+            self._tape.append(d)
+            self._events_captured += 1
+            if was_full:
+                self._events_evicted += 1
+
+    def _on_raw_signal(self, event: Phase3SignalEvent) -> None:
+        if not self._enabled:
+            return
+        if self._symbols and event.symbol not in self._symbols:
+            return
+        with self._lock:
+            seq_id = self._get_next_sequence_id()
+            d = signal_to_dict(event)
+            d["sequence_id"] = seq_id
+            d["event_ts"] = event.timestamp_ms
+            d["provider"] = event.strategy_id
+            was_full = len(self._tape) == self._tape.maxlen
+            self._tape.append(d)
+            self._events_captured += 1
+            if was_full:
+                self._events_evicted += 1
+
+    def _on_ranked_signal(self, event: RankedSignalEvent) -> None:
+        if not self._enabled:
+            return
+        if self._symbols and event.signal.symbol not in self._symbols:
+            return
+        with self._lock:
+            seq_id = self._get_next_sequence_id()
+            d = ranked_signal_to_dict(event)
+            d["sequence_id"] = seq_id
+            d["event_ts"] = event.signal.timestamp_ms
+            d["provider"] = event.signal.strategy_id
+            d["symbol"] = event.signal.symbol
+            d["timeframe"] = event.signal.timeframe
+            was_full = len(self._tape) == self._tape.maxlen
+            self._tape.append(d)
+            self._events_captured += 1
+            if was_full:
+                self._events_evicted += 1
+
     def get_status(self) -> Dict[str, Any]:
+
+
         """Status snapshot for soak summary."""
         with self._lock:
             size = len(self._tape)

@@ -207,7 +207,16 @@ TOPIC_MARKET_BARS = "market.bars"
 TOPIC_MARKET_METRICS = "market.metrics"
 TOPIC_SIGNALS = "signals.detections"
 TOPIC_SIGNALS_REGIME = "signals.regime"
+TOPIC_REGIMES_SYMBOL = "regimes.symbol"
+TOPIC_REGIMES_MARKET = "regimes.market"
 TOPIC_SYSTEM_STATUS = "system.status"
 TOPIC_SYSTEM_HEARTBEAT = "system.heartbeat"
 TOPIC_SYSTEM_MINUTE_TICK = "system.minute_tick"
 TOPIC_SYSTEM_COMPONENT_HEARTBEAT = "system.component_heartbeat"
+
+# Phase 3 Signal Topics
+TOPIC_SIGNALS_RAW = "signals.raw"           # Raw strategy output
+TOPIC_SIGNALS_RANKED = "signals.ranked"     # After ranker scoring
+TOPIC_SIGNALS_OUTCOME = "signals.outcome"   # Markout results
+
+

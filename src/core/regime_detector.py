@@ -1,256 +1,637 @@
 """
-Argus Regime Detector (Stream 4)
-================================
+Argus Regime Detector (Phase 2)
+===============================
 
-Consumes rolling metrics from ``market.metrics`` (specifically
-``realized_vol`` and ``log_return``) and classifies the current
-market regime for each symbol.
+Deterministic regime classification from BarEvents.
 
-Regimes
--------
-* ``UNKNOWN``       — insufficient data
-* ``LO_VOL_TREND``  — low volatility, trending (returns biased)
-* ``HI_VOL_RANGE``  — high volatility, mean-reverting
-* ``LO_VOL_RANGE``  — low volatility, range-bound
-* ``HI_VOL_TREND``  — high volatility with directional momentum
-* ``CRASH``         — extreme downside move detected
+GUARANTEES:
+- Same tape → same regimes → same downstream signals
+- No wall-clock dependence
+- No randomness
+- Arrival-faithful processing
 
-Emits ``SignalEvent`` to ``signals.detections`` on transitions.
-
-Safety constraints
-------------------
-* Downstream-only: subscribes to ``market.metrics``, publishes to
-  ``signals.detections``.  Never touches upstream bar/quote state.
-* Uses deterministic threshold logic (no ML, no randomness).
-* Bounded state per symbol.
+ARCHITECTURE:
+- Subscribes to market.bars (not metrics)
+- Per-symbol incremental indicator state
+- Emits SymbolRegimeEvent and MarketRegimeEvent
+- Supports warmup_from_db for restart reconstruction
 """
 
 from __future__ import annotations
 
+import json
 import logging
+import math
 import threading
 import time
 from collections import deque
-from typing import Any, Deque, Dict, Optional
+from dataclasses import dataclass
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 from .bus import EventBus
 from .events import (
+    BarEvent,
     ComponentHeartbeatEvent,
-    MetricEvent,
-    RegimeChangeEvent,
-    SignalEvent,
-    Priority,
-    TOPIC_MARKET_METRICS,
-    TOPIC_SIGNALS,
-    TOPIC_SIGNALS_REGIME,
+    TOPIC_MARKET_BARS,
+    TOPIC_REGIMES_SYMBOL,
+    TOPIC_REGIMES_MARKET,
     TOPIC_SYSTEM_COMPONENT_HEARTBEAT,
+)
+from .indicators import ATRState, EMAState, RSIState, RollingVolState
+from .regimes import (
+    SymbolRegimeEvent,
+    MarketRegimeEvent,
+    DQ_NONE,
+    DQ_REPAIRED_INPUT,
+    DQ_GAP_WINDOW,
+    DQ_STALE_INPUT,
+    DEFAULT_REGIME_THRESHOLDS,
+    compute_config_hash,
+    get_market_for_symbol,
+    symbol_regime_to_dict,
+    market_regime_to_dict,
 )
 
 logger = logging.getLogger("argus.regime_detector")
 
-# ── Regime constants ─────────────────────────────────────────
-UNKNOWN = "UNKNOWN"
-LO_VOL_TREND = "LO_VOL_TREND"
-HI_VOL_RANGE = "HI_VOL_RANGE"
-LO_VOL_RANGE = "LO_VOL_RANGE"
-HI_VOL_TREND = "HI_VOL_TREND"
-CRASH = "CRASH"
 
-# Thresholds (annualised realised vol)
-_VOL_LOW = 0.30       # < 30% annualised = low vol
-_VOL_HIGH = 0.80      # > 80% annualised = high vol
-_TREND_BIAS = 0.003   # |mean return| > 0.3% per bar = trending
-_CRASH_RET = -0.05    # single-bar return < -5% = crash signal
+# ═══════════════════════════════════════════════════════════════════════════
+# Constants
+# ═══════════════════════════════════════════════════════════════════════════
 
-# Minimum observations before classifying
-_MIN_OBS = 15
+ATR_EPSILON = 1e-8
 
-# Rolling window for return-bias calculation
-_BIAS_WINDOW = 30
+# Indicator periods
+EMA_FAST_PERIOD = 12
+EMA_SLOW_PERIOD = 26
+RSI_PERIOD = 14
+ATR_PERIOD = 14
+VOL_WINDOW = 20
 
+# Annualization factor for 1-minute bars (sqrt of bars per year)
+# ~525600 minutes per year → sqrt ≈ 725
+ANNUALIZE_1M = 725.0
+
+# Session time boundaries (UTC hour)
+# Equities
+EQUITIES_PRE_START = 9      # 4 AM ET = 9 UTC
+EQUITIES_RTH_START = 14     # 9:30 AM ET ≈ 14 UTC (simplified)
+EQUITIES_RTH_END = 21       # 4 PM ET = 21 UTC
+EQUITIES_POST_END = 1       # 8 PM ET = 1 UTC next day
+
+# Crypto
+CRYPTO_ASIA_START = 0       # 00:00 UTC
+CRYPTO_ASIA_END = 8         # 08:00 UTC
+CRYPTO_EU_START = 8         # 08:00 UTC
+CRYPTO_EU_END = 14          # 14:00 UTC
+CRYPTO_US_START = 14        # 14:00 UTC
+CRYPTO_US_END = 22          # 22:00 UTC
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Per-Symbol State
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SymbolState:
+    """Per-symbol indicator state for regime detection."""
+    symbol: str
+    timeframe: int
+    
+    # Indicators
+    ema_fast: EMAState
+    ema_slow: EMAState
+    rsi: RSIState
+    atr: ATRState
+    vol: RollingVolState
+    
+    # Previous values for slope calculation
+    prev_ema_fast: Optional[float] = None
+    prev_close: Optional[float] = None
+    
+    # Gap detection
+    last_bar_ts_ms: Optional[int] = None
+    gap_flag_remaining: int = 0
+    
+    # Volatility z-score tracking
+    vol_history: Deque[float] = None
+    
+    # Warmup tracking
+    bars_processed: int = 0
+    
+    def __post_init__(self):
+        if self.vol_history is None:
+            self.vol_history = deque(maxlen=50)
+
+
+def create_symbol_state(symbol: str, timeframe: int = 60) -> SymbolState:
+    """Factory for creating new symbol state with default periods."""
+    return SymbolState(
+        symbol=symbol,
+        timeframe=timeframe,
+        ema_fast=EMAState(EMA_FAST_PERIOD),
+        ema_slow=EMAState(EMA_SLOW_PERIOD),
+        rsi=RSIState(RSI_PERIOD),
+        atr=ATRState(ATR_PERIOD),
+        vol=RollingVolState(VOL_WINDOW, ANNUALIZE_1M),
+        vol_history=deque(maxlen=50),
+    )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Regime Detector
+# ═══════════════════════════════════════════════════════════════════════════
 
 class RegimeDetector:
-    """Deterministic regime classifier from rolling metrics.
-
-    Parameters
-    ----------
-    bus : EventBus
-        Shared event bus.
+    """
+    Deterministic regime classifier from BarEvents.
+    
+    Computes volatility and trend regimes per symbol,
+    session regimes per market. All computation is driven
+    by bar arrival (feature clock pattern).
     """
 
-    def __init__(self, bus: EventBus) -> None:
+    def __init__(
+        self,
+        bus: EventBus,
+        db: Optional[Any] = None,
+        thresholds: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self._bus = bus
+        self._db = db
         self._lock = threading.Lock()
         self._start_time = time.time()
-
+        
+        # Config
+        self._thresholds = thresholds or DEFAULT_REGIME_THRESHOLDS
+        self._config_hash = compute_config_hash(self._thresholds)
+        
         # Per-symbol state
-        self._current_regime: Dict[str, str] = {}
-        self._last_vol: Dict[str, float] = {}
-        self._returns_buf: Dict[str, Deque[float]] = {}
-        self._events_processed = 0
-        self._regime_changes = 0
+        self._symbol_states: Dict[str, SymbolState] = {}
+        
+        # Market-level state
+        self._last_market_regimes: Dict[str, MarketRegimeEvent] = {}
+        
+        # Telemetry
+        self._bars_received = 0
+        self._symbol_events_emitted = 0
+        self._market_events_emitted = 0
+        self._warmup_skips = 0
+        self._gaps_detected = 0
+        
+        # Subscribe to bars
+        bus.subscribe(TOPIC_MARKET_BARS, self._on_bar)
+        logger.info(
+            "RegimeDetector initialized — config_hash=%s, subscribed to %s",
+            self._config_hash, TOPIC_MARKET_BARS
+        )
 
-        bus.subscribe(TOPIC_MARKET_METRICS, self._on_metric)
-        logger.info("RegimeDetector initialised — subscribed to %s", TOPIC_MARKET_METRICS)
+    # ─── Warmup ───────────────────────────────────────────────────────────
 
-    # ── metric handler ───────────────────────────────────────
+    async def warmup_from_db(self, n_bars: int = 60) -> Dict[str, int]:
+        """
+        Reconstruct indicator state from persisted bars.
+        
+        For each symbol with bars in DB, replays the last n_bars
+        through the same indicator logic as live processing.
+        
+        Returns dict of {symbol: bars_replayed}.
+        """
+        if self._db is None:
+            logger.warning("warmup_from_db called but no db reference")
+            return {}
+        
+        result = {}
+        
+        # Get list of symbols from recent bars
+        cursor = await self._db.fetch_all("""
+            SELECT DISTINCT symbol, source, bar_duration 
+            FROM market_bars 
+            ORDER BY timestamp DESC 
+            LIMIT 100
+        """)
+        
+        seen = set()
+        for row in cursor:
+            key = (row['symbol'], row['source'], row['bar_duration'])
+            if key in seen:
+                continue
+            seen.add(key)
+            
+            symbol = row['symbol']
+            source = row['source']
+            timeframe = row['bar_duration']
+            
+            # Get recent bars for this symbol
+            bars = await self._db.get_recent_bars(source, symbol, timeframe, n_bars)
+            
+            if not bars:
+                continue
+            
+            logger.debug("Warming up %s with %d bars", symbol, len(bars))
+            
+            # Create state and replay
+            state = self._get_or_create_state(symbol, timeframe)
+            
+            for bar_dict in bars:
+                self._update_indicators_from_bar_dict(state, bar_dict)
+            
+            result[symbol] = len(bars)
+        
+        logger.info("Warmup complete: %d symbols initialized", len(result))
+        return result
 
-    def _on_metric(self, event: MetricEvent) -> None:
-        """Ingest realized_vol and log_return to classify regime."""
-        # Only process feature_builder metrics
-        if not event.source.startswith("feature_builder:"):
-            return
+    def _update_indicators_from_bar_dict(self, state: SymbolState, bar: Dict) -> None:
+        """Update indicators from a bar dict (for warmup replay)."""
+        close = bar['close']
+        high = bar['high']
+        low = bar['low']
+        
+        # Update indicators
+        state.ema_fast.update(close)
+        state.ema_slow.update(close)
+        state.rsi.update(close)
+        state.atr.update(high, low, close)
+        
+        # Log return for volatility
+        if state.prev_close is not None and state.prev_close > 0:
+            log_ret = math.log(close / state.prev_close)
+            vol = state.vol.update(log_ret)
+            if vol is not None:
+                state.vol_history.append(vol)
+        
+        state.prev_close = close
+        state.bars_processed += 1
 
-        symbol = event.symbol
-        metric = event.metric
+    # ─── Bar Handler ──────────────────────────────────────────────────────
 
+    def _on_bar(self, event: BarEvent) -> None:
+        """Handle incoming bar event."""
         with self._lock:
-            self._events_processed += 1
+            self._bars_received += 1
+            
+            symbol = event.symbol
+            timeframe = event.bar_duration
+            timestamp_ms = int(event.timestamp * 1000)
+            
+            # Get or create state
+            state = self._get_or_create_state(symbol, timeframe)
+            
+            # Check for gaps
+            dq_flags = DQ_NONE
+            if event.repaired:
+                dq_flags |= DQ_REPAIRED_INPUT
+            
+            dq_flags |= self._check_gap(state, timestamp_ms, timeframe)
+            
+            # Update indicators
+            self._update_indicators(state, event)
+            
+            # Classify and emit symbol regime
+            self._emit_symbol_regime(state, timestamp_ms, dq_flags)
+            
+            # Update market regime
+            market = get_market_for_symbol(symbol)
+            self._emit_market_regime(market, timeframe, timestamp_ms, dq_flags)
 
-            if metric == "realized_vol":
-                self._last_vol[symbol] = event.value
+    def _get_or_create_state(self, symbol: str, timeframe: int) -> SymbolState:
+        """Get existing state or create new one."""
+        key = f"{symbol}:{timeframe}"
+        if key not in self._symbol_states:
+            self._symbol_states[key] = create_symbol_state(symbol, timeframe)
+        return self._symbol_states[key]
 
-            elif metric == "log_return":
-                if symbol not in self._returns_buf:
-                    self._returns_buf[symbol] = deque(maxlen=_BIAS_WINDOW)
-                self._returns_buf[symbol].append(event.value)
+    def _check_gap(self, state: SymbolState, ts_ms: int, timeframe: int) -> int:
+        """Check for gap in bar sequence. Returns DQ flags."""
+        flags = DQ_NONE
+        
+        # Decrement any existing gap flag
+        if state.gap_flag_remaining > 0:
+            state.gap_flag_remaining -= 1
+            flags |= DQ_GAP_WINDOW
+        
+        if state.last_bar_ts_ms is not None:
+            expected_ts = state.last_bar_ts_ms + (timeframe * 1000)
+            tolerance = self._thresholds.get("gap_tolerance_bars", 1) * timeframe * 1000
+            
+            if ts_ms > expected_ts + tolerance:
+                # Gap detected
+                self._gaps_detected += 1
+                flags |= DQ_GAP_WINDOW
+                state.gap_flag_remaining = self._thresholds.get("gap_flag_duration_bars", 2)
+                logger.debug(
+                    "Gap detected for %s: expected=%d, got=%d",
+                    state.symbol, expected_ts, ts_ms
+                )
+        
+        state.last_bar_ts_ms = ts_ms
+        return flags
 
-                # Check for crash
-                if event.value < _CRASH_RET:
-                    self._transition(symbol, CRASH, event.timestamp, {
-                        "trigger_return": event.value,
-                    })
-                    return
+    def _update_indicators(self, state: SymbolState, bar: BarEvent) -> None:
+        """Update all indicators from bar event."""
+        close = bar.close
+        high = bar.high
+        low = bar.low
+        
+        # Store previous EMA for slope calculation
+        if state.ema_fast._ema is not None:
+            state.prev_ema_fast = state.ema_fast._ema
+        
+        # Update indicators
+        state.ema_fast.update(close)
+        state.ema_slow.update(close)
+        state.rsi.update(close)
+        state.atr.update(high, low, close)
+        
+        # Log return for volatility
+        if state.prev_close is not None and state.prev_close > 0:
+            log_ret = math.log(close / state.prev_close)
+            vol = state.vol.update(log_ret)
+            if vol is not None:
+                state.vol_history.append(vol)
+        
+        state.prev_close = close
+        state.bars_processed += 1
 
-            # Attempt classification after every metric update
-            self._classify(symbol, event.timestamp)
+    # ─── Regime Classification ────────────────────────────────────────────
 
-    def _classify(self, symbol: str, ts: float) -> None:
-        """Classify regime from accumulated vol + return data."""
-        vol = self._last_vol.get(symbol)
-        ret_buf = self._returns_buf.get(symbol)
+    def _emit_symbol_regime(
+        self, state: SymbolState, ts_ms: int, dq_flags: int
+    ) -> None:
+        """Classify and emit symbol regime event."""
+        warmup_bars = self._thresholds.get("warmup_bars", 30)
+        
+        # Check warmup
+        ema_fast = state.ema_fast._ema
+        ema_slow = state.ema_slow._ema
+        atr = state.atr._atr
+        rsi_val = state.rsi._avg_gain  # Check if RSI is warm
+        
+        is_warm = (
+            state.bars_processed >= warmup_bars
+            and ema_fast is not None
+            and ema_slow is not None
+            and atr is not None
+            and atr > ATR_EPSILON
+            and rsi_val is not None
+            and len(state.vol_history) >= 5
+        )
+        
+        if not is_warm:
+            self._warmup_skips += 1
+            dq_flags |= DQ_STALE_INPUT
+        
+        # Get current indicator values (with defaults for warmup)
+        atr = atr if atr and atr > ATR_EPSILON else 1.0
+        ema_fast = ema_fast if ema_fast else state.prev_close or 0.0
+        ema_slow = ema_slow if ema_slow else state.prev_close or 0.0
+        close = state.prev_close or 1.0
+        
+        # Compute RSI
+        rsi = 50.0
+        if state.rsi._avg_gain is not None and state.rsi._avg_loss is not None:
+            if state.rsi._avg_loss == 0:
+                rsi = 100.0
+            else:
+                rs = state.rsi._avg_gain / state.rsi._avg_loss
+                rsi = 100.0 - (100.0 / (1.0 + rs))
+        
+        # Compute ATR percentage
+        atr_pct = atr / close if close > 0 else 0.0
+        
+        # Compute EMA slope (normalized by ATR)
+        ema_slope = 0.0
+        if state.prev_ema_fast is not None and atr > ATR_EPSILON:
+            ema_slope = (ema_fast - state.prev_ema_fast) / atr
+        
+        # Compute trend strength
+        trend_strength = abs(ema_fast - ema_slow) / atr if atr > ATR_EPSILON else 0.0
+        
+        # Compute vol z-score
+        vol_z = 0.0
+        if len(state.vol_history) >= 5:
+            vol_list = list(state.vol_history)
+            current_vol = vol_list[-1] if vol_list else 0.0
+            mean_vol = sum(vol_list) / len(vol_list)
+            if len(vol_list) > 1:
+                var = sum((v - mean_vol) ** 2 for v in vol_list) / (len(vol_list) - 1)
+                std_vol = math.sqrt(var) if var > 0 else 1.0
+                vol_z = (current_vol - mean_vol) / std_vol if std_vol > 0 else 0.0
+        
+        # Classify volatility regime
+        vol_regime = self._classify_vol_regime(vol_z)
+        
+        # Classify trend regime
+        trend_regime = self._classify_trend_regime(ema_slope, trend_strength, is_warm)
+        
+        # Compute confidence
+        confidence = 1.0 if is_warm else 0.5
+        if dq_flags & DQ_REPAIRED_INPUT:
+            confidence *= 0.9
+        if dq_flags & DQ_GAP_WINDOW:
+            confidence *= 0.8
+        
+        # Create and emit event
+        event = SymbolRegimeEvent(
+            symbol=state.symbol,
+            timeframe=state.timeframe,
+            timestamp_ms=ts_ms,
+            vol_regime=vol_regime,
+            trend_regime=trend_regime,
+            atr=atr,
+            atr_pct=atr_pct,
+            vol_z=vol_z,
+            ema_fast=ema_fast,
+            ema_slow=ema_slow,
+            ema_slope=ema_slope,
+            rsi=rsi,
+            confidence=confidence,
+            is_warm=is_warm,
+            data_quality_flags=dq_flags,
+            config_hash=self._config_hash,
+        )
+        
+        self._bus.publish(TOPIC_REGIMES_SYMBOL, event)
+        self._symbol_events_emitted += 1
 
-        if vol is None or ret_buf is None or len(ret_buf) < _MIN_OBS:
-            return  # not enough data yet
-
-        mean_ret = sum(ret_buf) / len(ret_buf)
-        trending = abs(mean_ret) > _TREND_BIAS
-
-        if vol < _VOL_LOW:
-            regime = LO_VOL_TREND if trending else LO_VOL_RANGE
-        elif vol > _VOL_HIGH:
-            regime = HI_VOL_TREND if trending else HI_VOL_RANGE
+    def _classify_vol_regime(self, vol_z: float) -> str:
+        """Classify volatility regime from z-score."""
+        spike_z = self._thresholds.get("vol_spike_z", 2.5)
+        high_z = self._thresholds.get("vol_high_z", 1.0)
+        low_z = self._thresholds.get("vol_low_z", -0.5)
+        
+        if vol_z > spike_z:
+            return "VOL_SPIKE"
+        elif vol_z > high_z:
+            return "VOL_HIGH"
+        elif vol_z < low_z:
+            return "VOL_LOW"
         else:
-            # Medium vol — use trending flag to disambiguate
-            regime = LO_VOL_TREND if trending else LO_VOL_RANGE
+            return "VOL_NORMAL"
 
-        self._transition(symbol, regime, ts, {
-            "realized_vol": vol,
-            "mean_return": mean_ret,
-            "obs_count": len(ret_buf),
-        })
+    def _classify_trend_regime(
+        self, ema_slope: float, trend_strength: float, is_warm: bool
+    ) -> str:
+        """Classify trend regime."""
+        if not is_warm:
+            return "RANGE"
+        
+        slope_thresh = self._thresholds.get("trend_slope_threshold", 0.5)
+        strength_thresh = self._thresholds.get("trend_strength_threshold", 1.0)
+        
+        if trend_strength > strength_thresh:
+            if ema_slope > slope_thresh:
+                return "TREND_UP"
+            elif ema_slope < -slope_thresh:
+                return "TREND_DOWN"
+        
+        return "RANGE"
 
-    def _transition(self, symbol: str, new_regime: str, ts: float,
-                    data: Dict[str, Any]) -> None:
-        """Emit a RegimeChangeEvent if the regime has changed."""
-        old = self._current_regime.get(symbol, UNKNOWN)
-        if old == new_regime:
-            return
-
-        self._current_regime[symbol] = new_regime
-        self._regime_changes += 1
-
-        signal = SignalEvent(
-            detector="regime_detector",
-            symbol=symbol,
-            signal_type="regime_change",
-            priority=Priority.MEDIUM,
-            timestamp=ts,
-            data={
-                "old_regime": old,
-                "new_regime": new_regime,
-                "confidence": 1.0,
-                **data,
-            },
-            source_ts=ts,
+    def _emit_market_regime(
+        self, market: str, timeframe: int, ts_ms: int, dq_flags: int
+    ) -> None:
+        """Emit market regime event."""
+        # Session regime from timestamp
+        session = self._get_session_regime(market, ts_ms)
+        
+        # Create event
+        event = MarketRegimeEvent(
+            market=market,
+            timeframe=timeframe,
+            timestamp_ms=ts_ms,
+            session_regime=session,
+            risk_regime="UNKNOWN",  # Stub for future
+            confidence=1.0,
+            data_quality_flags=dq_flags,
+            config_hash=self._config_hash,
         )
-        self._bus.publish(TOPIC_SIGNALS, signal)
+        
+        self._bus.publish(TOPIC_REGIMES_MARKET, event)
+        self._market_events_emitted += 1
+        self._last_market_regimes[market] = event
 
-        legacy_event = RegimeChangeEvent(
-            symbol=symbol,
-            old_regime=old,
-            new_regime=new_regime,
-            confidence=1.0,  # deterministic = full confidence
-            data=data,
-            timestamp=ts,
-        )
-        self._bus.publish(TOPIC_SIGNALS_REGIME, legacy_event)
-        logger.info("Regime change %s: %s → %s", symbol, old, new_regime)
+    def _get_session_regime(self, market: str, ts_ms: int) -> str:
+        """Determine session from timestamp (no wall clock)."""
+        # Convert ms to hour of day (UTC)
+        seconds = ts_ms // 1000
+        hour = (seconds // 3600) % 24
+        
+        if market == "EQUITIES":
+            if EQUITIES_RTH_START <= hour < EQUITIES_RTH_END:
+                return "RTH"
+            elif EQUITIES_PRE_START <= hour < EQUITIES_RTH_START:
+                return "PRE"
+            elif hour >= EQUITIES_RTH_END or hour < EQUITIES_POST_END:
+                return "POST"
+            else:
+                return "CLOSED"
+        else:  # CRYPTO
+            if CRYPTO_ASIA_START <= hour < CRYPTO_ASIA_END:
+                return "ASIA"
+            elif CRYPTO_EU_START <= hour < CRYPTO_EU_END:
+                return "EU"
+            elif CRYPTO_US_START <= hour < CRYPTO_US_END:
+                return "US"
+            else:
+                return "OFFPEAK"
 
-    # ── public API ───────────────────────────────────────────
+    # ─── Public API ───────────────────────────────────────────────────────
 
-    def get_current_regime(self, symbol: str) -> str:
-        """Return current regime for *symbol* (thread-safe)."""
+    def get_symbol_regime(self, symbol: str, timeframe: int = 60) -> Optional[str]:
+        """Get current volatility regime for symbol."""
+        key = f"{symbol}:{timeframe}"
         with self._lock:
-            return self._current_regime.get(symbol, UNKNOWN)
+            state = self._symbol_states.get(key)
+            if state is None:
+                return None
+            # Return combined regime string
+            vol_z = 0.0
+            if len(state.vol_history) >= 5:
+                vol_list = list(state.vol_history)
+                current_vol = vol_list[-1]
+                mean_vol = sum(vol_list) / len(vol_list)
+                var = sum((v - mean_vol) ** 2 for v in vol_list) / max(1, len(vol_list) - 1)
+                std_vol = math.sqrt(var) if var > 0 else 1.0
+                vol_z = (current_vol - mean_vol) / std_vol if std_vol > 0 else 0.0
+            return self._classify_vol_regime(vol_z)
 
-    def get_all_regimes(self) -> Dict[str, str]:
+    def get_all_regimes(self) -> Dict[str, Dict[str, Any]]:
+        """Get current regime status for all symbols."""
         with self._lock:
-            return dict(self._current_regime)
+            result = {}
+            for key, state in self._symbol_states.items():
+                result[key] = {
+                    "bars_processed": state.bars_processed,
+                    "is_warm": state.bars_processed >= self._thresholds.get("warmup_bars", 30),
+                    "last_ts_ms": state.last_bar_ts_ms,
+                }
+            return result
 
-    # ── heartbeat / status ───────────────────────────────────
+    def get_market_regime(self, market: str) -> Optional[MarketRegimeEvent]:
+        """Get last market regime event."""
+        with self._lock:
+            return self._last_market_regimes.get(market)
+
+    # ─── Telemetry ────────────────────────────────────────────────────────
 
     def emit_heartbeat(self) -> ComponentHeartbeatEvent:
+        """Emit component heartbeat."""
         now = time.time()
         with self._lock:
-            processed = self._events_processed
-            changes = self._regime_changes
-            regimes = dict(self._current_regime)
-
-        health = "ok"
-        if not processed and (now - self._start_time) > 120:
-            health = "down"
-
+            bars = self._bars_received
+            symbol_events = self._symbol_events_emitted
+            market_events = self._market_events_emitted
+            warmup_skips = self._warmup_skips
+            gaps = self._gaps_detected
+        
+        uptime = now - self._start_time
+        health = "ok" if bars > 0 or uptime < 120 else "down"
+        
         hb = ComponentHeartbeatEvent(
             component="regime_detector",
-            uptime_seconds=round(now - self._start_time, 1),
-            events_processed=processed,
+            uptime_seconds=round(uptime, 1),
+            events_processed=bars,
             health=health,
             extra={
-                "regime_changes_total": changes,
-                "current_regimes": regimes,
+                "symbol_events_emitted": symbol_events,
+                "market_events_emitted": market_events,
+                "warmup_skips_total": warmup_skips,
+                "gaps_detected_total": gaps,
+                "config_hash": self._config_hash,
             },
         )
         self._bus.publish(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, hb)
         return hb
 
     def get_status(self) -> Dict[str, Any]:
+        """Get status for dashboard."""
         from .status import build_status
         
         now = time.time()
         with self._lock:
-            events_processed = self._events_processed
-            regime_changes = self._regime_changes
-            current_regimes = dict(self._current_regime)
+            bars = self._bars_received
+            symbol_events = self._symbol_events_emitted
+            market_events = self._market_events_emitted
+            warmup_skips = self._warmup_skips
+            gaps = self._gaps_detected
+            symbols = list(self._symbol_states.keys())
         
-        # Determine health status
         uptime = now - self._start_time
-        if events_processed > 0:
-            status = "ok"
-        elif uptime > 120:
-            status = "down"  # No data after 2 minutes
-        else:
-            status = "ok"  # Still starting up
+        status = "ok" if bars > 0 else ("ok" if uptime < 120 else "down")
         
         return build_status(
             name="regime_detector",
             type="internal",
             status=status,
-            request_count=events_processed,
+            request_count=bars,
             extras={
-                "events_processed": events_processed,
-                "regime_changes_total": regime_changes,
-                "current_regimes": current_regimes,
+                "bars_received": bars,
+                "symbol_events_emitted": symbol_events,
+                "market_events_emitted": market_events,
+                "warmup_skips_total": warmup_skips,
+                "gaps_detected_total": gaps,
+                "config_hash": self._config_hash,
+                "symbols_tracked": len(symbols),
                 "uptime_seconds": round(uptime, 1),
             },
         )
