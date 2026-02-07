@@ -149,6 +149,25 @@ def test_gate_mixed_regime_arrival_order():
     assert signal_to_dict(signal1) == signal_to_dict(signal2)
 
 
+def test_gate_no_duplicate_emits_for_same_state():
+    config = _default_config()
+    dt = datetime(2024, 1, 2, 15, 0, tzinfo=timezone.utc)
+    ts_ms = int(dt.timestamp() * 1000)
+    bar = _make_bar("IBIT", dt.timestamp())
+    symbol_regime = _make_symbol_regime("IBIT", ts_ms)
+    market_regime = _make_market_regime(ts_ms, session="RTH")
+
+    bus = DummyBus()
+    strat = DowRegimeTimingGateStrategy(bus, config=config)
+    strat._on_symbol_regime(symbol_regime)
+    strat._on_market_regime(market_regime)
+
+    strat._on_bar(bar)
+    strat._on_bar(bar)
+
+    assert len(bus.published) == 1
+
+
 def test_gate_session_last_n_minutes():
     config = _default_config()
     dt = datetime(2024, 1, 2, 20, 55, tzinfo=timezone.utc)

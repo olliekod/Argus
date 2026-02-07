@@ -60,7 +60,7 @@ from .events import (
     TOPIC_SYSTEM_HEARTBEAT,
     TOPIC_SYSTEM_COMPONENT_HEARTBEAT,
 )
-from .signals import SignalEvent as Phase3SignalEvent
+from .signals import SignalEvent as Phase3SignalEvent, normalize_snapshot
 
 logger = logging.getLogger("argus.persistence")
 
@@ -927,14 +927,24 @@ class PersistenceManager:
 
     async def _write_phase3_signal(self, event: Phase3SignalEvent) -> None:
         """Write a Phase 3 signal event immediately."""
-        regime_json = (
-            json.dumps(event.regime_snapshot, sort_keys=True)
+        regime_snapshot = (
+            normalize_snapshot(event.regime_snapshot)
             if event.regime_snapshot
             else None
         )
-        features_json = (
-            json.dumps(event.features_snapshot, sort_keys=True)
+        features_snapshot = (
+            normalize_snapshot(event.features_snapshot)
             if event.features_snapshot
+            else None
+        )
+        regime_json = (
+            json.dumps(regime_snapshot, sort_keys=True, separators=(",", ":"))
+            if regime_snapshot
+            else None
+        )
+        features_json = (
+            json.dumps(features_snapshot, sort_keys=True, separators=(",", ":"))
+            if features_snapshot
             else None
         )
         await self._db.write_signal(
