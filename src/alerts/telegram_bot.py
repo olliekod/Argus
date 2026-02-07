@@ -257,7 +257,6 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
     async def _polling_loop(self) -> None:
         attempt = 0
         while not self._polling_stop_event.is_set():
-            delay = 0.0
             self._polling_restart_event.clear()
             self._polling_last_exception = None
             try:
@@ -267,32 +266,38 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
                 await self._wait_for_polling_signal()
             except _PollingRestart as exc:
                 attempt += 1
-                delay = await self._handle_polling_failure(exc.error, attempt)
+                await self._handle_polling_failure(exc.error, attempt)
             except self._polling_retry_exceptions() as exc:
                 attempt += 1
-                delay = await self._handle_polling_failure(exc, attempt)
+                await self._handle_polling_failure(exc, attempt)
             except Exception as exc:
                 attempt += 1
-                delay = await self._handle_polling_failure(exc, attempt)
+                await self._handle_polling_failure(exc, attempt)
             finally:
                 await self._shutdown_application()
 
             if self._polling_stop_event.is_set():
                 break
 
-            await self._sleep_with_stop(delay)
-
     async def _wait_for_polling_signal(self) -> None:
-        done, _ = await asyncio.wait(
-            [self._polling_stop_event.wait(), self._polling_restart_event.wait()],
-            return_when=asyncio.FIRST_COMPLETED,
-        )
-        if self._polling_stop_event.is_set():
+        stop_task = asyncio.create_task(self._polling_stop_event.wait())
+        restart_task = asyncio.create_task(self._polling_restart_event.wait())
+        pending: List[asyncio.Task] = []
+        try:
+            done, pending = await asyncio.wait(
+                {stop_task, restart_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+        if stop_task in done and self._polling_stop_event.is_set():
             return
-        if self._polling_restart_event.is_set():
+        if restart_task in done and self._polling_restart_event.is_set():
             raise _PollingRestart(self._polling_last_exception)
-        if done:
-            return
 
     async def _sleep_with_stop(self, delay: float) -> None:
         if delay <= 0:
@@ -325,6 +330,7 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
             self._polling_last_error = str(error)
         delay = self._compute_backoff(attempt)
         self._rate_limited_polling_warning(error, delay)
+        await self._sleep_with_stop(delay)
         return delay
 
     def _rate_limited_polling_warning(self, error: Optional[BaseException], delay: float) -> None:
