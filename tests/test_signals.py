@@ -89,6 +89,32 @@ class TestSignalEventSchema:
         
         assert json1 == json2
 
+    def test_signal_snapshot_normalization(self):
+        """Snapshot values are JSON-safe and deterministically ordered."""
+        signal = SignalEvent(
+            timestamp_ms=1700000000000,
+            strategy_id="TEST_V1",
+            config_hash="abc",
+            symbol="BTC",
+            direction=DIRECTION_LONG,
+            signal_type=SIGNAL_TYPE_ENTRY,
+            timeframe=60,
+            confidence=0.9,
+            regime_snapshot={"trend": "TREND_UP", "vol": "VOL_NORMAL"},
+            features_snapshot={
+                "gate_name": "SELL_PUT_SPREAD",
+                "gate_score": 0.123456789,
+                "gate_allow": 1.0,
+            },
+            idempotency_key="key1",
+        )
+
+        d = signal_to_dict(signal)
+
+        assert list(d.keys()) == sorted(d.keys())
+        assert d["features_snapshot"]["gate_name"] == "SELL_PUT_SPREAD"
+        assert d["features_snapshot"]["gate_score"] == 0.12345679
+
     def test_idempotency_key_determinism(self):
         """Same inputs produce same idempotency key."""
         key1 = compute_signal_id("STRAT", "config", "BTC", 1700000000000)
