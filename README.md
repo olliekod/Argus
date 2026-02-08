@@ -1,109 +1,69 @@
-# 👁️ Argus
+# Argus
 
-> *Named after Argus Panoptes, the all-seeing giant of Greek mythology who had 100 eyes and never slept*
+Argus is a real-time market data ingestion and strategy research platform. It collects live data from exchanges and brokers, turns it into bars, detects market regimes, and generates trading signals for manual execution. No trades are placed automatically; it runs in collector mode by default.
 
-**Argus** is a 24/7 crypto market monitoring system that powers manual trading recommendations. It runs in observation mode to gather real market data, then paper trades a wide range of parameter combinations to identify the best-performing strategy to follow manually.
+## What It Does:
 
-## 🎯 Strategy Types (Manual Recommendations)
+Argus pulls market data from multiple sources: crypto perpetuals via Bybit, options IV via Deribit, and ETFs (IBIT, BITO) via Alpaca and Yahoo. Raw ticks are normalized and aggregated into 1-minute OHLCV bars. A feature builder computes returns, volatility, and jump scores. A regime detector classifies each symbol and the overall market (trend, volatility state, session). Detectors look for specific setups (e.g., BTC IV spike plus IBIT drawdown) and emit signals. A paper trader farm runs hundreds of thousands of virtual traders with different parameter sets to evaluate which strategies would have performed well.
 
-1. **BTC Options IV Spike** - Implied volatility spikes during panic (sell premium)
-2. **Volatility Regime Shifts** - Sudden volatility expansion/compression events
-3. **IBIT Options Put Spreads** - BTC IV + ETF drawdown triggers for Robinhood trades
-4. **BITO Options Put Spreads** - Same framework, more opportunity coverage
+Determinism is central. Same tape input produces same bars, same regimes, same signals. No randomness or wall-clock dependency in the core pipeline. A tape recorder captures events for replay and backtesting.
 
-## 📊 Architecture
+## Data Flow:
 
-```
-Market Data Sources (WebSocket/REST)
-    ↓
-Data Normalization Layer
-    ↓
-Manual Opportunity Detectors (Independent Modules)
-    ↓
-SQLite Database (Logging Everything)
-    ↓
-Alert System (Telegram) + Paper Trader Analysis Engine
-```
+Connectors publish quotes and metrics to an event bus. The bar builder subscribes to quotes, aggregates ticks into 1-minute bars, and publishes bar events. The feature builder and regime detector consume bars and emit metrics and regime labels. Detectors and strategies consume bars plus regimes and emit signals. Persistence writes bars and signals to SQLite. The paper trader farm and Telegram bot consume signals.
 
-## 🛠️ Setup
+## Connectors:
 
-### Prerequisites
-- Python 3.10+
-- API keys for: Bybit, Deribit (optional for IV data)
-- Telegram bot token
+- Bybit (crypto perpetuals, WebSocket)
+- Deribit (BTC options IV)
+- Alpaca (IBIT, BITO equity and bars)
+- Yahoo Finance (equity data)
+- Polymarket (optional, disabled by default)
 
-### Installation
+## Detectors and Strategies:
+
+- IBIT detector: sell put spreads when BTC volatility spikes and IBIT drops
+- Options IV detector: implied volatility setups
+- Volatility detector: regime shifts and expansion events
+- Day-of-week + regime timing gate: filter signals based on session, trend, volatility, and data quality
+
+## Indicators:
+
+Deterministic implementations of EMA, RSI, VWAP, MACD, ATR, rolling volatility, and log returns. Supports batch and incremental modes.
+
+## Modes:
+
+Collector mode (default): collects data, builds bars, detects regimes, generates signals. No execution.
+
+Live mode: set `ARGUS_MODE=live` to enable trading. Not recommended until strategies are validated.
+
+## Setup:
+
+Requires Python 3.10+, API keys for Bybit and Alpaca (Deribit optional for IV data), and a Telegram bot token if you want alerts.
 
 ```powershell
-# Navigate to project
 cd C:\Users\Oliver\Desktop\Desktop\Projects\argus
-
-# Create virtual environment
 python -m venv venv
-
-# Activate
 .\venv\Scripts\Activate.ps1
-
-# Install dependencies
 pip install -r requirements.txt
-
-# Copy secrets template
 copy config\secrets.example.yaml config\secrets.yaml
-
-# Edit secrets.yaml with your API keys
-
-# Initialize database
+# Secrets.yaml need to have updated api keys
 python scripts\init_database.py
-
-# Run Argus
 python main.py
 ```
 
-## 📁 Project Structure
+## Configuration
 
-```
-argus/
-├── config/
-│   ├── config.yaml          # Main configuration
-│   ├── secrets.yaml         # API keys (gitignored)
-│   └── thresholds.yaml      # Detection thresholds
-├── src/
-│   ├── core/                # Database, logging, utilities
-│   ├── connectors/          # Exchange WebSocket/REST clients
-│   ├── detectors/           # Manual opportunity detectors
-│   ├── alerts/              # Telegram notifications
-│   └── analysis/            # Performance tracking
-├── data/
-│   ├── argus.db            # SQLite database
-│   └── logs/               # Daily log files
-├── tests/                   # Unit tests
-├── notebooks/               # Jupyter analysis notebooks
-└── scripts/                 # Utility scripts
-```
+Main config lives in `config/config.yaml`. Thresholds and strategy params in `config/thresholds.yaml` and `config/strategy_params.json`. Secrets (API keys, Telegram token) go in `config/secrets.yaml` (gitignored).
 
-## 📈 Timeline
+## Rules
 
-| Week | Phase |
-|------|-------|
-| 1-2 | Build and run detector (observation only) |
-| 3 | Analyze data and select best paper trader |
-| 4-5 | Follow the top paper trader manually (no automation) |
-| 6+ | Continue monitoring and performance reviews |
+90-day rule: after adopting a strategy, no parameter changes for 90 days.
 
-## ⚠️ Important Rules
+Circuit breakers: auto-pause on 5% daily loss or 5 consecutive losses.
 
-1. **90-Day Rule**: After adopting a strategy, NO parameter changes for 90 days
-2. **Circuit Breakers**: Auto-pause on 5% daily loss or 5 consecutive losses
-3. **Observation First**: Always observe before trading
+Observation first: run in collector mode and validate before considering live execution.
 
-## 📞 Alert Tiers
+## License
 
-| Tier | Type | Example |
-|------|------|---------|
-| 🚨 1 | Immediate | IBIT/BITO put spread signal |
-| 📊 2 | FYI | IV spike confirmations |
-| 📝 3 | Background | Minor events (logged only) |
-
-## 📜 License
-
-Private project - not for redistribution.
+Private project. Not for redistribution.
