@@ -55,11 +55,13 @@ from .events import (
     SignalEvent,
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_METRICS,
+    TOPIC_OPTIONS_CHAINS,
     TOPIC_SIGNALS,
     TOPIC_SIGNALS_RAW,
     TOPIC_SYSTEM_HEARTBEAT,
     TOPIC_SYSTEM_COMPONENT_HEARTBEAT,
 )
+from .option_events import OptionChainSnapshotEvent, option_chain_to_dict
 from .signals import SignalEvent as Phase3SignalEvent, normalize_snapshot
 
 logger = logging.getLogger("argus.persistence")
@@ -268,6 +270,8 @@ class PersistenceManager:
         bus.subscribe(TOPIC_SYSTEM_HEARTBEAT, self._on_heartbeat)
         bus.subscribe(TOPIC_MARKET_METRICS, self._on_metric)
         bus.subscribe(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, self._on_component_heartbeat)
+        # Phase 3B: Options chain snapshots (idempotent upsert)
+        bus.subscribe(TOPIC_OPTIONS_CHAINS, self._on_option_chain)
 
         logger.info("PersistenceManager initialised (bar_buffer_max=%d)", self._bar_buffer_max)
 
@@ -690,6 +694,38 @@ class PersistenceManager:
             with self._status_lock:
                 self._heartbeats_dropped_total += 1
             logger.debug("Telemetry queue full — dropping heartbeat event")
+
+    def _on_option_chain(self, event: OptionChainSnapshotEvent) -> None:
+        """Persist option chain snapshot via idempotent upsert.
+        
+        Writes directly to DB (async-safe via futures).
+        Uses upsert_option_chain_snapshot for restart idempotency.
+        """
+        if not self._running:
+            return
+        
+        # Serialize quotes to JSON for storage
+        import json
+        quotes_json = json.dumps(option_chain_to_dict(event), sort_keys=True)
+        
+        # Schedule async write
+        future = asyncio.run_coroutine_threadsafe(
+            self._db.upsert_option_chain_snapshot(
+                snapshot_id=event.snapshot_id,
+                symbol=event.symbol,
+                expiration_ms=event.expiration_ms,
+                underlying_price=event.underlying_price,
+                n_strikes=event.n_strikes,
+                atm_iv=event.atm_iv,
+                timestamp_ms=event.timestamp_ms,
+                source_ts_ms=event.source_ts_ms,
+                provider=event.provider,
+                quotes_json=quotes_json,
+            ),
+            self._loop,
+        )
+        # Fire-and-forget (errors logged in db method)
+        future.add_done_callback(lambda f: f.exception() if f.exception() else None)
 
     # ── flush logic ─────────────────────────────────────────
 

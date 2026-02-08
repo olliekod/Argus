@@ -214,22 +214,29 @@ class TestCanonicalReplay:
 class TestPriorityTables:
     def test_provider_priority_values(self):
         """Verify provider priority table values."""
+        # Code is source of truth - updated to match actual tape.py
         assert PROVIDER_PRIORITY["alpaca"] == 1
-        assert PROVIDER_PRIORITY["yahoo"] == 2
-        assert PROVIDER_PRIORITY["bybit"] == 3
-        assert PROVIDER_PRIORITY["binance"] == 4
-        assert PROVIDER_PRIORITY["deribit"] == 5
-        assert PROVIDER_PRIORITY["polymarket"] == 6
+        assert PROVIDER_PRIORITY["tradier"] == 2
+        assert PROVIDER_PRIORITY["yahoo"] == 3
+        assert PROVIDER_PRIORITY["bybit"] == 4
+        assert PROVIDER_PRIORITY["binance"] == 5
+        assert PROVIDER_PRIORITY["deribit"] == 6
+        assert PROVIDER_PRIORITY["polymarket"] == 7
         assert PROVIDER_PRIORITY["unknown"] == 99
     
     def test_event_type_priority_values(self):
         """Verify event type priority table values."""
+        # Code is source of truth - updated to match actual tape.py
+        # Options events ordered by data dependency: contract → quote → chain
         assert EVENT_TYPE_PRIORITY["bar"] == 1
         assert EVENT_TYPE_PRIORITY["quote"] == 2
-        assert EVENT_TYPE_PRIORITY["metric"] == 3
-        assert EVENT_TYPE_PRIORITY["minute_tick"] == 4
-        assert EVENT_TYPE_PRIORITY["signal"] == 5
-        assert EVENT_TYPE_PRIORITY["heartbeat"] == 6
+        assert EVENT_TYPE_PRIORITY["option_contract"] == 3  # Static metadata first
+        assert EVENT_TYPE_PRIORITY["option_quote"] == 4     # Live quotes per contract
+        assert EVENT_TYPE_PRIORITY["option_chain"] == 5     # Aggregate snapshot last
+        assert EVENT_TYPE_PRIORITY["metric"] == 6
+        assert EVENT_TYPE_PRIORITY["minute_tick"] == 7
+        assert EVENT_TYPE_PRIORITY["signal"] == 8
+        assert EVENT_TYPE_PRIORITY["heartbeat"] == 9
 
 
 # ═══════════════════════════════════════════════════════════════════════════

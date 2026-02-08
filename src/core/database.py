@@ -519,13 +519,185 @@ class Database:
             "ON signal_outcomes(strategy_id, timestamp_ms DESC)"
         )
 
+        # Phase 3B: Option contracts (static metadata)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS option_contracts (
+                contract_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                option_symbol TEXT NOT NULL UNIQUE,
+                strike REAL NOT NULL,
+                expiration_ms INTEGER NOT NULL,
+                option_type TEXT NOT NULL,
+                multiplier INTEGER DEFAULT 100,
+                style TEXT DEFAULT 'american',
+                provider TEXT NOT NULL,
+                first_seen_ms INTEGER NOT NULL,
+                last_updated_ms INTEGER NOT NULL
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_oc_symbol_exp "
+            "ON option_contracts(symbol, expiration_ms)"
+        )
+
+        # Phase 3B: Option quotes (time series)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS option_quotes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                contract_id TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                strike REAL NOT NULL,
+                expiration_ms INTEGER NOT NULL,
+                option_type TEXT NOT NULL,
+                bid REAL,
+                ask REAL,
+                last REAL,
+                mid REAL,
+                volume INTEGER,
+                open_interest INTEGER,
+                iv REAL,
+                delta REAL,
+                gamma REAL,
+                theta REAL,
+                vega REAL,
+                timestamp_ms INTEGER NOT NULL,
+                source_ts_ms INTEGER,
+                provider TEXT,
+                FOREIGN KEY (contract_id) REFERENCES option_contracts(contract_id)
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_oq_ts "
+            "ON option_quotes(timestamp_ms)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_oq_symbol_exp "
+            "ON option_quotes(symbol, expiration_ms)"
+        )
+
+        # Phase 3B: Option chain snapshots (atomic snapshots)
+        # Unique constraint: (provider, symbol, timestamp_ms)
+        # Each snapshot represents the full chain at a point in time.
+        # expiration_ms is stored in the quote payload, not in uniqueness.
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS option_chain_snapshots (
+                snapshot_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                expiration_ms INTEGER NOT NULL,
+                underlying_price REAL NOT NULL,
+                n_strikes INTEGER,
+                atm_iv REAL,
+                timestamp_ms INTEGER NOT NULL,
+                source_ts_ms INTEGER,
+                provider TEXT NOT NULL,
+                quotes_json TEXT NOT NULL,
+                UNIQUE(provider, symbol, timestamp_ms)
+            )
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocs_ts "
+            "ON option_chain_snapshots(timestamp_ms)"
+        )
+
         await self._connection.commit()
 
         logger.debug("Database tables created/verified")
 
+    # =========================================================================
+    # Phase 3B: Options Persistence (idempotent upserts)
+    # =========================================================================
+
+    async def upsert_option_contract(
+        self,
+        contract_id: str,
+        symbol: str,
+        option_symbol: str,
+        strike: float,
+        expiration_ms: int,
+        option_type: str,
+        provider: str,
+        timestamp_ms: int,
+        multiplier: int = 100,
+        style: str = "american",
+    ) -> bool:
+        """Upsert option contract metadata (idempotent).
+        
+        Unique constraint: option_symbol (globally unique OCC symbol).
+        
+        Returns:
+            True if inserted, False if updated existing.
+        """
+        try:
+            await self._connection.execute("""
+                INSERT INTO option_contracts (
+                    contract_id, symbol, option_symbol, strike, expiration_ms,
+                    option_type, multiplier, style, provider, first_seen_ms, last_updated_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(option_symbol) DO UPDATE SET
+                    last_updated_ms = excluded.last_updated_ms
+            """, (
+                contract_id, symbol, option_symbol, strike, expiration_ms,
+                option_type, multiplier, style, provider, timestamp_ms, timestamp_ms,
+            ))
+            await self._connection.commit()
+            return True
+        except Exception as e:
+            logger.warning("upsert_option_contract failed: %s", e)
+            return False
+
+    async def upsert_option_chain_snapshot(
+        self,
+        snapshot_id: str,
+        symbol: str,
+        expiration_ms: int,
+        underlying_price: float,
+        n_strikes: int,
+        atm_iv: float | None,
+        timestamp_ms: int,
+        source_ts_ms: int | None,
+        provider: str,
+        quotes_json: str,
+    ) -> bool:
+        """Upsert option chain snapshot (idempotent).
+        
+        Unique constraint: (provider, symbol, timestamp_ms).
+        Expiration is stored in payload, not in uniqueness key.
+        
+        Returns:
+            True if inserted, False if already exists.
+        """
+        try:
+            await self._connection.execute("""
+                INSERT INTO option_chain_snapshots (
+                    snapshot_id, symbol, expiration_ms, underlying_price,
+                    n_strikes, atm_iv, timestamp_ms, source_ts_ms, provider, quotes_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, symbol, timestamp_ms) DO NOTHING
+            """, (
+                snapshot_id, symbol, expiration_ms, underlying_price,
+                n_strikes, atm_iv, timestamp_ms, source_ts_ms, provider, quotes_json,
+            ))
+            await self._connection.commit()
+            return True
+        except Exception as e:
+            logger.warning("upsert_option_chain_snapshot failed: %s", e)
+            return False
+
+    async def get_latest_chain_timestamp(self, symbol: str) -> int | None:
+        """Get latest chain snapshot timestamp for a symbol.
+        
+        Used for restart initialization to avoid duplicate polling.
+        
+        Returns:
+            Latest timestamp_ms or None if no snapshots exist.
+        """
+        cursor = await self._connection.execute("""
+            SELECT MAX(timestamp_ms) FROM option_chain_snapshots WHERE symbol = ?
+        """, (symbol,))
+        row = await cursor.fetchone()
+        return row[0] if row and row[0] else None
 
     
-    # =========================================================================
     # Detection Operations
     # =========================================================================
     
@@ -1500,3 +1672,144 @@ class Database:
             await self._connection.backup(backup)
         
         logger.info(f"Database backed up to {backup_path}")
+
+    # =========================================================================
+    # Phase 3B: Options Data Operations
+    # =========================================================================
+
+    async def upsert_option_contract(
+        self,
+        contract_id: str,
+        symbol: str,
+        option_symbol: str,
+        strike: float,
+        expiration_ms: int,
+        option_type: str,
+        provider: str,
+        timestamp_ms: int,
+        multiplier: int = 100,
+        style: str = "american",
+    ) -> None:
+        """Upsert an option contract (insert or update last_updated_ms)."""
+        await self._connection.execute("""
+            INSERT INTO option_contracts (
+                contract_id, symbol, option_symbol, strike, expiration_ms,
+                option_type, multiplier, style, provider, first_seen_ms, last_updated_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(contract_id) DO UPDATE SET
+                last_updated_ms = excluded.last_updated_ms
+        """, (
+            contract_id, symbol, option_symbol, strike, expiration_ms,
+            option_type, multiplier, style, provider, timestamp_ms, timestamp_ms
+        ))
+        await self._connection.commit()
+
+    async def insert_option_quote(
+        self,
+        contract_id: str,
+        symbol: str,
+        strike: float,
+        expiration_ms: int,
+        option_type: str,
+        bid: float,
+        ask: float,
+        timestamp_ms: int,
+        last: float = 0.0,
+        mid: float = 0.0,
+        volume: int = 0,
+        open_interest: int = 0,
+        iv: float = None,
+        delta: float = None,
+        gamma: float = None,
+        theta: float = None,
+        vega: float = None,
+        source_ts_ms: int = None,
+        provider: str = "",
+    ) -> None:
+        """Insert an option quote (append-only)."""
+        await self._connection.execute("""
+            INSERT INTO option_quotes (
+                contract_id, symbol, strike, expiration_ms, option_type,
+                bid, ask, last, mid, volume, open_interest,
+                iv, delta, gamma, theta, vega,
+                timestamp_ms, source_ts_ms, provider
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            contract_id, symbol, strike, expiration_ms, option_type,
+            bid, ask, last, mid, volume, open_interest,
+            iv, delta, gamma, theta, vega,
+            timestamp_ms, source_ts_ms, provider
+        ))
+        await self._connection.commit()
+
+    async def insert_option_chain_snapshot(
+        self,
+        snapshot_id: str,
+        symbol: str,
+        expiration_ms: int,
+        underlying_price: float,
+        timestamp_ms: int,
+        quotes_json: str,
+        n_strikes: int = 0,
+        atm_iv: float = None,
+        source_ts_ms: int = None,
+        provider: str = "",
+    ) -> None:
+        """Insert or replace an option chain snapshot (atomic)."""
+        await self._connection.execute("""
+            INSERT OR REPLACE INTO option_chain_snapshots (
+                snapshot_id, symbol, expiration_ms, underlying_price,
+                n_strikes, atm_iv, timestamp_ms, source_ts_ms, provider, quotes_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            snapshot_id, symbol, expiration_ms, underlying_price,
+            n_strikes, atm_iv, timestamp_ms, source_ts_ms, provider, quotes_json
+        ))
+        await self._connection.commit()
+
+    async def get_option_chain_snapshot(
+        self,
+        symbol: str,
+        expiration_ms: int,
+        timestamp_ms: int = None,
+    ) -> Optional[Dict[str, Any]]:
+        """Get an option chain snapshot.
+        
+        If timestamp_ms is None, returns the most recent snapshot.
+        """
+        if timestamp_ms:
+            cursor = await self._connection.execute("""
+                SELECT * FROM option_chain_snapshots
+                WHERE symbol = ? AND expiration_ms = ? AND timestamp_ms = ?
+            """, (symbol, expiration_ms, timestamp_ms))
+        else:
+            cursor = await self._connection.execute("""
+                SELECT * FROM option_chain_snapshots
+                WHERE symbol = ? AND expiration_ms = ?
+                ORDER BY timestamp_ms DESC
+                LIMIT 1
+            """, (symbol, expiration_ms))
+        row = await cursor.fetchone()
+        return dict(row) if row else None
+
+    async def get_option_contracts(
+        self,
+        symbol: str,
+        expiration_ms: int = None,
+    ) -> List[Dict[str, Any]]:
+        """Get option contracts for a symbol, optionally filtered by expiration."""
+        if expiration_ms:
+            cursor = await self._connection.execute("""
+                SELECT * FROM option_contracts
+                WHERE symbol = ? AND expiration_ms = ?
+                ORDER BY strike ASC
+            """, (symbol, expiration_ms))
+        else:
+            cursor = await self._connection.execute("""
+                SELECT * FROM option_contracts
+                WHERE symbol = ?
+                ORDER BY expiration_ms ASC, strike ASC
+            """, (symbol,))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+

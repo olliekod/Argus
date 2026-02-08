@@ -34,6 +34,8 @@ from .core.events import (
     TOPIC_MARKET_METRICS,
     TOPIC_MARKET_QUOTES,
     TOPIC_SIGNALS,
+    TOPIC_SIGNALS_RAW,
+    TOPIC_OPTIONS_CHAINS,
     TOPIC_SYSTEM_HEARTBEAT,
     TOPIC_SYSTEM_MINUTE_TICK,
 )
@@ -49,6 +51,8 @@ from .connectors.bybit_ws import BybitWebSocket
 from .connectors.deribit_client import DeribitClient
 from .connectors.yahoo_client import YahooFinanceClient
 from .connectors.alpaca_client import AlpacaDataClient
+from .connectors.alpaca_options import AlpacaOptionsConnector, AlpacaOptionsConfig
+from .strategies.spread_generator import SpreadCandidateGenerator, SpreadGeneratorConfig
 from .connectors.polymarket_gamma import PolymarketGammaClient
 from .connectors.polymarket_clob import PolymarketCLOBClient
 from .connectors.polymarket_watchlist import PolymarketWatchlistService
@@ -179,6 +183,8 @@ class ArgusOrchestrator:
         self.deribit_client: Optional[DeribitClient] = None
         self.yahoo_client: Optional[YahooFinanceClient] = None
         self.alpaca_client: Optional[AlpacaDataClient] = None
+        self.alpaca_options: Optional[AlpacaOptionsConnector] = None
+        self.spread_generator: Optional[SpreadCandidateGenerator] = None
         self.telegram: Optional[TelegramBot] = None
         
         # Off-hours monitoring
@@ -550,6 +556,45 @@ class ArgusOrchestrator:
                     alpaca_cfg.get('poll_interval_seconds', 60),
                     alpaca_cfg.get('overlap_seconds', 120),
                 )
+                
+                # Alpaca Options Connector (Phase 3B)
+                options_cfg = alpaca_cfg.get('options', {})
+                if options_cfg.get('enabled', False):
+                    self.alpaca_options = AlpacaOptionsConnector(
+                        config=AlpacaOptionsConfig(
+                            api_key=alpaca_api_key,
+                            api_secret=alpaca_api_secret,
+                            cache_ttl_seconds=int(options_cfg.get('poll_interval_seconds', 60)),
+                        )
+                    )
+                    self._alpaca_options_symbols = options_cfg.get('symbols', ['IBIT', 'BITO'])
+                    self._alpaca_options_poll_interval = int(options_cfg.get('poll_interval_seconds', 60))
+                    self._alpaca_options_min_dte = int(options_cfg.get('min_dte', 7))
+                    self._alpaca_options_max_dte = int(options_cfg.get('max_dte', 21))
+                    
+                    # SpreadCandidateGenerator (subscribes to options.chains)
+                    self.spread_generator = SpreadCandidateGenerator(
+                        strategy_id="PUT_SPREAD_V1",
+                        config=SpreadGeneratorConfig(
+                            min_dte=self._alpaca_options_min_dte,
+                            max_dte=self._alpaca_options_max_dte,
+                        ),
+                        on_signal=self._on_spread_signal,
+                    )
+                    # Subscribe generator to chain snapshots
+                    self.event_bus.subscribe(
+                        TOPIC_OPTIONS_CHAINS,
+                        self.spread_generator.on_chain_snapshot,
+                    )
+                    self.logger.info(
+                        "Alpaca Options connector + SpreadGenerator configured for %s (poll=%ds, DTE=%d-%d)",
+                        self._alpaca_options_symbols,
+                        self._alpaca_options_poll_interval,
+                        self._alpaca_options_min_dte,
+                        self._alpaca_options_max_dte,
+                    )
+                else:
+                    self.logger.info("Alpaca Options disabled (set alpaca.options.enabled=true)")
             else:
                 self.logger.warning("Alpaca enabled but API keys not found in secrets.yaml")
         else:
@@ -1217,6 +1262,78 @@ class ArgusOrchestrator:
                 if (now - self._deribit_traceback_ts) >= 60:
                     self._deribit_traceback_ts = now
                     self.logger.error("Deribit polling traceback:\n%s", traceback.format_exc())
+            
+            await asyncio.sleep(interval)
+    
+    def _on_spread_signal(self, signal) -> None:
+        """Handle spread signal from SpreadCandidateGenerator.
+        
+        Emits SignalEvent to signals.raw with strategy_id=PUT_SPREAD_V1.
+        """
+        from .core.signals import SignalEvent as Phase3Signal, signal_to_dict
+        
+        # Convert to Phase 3 SignalEvent if needed
+        if hasattr(signal, 'signal_id'):
+            # Already a SignalEvent-like object
+            self.event_bus.publish(TOPIC_SIGNALS_RAW, signal)
+            self.logger.debug(
+                "Spread signal emitted: %s %s credit=%.2f",
+                signal.symbol if hasattr(signal, 'symbol') else "?",
+                signal.direction if hasattr(signal, 'direction') else "?",
+                signal.metadata.get('credit', 0) if hasattr(signal, 'metadata') else 0,
+            )
+    
+    async def _poll_options_chains(self) -> None:
+        """Poll Alpaca for options chain snapshots.
+        
+        Publishes OptionChainSnapshotEvent to options.chains topic.
+        SpreadCandidateGenerator is already subscribed via event bus.
+        """
+        if not self.alpaca_options:
+            return
+        
+        interval = getattr(self, '_alpaca_options_poll_interval', 60)
+        symbols = getattr(self, '_alpaca_options_symbols', ['IBIT', 'BITO'])
+        min_dte = getattr(self, '_alpaca_options_min_dte', 7)
+        max_dte = getattr(self, '_alpaca_options_max_dte', 21)
+        
+        # Rate-limit warning aggregation
+        last_warning_ts = 0
+        warning_count = 0
+        
+        while self._running:
+            try:
+                for symbol in symbols:
+                    # Get expirations in DTE range
+                    expirations = await self.alpaca_options.get_expirations_in_range(
+                        symbol, min_dte=min_dte, max_dte=max_dte
+                    )
+                    
+                    for exp_date, dte in expirations:
+                        snapshot = await self.alpaca_options.build_chain_snapshot(
+                            symbol, exp_date
+                        )
+                        if snapshot:
+                            # Publish to event bus (TapeRecorder + SpreadGenerator subscribe)
+                            self.event_bus.publish(TOPIC_OPTIONS_CHAINS, snapshot)
+                            self.logger.debug(
+                                "Options chain: %s exp=%s DTE=%d puts=%d calls=%d",
+                                symbol, exp_date, dte,
+                                len(snapshot.puts), len(snapshot.calls),
+                            )
+                        else:
+                            warning_count += 1
+                            now = time.time()
+                            if now - last_warning_ts > 60:
+                                self.logger.warning(
+                                    "Empty chain for %s exp=%s (suppressed %d similar)",
+                                    symbol, exp_date, warning_count,
+                                )
+                                last_warning_ts = now
+                                warning_count = 0
+                            
+            except Exception as e:
+                self.logger.error("Options polling error: %s", e)
             
             await asyncio.sleep(interval)
     
@@ -2196,6 +2313,10 @@ class ArgusOrchestrator:
         # Uses FIXED INTERVAL polling - no market-hours gating for determinism
         if self.alpaca_client:
             self._tasks.append(asyncio.create_task(self.alpaca_client.poll()))
+
+        # Alpaca OPTIONS chain polling (Phase 3B - runs in ALL modes)
+        if self.alpaca_options:
+            self._tasks.append(asyncio.create_task(self._poll_options_chains()))
 
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._health_check()))

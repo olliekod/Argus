@@ -66,6 +66,20 @@ from ..core.events import (
     TOPIC_SIGNALS_RAW,
     TOPIC_SIGNALS_RANKED,
 )
+from ..core.option_events import (
+    OptionContractEvent,
+    OptionQuoteEvent,
+    OptionChainSnapshotEvent,
+    option_contract_to_dict,
+    option_quote_to_dict,
+    option_chain_to_dict,
+    dict_to_option_contract,
+    dict_to_option_quote,
+    dict_to_option_chain,
+    TOPIC_OPTIONS_CHAINS,
+    TOPIC_OPTIONS_QUOTES,
+    TOPIC_OPTIONS_CONTRACTS,
+)
 from ..core.regimes import (
     SymbolRegimeEvent,
     MarketRegimeEvent,
@@ -92,24 +106,41 @@ logger = logging.getLogger("argus.soak.tape")
 # Provider priority for canonical tape ordering (lower = higher priority)
 PROVIDER_PRIORITY: Dict[str, int] = {
     "alpaca": 1,
-    "yahoo": 2,
-    "bybit": 3,
-    "binance": 4,
-    "deribit": 5,
-    "polymarket": 6,
+    "tradier": 2,
+    "yahoo": 3,
+    "bybit": 4,
+    "binance": 5,
+    "deribit": 6,
+    "polymarket": 7,
     "unknown": 99,
 }
 
 # Event type priority for canonical tape ordering (lower = higher priority)
+# 
+# Ordering rationale:
+#   1. bar         - Core market data, highest priority for replay
+#   2. quote       - Equity quotes feed bar builder
+#   3. option_contract - Static metadata, defines chain structure
+#   4. option_quote    - Live option quotes per contract
+#   5. option_chain    - Aggregate snapshot built from quotes
+#   6. metric      - Derived metrics from market data
+#   7. minute_tick - Time boundary marker
+#   8. signal      - Strategy outputs from processed data
+#   9. heartbeat   - System health (lowest data priority)
+#   10-11. regime  - Market state classifications
+#
 EVENT_TYPE_PRIORITY: Dict[str, int] = {
     "bar": 1,
     "quote": 2,
-    "metric": 3,
-    "minute_tick": 4,
-    "signal": 5,
-    "heartbeat": 6,
-    "symbol_regime": 7,
-    "market_regime": 8,
+    "option_contract": 3,  # Static metadata first
+    "option_quote": 4,     # Live quotes per contract
+    "option_chain": 5,     # Aggregate snapshot last
+    "metric": 6,
+    "minute_tick": 7,
+    "signal": 8,
+    "heartbeat": 9,
+    "symbol_regime": 10,
+    "market_regime": 11,
 }
 
 
@@ -295,8 +326,13 @@ def _dict_to_event(d: Dict[str, Any]):
         ts = d["timestamp"]
         return MinuteTickEvent(timestamp=_from_tape_ts(ts))
     elif event_type == "bar":
-
         return _dict_to_bar(d)
+    elif event_type == "option_chain":
+        return dict_to_option_chain(d)
+    elif event_type == "option_quote":
+        return dict_to_option_quote(d)
+    elif event_type == "option_contract":
+        return dict_to_option_contract(d)
     raise ValueError(f"Unknown event type: {event_type}")
 
 
@@ -418,6 +454,8 @@ class TapeRecorder:
         bus.subscribe(TOPIC_REGIMES_MARKET, self._on_market_regime)
         bus.subscribe(TOPIC_SIGNALS_RAW, self._on_raw_signal)
         bus.subscribe(TOPIC_SIGNALS_RANKED, self._on_ranked_signal)
+        # Phase 3B: Options chain snapshots
+        bus.subscribe(TOPIC_OPTIONS_CHAINS, self._on_option_chain)
         logger.info(
             "TapeRecorder attached (maxlen=%d, symbols=%s)",
             self._maxlen,
@@ -493,6 +531,25 @@ class TapeRecorder:
             d["provider"] = "regime_detector"
             d["symbol"] = event.market  # Use market as "symbol" for sorting
             d["timeframe"] = event.timeframe
+            was_full = len(self._tape) == self._tape.maxlen
+            self._tape.append(d)
+            self._events_captured += 1
+            if was_full:
+                self._events_evicted += 1
+
+    def _on_option_chain(self, event: OptionChainSnapshotEvent) -> None:
+        """Record option chain snapshot to tape."""
+        if not self._enabled:
+            return
+        if self._symbols and event.symbol not in self._symbols:
+            return
+        with self._lock:
+            seq_id = self._get_next_sequence_id()
+            d = option_chain_to_dict(event)
+            d["sequence_id"] = seq_id
+            d["event_ts"] = event.timestamp_ms
+            d["provider"] = event.provider
+            d["event_type"] = "option_chain"
             was_full = len(self._tape) == self._tape.maxlen
             self._tape.append(d)
             self._events_captured += 1

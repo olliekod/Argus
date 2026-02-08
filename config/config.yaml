@@ -54,6 +54,12 @@ exchanges:
     symbols: ["IBIT", "BITO"]
     poll_interval_seconds: 60
     bar_timeframe: "1Min"
+    options:
+      enabled: true
+      symbols: ["IBIT", "BITO"]
+      poll_interval_seconds: 60  # 1 minute between chain polls (default)
+      min_dte: 7
+      max_dte: 21
 
 # -----------------------------------------------------------------------------
 # Alert Configuration

@@ -214,9 +214,15 @@ TOPIC_SYSTEM_HEARTBEAT = "system.heartbeat"
 TOPIC_SYSTEM_MINUTE_TICK = "system.minute_tick"
 TOPIC_SYSTEM_COMPONENT_HEARTBEAT = "system.component_heartbeat"
 
-# Phase 3 Signal Topics
+# Signal Topics
 TOPIC_SIGNALS_RAW = "signals.raw"           # Raw strategy output
 TOPIC_SIGNALS_RANKED = "signals.ranked"     # After ranker scoring
 TOPIC_SIGNALS_OUTCOME = "signals.outcome"   # Markout results
+
+# Options Topics
+TOPIC_OPTIONS_CONTRACTS = "options.contracts"   # Static contract metadata
+TOPIC_OPTIONS_QUOTES = "options.quotes"         # Live option quotes
+TOPIC_OPTIONS_CHAINS = "options.chains"         # Atomic chain snapshots
+TOPIC_OPTIONS_SPREADS = "options.spreads"       # Put spread candidates
 
 
