@@ -96,13 +96,21 @@ def _quantize(value: Optional[float], decimals: int) -> Optional[float]:
 
 
 def _timestamp_to_ms(ts_str: str) -> int:
-    """Convert ISO timestamp string to milliseconds."""
-    # Handle ISO format like "2025-01-15 12:30:00" or "2025-01-15T12:30:00"
+    """Convert ISO timestamp string to milliseconds (always UTC).
+
+    Naive timestamps (no timezone info) are treated as UTC to ensure
+    determinism regardless of the machine's local timezone.
+    """
+    from datetime import timezone as _tz
+
     try:
         if "T" in ts_str:
             dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
         else:
             dt = datetime.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+        # Force UTC for naive datetimes to guarantee determinism
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=_tz.utc)
         return int(dt.timestamp() * 1000)
     except Exception:
         # Fallback: try to parse as float seconds

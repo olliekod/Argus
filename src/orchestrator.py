@@ -2465,6 +2465,11 @@ class ArgusOrchestrator:
                     self.feature_builder.emit_heartbeat()
                 if self.regime_detector:
                     self.regime_detector.emit_heartbeat()
+                # ── System-level heartbeat for uptime tracking (Phase 4A.1+) ──
+                if self.db:
+                    import time as _t
+                    ts_ms = int(_t.time() * 1000)
+                    await self.db.write_heartbeat("orchestrator", ts_ms)
             except Exception:
                 self.logger.debug("Component heartbeat emission failed", exc_info=True)
 

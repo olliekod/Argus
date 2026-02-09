@@ -647,6 +647,20 @@ class Database:
             "ON bar_outcomes(status, provider, symbol)"
         )
 
+        # Phase 4A.1+: System heartbeat for uptime tracking
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS system_heartbeat (
+                component TEXT NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                metadata_json TEXT,
+                PRIMARY KEY (component, timestamp_ms)
+            ) WITHOUT ROWID
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_sys_hb_comp_ts "
+            "ON system_heartbeat(component, timestamp_ms)"
+        )
+
         await self._connection.commit()
 
         logger.debug("Database tables created/verified")
@@ -2103,7 +2117,7 @@ class Database:
                 open, high, low, close, volume
             FROM market_bars
             WHERE source = ? AND symbol = ? AND bar_duration = ?
-              AND timestamp >= datetime(?, 'unixepoch', 'subsec')
+              AND timestamp >= datetime(?, 'unixepoch')
             ORDER BY timestamp ASC
             LIMIT ?
         """, (source, symbol, bar_duration, start_ms / 1000.0, limit))
@@ -2213,3 +2227,265 @@ class Database:
         row = await cursor.fetchone()
         return dict(row) if row else {}
 
+    async def get_bar_inventory(self) -> List[Dict[str, Any]]:
+        """List all distinct (source, symbol, bar_duration) keys in market_bars.
+
+        Returns rows with: source, symbol, bar_duration, count, min_ts, max_ts.
+        Used by the CLI ``list`` command so users can discover exact key strings
+        without needing a sqlite3 shell.
+        """
+        cursor = await self._connection.execute("""
+            SELECT
+                source,
+                symbol,
+                bar_duration,
+                COUNT(*) as bar_count,
+                MIN(timestamp) as min_ts,
+                MAX(timestamp) as max_ts
+            FROM market_bars
+            GROUP BY source, symbol, bar_duration
+            ORDER BY source, symbol, bar_duration
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_outcome_inventory(self) -> List[Dict[str, Any]]:
+        """List all distinct (provider, symbol, bar_duration_seconds, horizon_seconds)
+        keys in bar_outcomes with counts by status.
+
+        Returns rows with: provider, symbol, bar_duration_seconds, horizon_seconds,
+        total, ok_count, incomplete_count, gap_count, min_ts_ms, max_ts_ms.
+        """
+        cursor = await self._connection.execute("""
+            SELECT
+                provider,
+                symbol,
+                bar_duration_seconds,
+                horizon_seconds,
+                COUNT(*) as total,
+                SUM(CASE WHEN status = 'OK' THEN 1 ELSE 0 END) as ok_count,
+                SUM(CASE WHEN status = 'INCOMPLETE' THEN 1 ELSE 0 END) as incomplete_count,
+                SUM(CASE WHEN status = 'GAP' THEN 1 ELSE 0 END) as gap_count,
+                MIN(timestamp_ms) as min_ts_ms,
+                MAX(timestamp_ms) as max_ts_ms
+            FROM bar_outcomes
+            GROUP BY provider, symbol, bar_duration_seconds, horizon_seconds
+            ORDER BY provider, symbol, bar_duration_seconds, horizon_seconds
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # System Heartbeat (uptime tracking)
+    # =========================================================================
+
+    async def write_heartbeat(
+        self,
+        component: str,
+        timestamp_ms: int,
+        metadata_json: Optional[str] = None,
+    ) -> None:
+        """Write a system heartbeat (idempotent via PK)."""
+        await self._connection.execute(
+            "INSERT OR IGNORE INTO system_heartbeat "
+            "(component, timestamp_ms, metadata_json) VALUES (?, ?, ?)",
+            (component, timestamp_ms, metadata_json),
+        )
+        await self._connection.commit()
+
+    async def get_heartbeats(
+        self,
+        component: str,
+        start_ms: int,
+        end_ms: int,
+    ) -> List[int]:
+        """Return sorted list of heartbeat timestamp_ms for a component in range."""
+        cursor = await self._connection.execute(
+            "SELECT timestamp_ms FROM system_heartbeat "
+            "WHERE component = ? AND timestamp_ms >= ? AND timestamp_ms <= ? "
+            "ORDER BY timestamp_ms ASC",
+            (component, start_ms, end_ms),
+        )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    async def get_bar_timestamps(
+        self,
+        source: str,
+        symbol: str,
+        bar_duration: int,
+        start_ms: int,
+        end_ms: int,
+    ) -> List[int]:
+        """Return sorted list of bar open timestamps (as epoch ms) for gap analysis.
+
+        Converts the ISO-string ``timestamp`` column to epoch ms using
+        ``strftime`` in SQLite for efficiency (avoids pulling all rows into Python).
+        """
+        cursor = await self._connection.execute(
+            "SELECT CAST(strftime('%s', timestamp) AS INTEGER) * 1000 as ts_ms "
+            "FROM market_bars "
+            "WHERE source = ? AND symbol = ? AND bar_duration = ? "
+            "  AND timestamp >= datetime(?, 'unixepoch') "
+            "  AND timestamp <= datetime(?, 'unixepoch') "
+            "ORDER BY timestamp ASC",
+            (source, symbol, bar_duration,
+             start_ms / 1000.0, end_ms / 1000.0),
+        )
+        rows = await cursor.fetchall()
+        return [row[0] for row in rows]
+
+    async def get_heartbeat_inventory(self) -> List[Dict[str, Any]]:
+        """List distinct components in system_heartbeat with counts and ranges.
+
+        Returns rows with: component, count, min_ts_ms, max_ts_ms.
+        """
+        cursor = await self._connection.execute("""
+            SELECT
+                component,
+                COUNT(*) as count,
+                MIN(timestamp_ms) as min_ts_ms,
+                MAX(timestamp_ms) as max_ts_ms
+            FROM system_heartbeat
+            GROUP BY component
+            ORDER BY component
+        """)
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Bar backfill helpers
+    # =========================================================================
+
+    async def get_last_bar_timestamp_ms(
+        self,
+        source: str,
+        symbol: str,
+        bar_duration: int = 60,
+    ) -> Optional[int]:
+        """Return the latest bar timestamp as epoch ms, or None if no bars."""
+        cursor = await self._connection.execute(
+            "SELECT MAX(timestamp) FROM market_bars "
+            "WHERE source = ? AND symbol = ? AND bar_duration = ?",
+            (source, symbol, bar_duration),
+        )
+        row = await cursor.fetchone()
+        if row and row[0]:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                ts_str = row[0]
+                if "T" in ts_str:
+                    dt = _dt.fromisoformat(ts_str.replace("Z", "+00:00"))
+                else:
+                    dt = _dt.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                return int(dt.timestamp() * 1000)
+            except Exception:
+                return None
+        return None
+
+    async def get_first_bar_timestamp_ms(
+        self,
+        source: str,
+        symbol: str,
+        bar_duration: int = 60,
+    ) -> Optional[int]:
+        """Return the earliest bar timestamp as epoch ms, or None if no bars."""
+        cursor = await self._connection.execute(
+            "SELECT MIN(timestamp) FROM market_bars "
+            "WHERE source = ? AND symbol = ? AND bar_duration = ?",
+            (source, symbol, bar_duration),
+        )
+        row = await cursor.fetchone()
+        if row and row[0]:
+            try:
+                from datetime import datetime as _dt, timezone as _tz
+                ts_str = row[0]
+                if "T" in ts_str:
+                    dt = _dt.fromisoformat(ts_str.replace("Z", "+00:00"))
+                else:
+                    dt = _dt.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                return int(dt.timestamp() * 1000)
+            except Exception:
+                return None
+        return None
+
+    async def upsert_bars_backfill(self, rows: List[tuple]) -> int:
+        """Insert backfilled bars using INSERT OR IGNORE.
+
+        Existing bars (by unique key) are NOT overwritten.
+        This ensures live-collected bars (which have tick-level fidelity)
+        are never replaced by REST backfill bars.
+
+        Parameters
+        ----------
+        rows : list of tuple
+            Each tuple matches market_bars columns:
+            (timestamp, symbol, source, open, high, low, close, volume,
+             tick_count, n_ticks, first_source_ts, last_source_ts,
+             late_ticks_dropped, close_reason, bar_duration)
+
+        Returns
+        -------
+        int
+            Number of rows actually inserted (new bars).
+        """
+        if not rows:
+            return 0
+
+        cursor = await self._connection.execute("SELECT COUNT(*) FROM market_bars")
+        before = (await cursor.fetchone())[0]
+
+        await self._connection.executemany(
+            """INSERT OR IGNORE INTO market_bars
+               (timestamp, symbol, source, open, high, low, close, volume,
+                tick_count, n_ticks, first_source_ts, last_source_ts,
+                late_ticks_dropped, close_reason, bar_duration)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            rows,
+        )
+        await self._connection.commit()
+
+        cursor = await self._connection.execute("SELECT COUNT(*) FROM market_bars")
+        after = (await cursor.fetchone())[0]
+        return after - before
+
+    async def get_bar_health(self) -> List[Dict[str, Any]]:
+        """Return last-bar timestamps per source/symbol for health reporting.
+
+        Returns rows with: source, symbol, bar_duration, bar_count,
+        last_ts (text), last_ts_age_s (seconds since last bar, approximate).
+        """
+        cursor = await self._connection.execute("""
+            SELECT
+                source,
+                symbol,
+                bar_duration,
+                COUNT(*) as bar_count,
+                MAX(timestamp) as last_ts
+            FROM market_bars
+            GROUP BY source, symbol, bar_duration
+            ORDER BY source, symbol
+        """)
+        rows = await cursor.fetchall()
+        result = []
+        from datetime import datetime as _dt, timezone as _tz
+        now = _dt.now(_tz.utc)
+        for row in rows:
+            d = dict(row)
+            try:
+                ts_str = d["last_ts"]
+                if "T" in ts_str:
+                    dt = _dt.fromisoformat(ts_str.replace("Z", "+00:00"))
+                else:
+                    dt = _dt.strptime(ts_str, "%Y-%m-%d %H:%M:%S")
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_tz.utc)
+                d["last_ts_age_s"] = int((now - dt).total_seconds())
+            except Exception:
+                d["last_ts_age_s"] = -1
+            result.append(d)
+        return result

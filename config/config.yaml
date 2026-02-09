@@ -30,6 +30,10 @@ assets:
     - "ETH/USDT:USDT"
     - "SOL/USDT:USDT"
 
+  # Dynamic discovery: track these base assets on Bybit linear perpetuals.
+  # The discover CLI resolves actual symbols from the exchange.
+  bybit_base_coins: ["BTC", "ETH", "SOL", "DOGE", "ARB"]
+
   options:
     - "BTC"  # Deribit BTC options
 
@@ -43,6 +47,13 @@ exchanges:
     rate_limit: 10  # requests per second
     reconnect_delay: 5  # initial delay, will use exponential backoff
     max_reconnect_delay: 300  # max 5 minutes between reconnects
+
+    # REST backfill settings
+    backfill:
+      enabled: true
+      rate_limit_rps: 8           # conservative REST rate limit
+      max_bars_per_run: 50000     # safety cap per CLI invocation
+      chunk_size: 200             # Bybit kline API max per request
 
   deribit:
     enabled: true
@@ -193,6 +204,24 @@ polymarket:
   max_watchlist: 50                       # max tokens to track
   min_volume: 10000                       # minimum USD volume to qualify
   keywords: []                            # keyword filter (empty = no filter)
+
+# -----------------------------------------------------------------------------
+# Outcome Engine (Phase 4A.1 — bar-level forward returns)
+# -----------------------------------------------------------------------------
+outcomes:
+  enabled: true
+  outcome_version: "BAR_OUTCOMES_V1"
+  bar_durations_seconds: [60, 300, 900, 3600, 14400, 86400]
+  horizons_seconds_by_bar:
+    60:    [300, 900, 3600, 14400, 86400]
+    300:   [900, 3600, 14400, 86400]
+    900:   [3600, 14400, 86400]
+    3600:  [14400, 86400]
+    14400: [86400]
+    86400: [604800]
+  gap_tolerance_bars: 1
+  lookback_bars_per_symbol: 5000
+  quantize_decimals: 10
 
 # -----------------------------------------------------------------------------
 # Soak Test Hardening
