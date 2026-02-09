@@ -207,3 +207,7 @@ class TastytradeRestClient:
             self._retry.backoff_multiplier ** attempt
         )
         time.sleep(delay)
+
+
+class TastytradeClient(TastytradeRestClient):
+    """Backward-compatible alias for TastytradeRestClient."""
