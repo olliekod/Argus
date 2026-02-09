@@ -83,6 +83,17 @@ exchanges:
     symbols: ["IBIT", "BITO", "SPY", "QQQ", "NVDA"]
 
 # -----------------------------------------------------------------------------
+# Tastytrade Configuration
+# -----------------------------------------------------------------------------
+tastytrade:
+  environment: "live"   # live | sandbox
+  timeout_seconds: 20
+  retries:
+    max_attempts: 3
+    backoff_seconds: 1.0
+    backoff_multiplier: 2.0
+
+# -----------------------------------------------------------------------------
 # Alert Configuration
 # -----------------------------------------------------------------------------
 alerts:

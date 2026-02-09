@@ -49,6 +49,10 @@ def load_secrets(secrets_path: str = "config/secrets.yaml") -> Dict[str, Any]:
     Returns:
         Secrets dictionary
     """
+    override_path = os.getenv("ARGUS_SECRETS")
+    if override_path:
+        secrets_path = override_path
+
     path = Path(secrets_path)
     if not path.exists():
         raise ConfigurationError(
