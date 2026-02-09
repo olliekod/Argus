@@ -98,7 +98,7 @@ def test_list_nested_option_chains_url_and_params():
     )
     client.login()
     client.list_nested_option_chains("IBIT", include_weeklies="true")
-    assert session.calls[-1]["url"].endswith("/instruments/nested-option-chains/IBIT")
+    assert session.calls[-1]["url"].endswith("/option-chains/IBIT/nested")
     assert session.calls[-1]["params"] == {"include_weeklies": "true"}
 
 
