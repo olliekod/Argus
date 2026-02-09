@@ -27,40 +27,16 @@ def _is_placeholder(value: str) -> bool:
     return not value or value.startswith("PASTE_") or value.startswith("YOUR_")
 
 
-def _extract_underlying_price(payload: dict[str, Any]) -> float | None:
-    data = payload.get("data", payload)
-    if not isinstance(data, dict):
-        return None
-    for key in (
-        "underlying-price",
-        "underlying-price-value",
-        "underlying-mark",
-        "underlying_price",
-    ):
-        value = data.get(key)
-        if value is None:
-            continue
-        try:
-            return float(value)
-        except (TypeError, ValueError):
-            continue
-    return None
-
-
-def _sample_contracts(contracts: list[dict[str, Any]], underlying_price: float | None) -> list[dict[str, Any]]:
-    if not contracts:
-        return []
-    if underlying_price is None:
-        return contracts[:10]
-
-    def distance(contract: dict[str, Any]) -> float:
-        strike = contract.get("strike")
-        if strike is None:
-            return float("inf")
-        return abs(strike - underlying_price)
-
-    ranked = sorted(contracts, key=distance)
-    return ranked[:10]
+def _sample_symbols(contracts: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    call_symbol = next(
+        (contract.get("option_symbol") for contract in contracts if contract.get("right") == "C"),
+        None,
+    )
+    put_symbol = next(
+        (contract.get("option_symbol") for contract in contracts if contract.get("right") == "P"),
+        None,
+    )
+    return call_symbol, put_symbol
 
 
 def main() -> int:
@@ -110,34 +86,14 @@ def main() -> int:
     normalized = normalize_tastytrade_nested_chain(chain)
     expirations = sorted({item["expiry"] for item in normalized if item.get("expiry")})
     strikes = {item["strike"] for item in normalized if item.get("strike") is not None}
-    calls = sum(1 for item in normalized if item.get("right") == "C")
-    puts = sum(1 for item in normalized if item.get("right") == "P")
 
     print(f"Underlying: {args.underlying}")
     print(f"Expirations count: {len(expirations)}")
     print(f"Strikes count: {len(strikes)}")
-    print(f"Contracts count: {len(normalized)} (calls={calls}, puts={puts})")
 
-    if expirations:
-        print(f"First expiry: {expirations[0]}")
-        print(f"Last expiry: {expirations[-1]}")
-    else:
-        print("First expiry: n/a")
-        print("Last expiry: n/a")
-
-    underlying_price = _extract_underlying_price(chain)
-    if underlying_price is not None:
-        print(f"Underlying price: {underlying_price:.2f}")
-
-    samples = _sample_contracts(normalized, underlying_price)
-    print("Sample contracts:")
-    for contract in samples:
-        symbol = contract.get("option_symbol") or "?"
-        expiry = contract.get("expiry") or "?"
-        right = contract.get("right") or "?"
-        strike = contract.get("strike")
-        strike_display = f"{strike:.2f}" if strike is not None else "?"
-        print(f"  {symbol} {expiry} {right}{strike_display}")
+    call_symbol, put_symbol = _sample_symbols(normalized)
+    print(f"Sample call symbol: {call_symbol or 'n/a'}")
+    print(f"Sample put symbol: {put_symbol or 'n/a'}")
 
     client.close()
     return 0
