@@ -47,50 +47,79 @@ def _int_or_default(value: Any, default: int) -> int:
 
 def normalize_tastytrade_nested_chain(raw: Dict[str, Any]) -> list[Dict[str, Any]]:
     """Normalize tastytrade nested option chain response into a flat list."""
-    if not raw:
+    if not raw or not isinstance(raw, dict):
         return []
 
-    data = raw.get("data", raw)
-    if not isinstance(data, dict):
+    chains: list[Dict[str, Any]] = []
+    data = raw.get("data")
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        chains = data.get("items", [])
+    elif isinstance(data, dict) and isinstance(data.get("expirations"), list):
+        chains = [data]
+    elif isinstance(raw.get("expirations"), list):
+        chains = [raw]
+    else:
         return []
-
-    underlying = _first_present(
-        [
-            data.get("underlying-symbol"),
-            data.get("symbol"),
-            data.get("underlying"),
-        ]
-    )
-
-    expirations = (
-        data.get("expirations")
-        or data.get("items")
-        or data.get("option-chains")
-        or []
-    )
 
     normalized: list[Dict[str, Any]] = []
 
-    for expiration in expirations:
-        expiry_raw = _first_present(
+    for chain in chains:
+        if not isinstance(chain, dict):
+            continue
+
+        underlying = _first_present(
             [
-                expiration.get("expiration-date"),
-                expiration.get("expiration"),
-                expiration.get("expiration-date-time"),
-                expiration.get("date"),
+                chain.get("underlying-symbol"),
+                chain.get("underlying_symbol"),
+                chain.get("root-symbol"),
+                chain.get("root_symbol"),
+                chain.get("symbol"),
+                chain.get("underlying"),
             ]
         )
-        expiry = _parse_expiry(expiry_raw)
-
-        strikes = (
-            expiration.get("strikes")
-            or expiration.get("strike-prices")
-            or expiration.get("strike-price-list")
-            or []
+        chain_type = _first_present(
+            [
+                chain.get("option-chain-type"),
+                chain.get("option_chain_type"),
+                chain.get("chain-type"),
+            ]
+        )
+        shares_per_contract = _int_or_default(
+            _first_present(
+                [
+                    chain.get("shares-per-contract"),
+                    chain.get("shares_per_contract"),
+                ]
+            ),
+            100,
         )
 
-        for strike in strikes:
-            if isinstance(strike, dict):
+        expirations = chain.get("expirations") or []
+        for expiration in expirations:
+            if not isinstance(expiration, dict):
+                continue
+
+            expiry_raw = _first_present(
+                [
+                    expiration.get("expiration-date"),
+                    expiration.get("expiration"),
+                    expiration.get("expiration-date-time"),
+                    expiration.get("date"),
+                ]
+            )
+            expiry = _parse_expiry(expiry_raw)
+
+            strikes = (
+                expiration.get("strikes")
+                or expiration.get("strike-prices")
+                or expiration.get("strike-price-list")
+                or []
+            )
+
+            for strike in strikes:
+                if not isinstance(strike, dict):
+                    continue
+
                 strike_price = _first_present(
                     [
                         strike.get("strike-price"),
@@ -99,100 +128,60 @@ def normalize_tastytrade_nested_chain(raw: Dict[str, Any]) -> list[Dict[str, Any
                         strike.get("strike_price"),
                     ]
                 )
-            else:
-                strike_price = strike
+                strike_value = _float_or_none(strike_price)
 
-            strike_value = _float_or_none(strike_price)
+                for right_label, option_key, streamer_key in (
+                    ("C", "call", "call-streamer-symbol"),
+                    ("P", "put", "put-streamer-symbol"),
+                ):
+                    option_value = strike.get(option_key)
+                    if not option_value:
+                        continue
 
-            for right_label, option_key in (("C", "call"), ("P", "put")):
-                option_data = strike.get(option_key) if isinstance(strike, dict) else None
-                if not option_data:
-                    continue
+                    option_symbol = option_value
+                    option_streamer = strike.get(streamer_key) or strike.get(
+                        streamer_key.replace("-", "_")
+                    )
 
-                option_symbol = _first_present(
-                    [
-                        option_data.get("streamer-symbol"),
-                        option_data.get("symbol"),
-                        option_data.get("occ-symbol"),
-                    ]
-                )
-                multiplier = _int_or_default(
-                    _first_present(
-                        [
-                            option_data.get("multiplier"),
-                            option_data.get("contract-size"),
-                        ]
-                    ),
-                    100,
-                )
+                    if isinstance(option_value, dict):
+                        option_symbol = _first_present(
+                            [
+                                option_value.get("streamer-symbol"),
+                                option_value.get("symbol"),
+                                option_value.get("occ-symbol"),
+                            ]
+                        )
+                        option_streamer = option_streamer or option_value.get(
+                            "streamer-symbol"
+                        )
 
-                currency = _first_present(
-                    [
-                        option_data.get("currency"),
-                        expiration.get("currency"),
-                        data.get("currency"),
-                    ]
-                ) or "USD"
-
-                exchange = _first_present(
-                    [
-                        option_data.get("exchange"),
-                        option_data.get("listing-exchange"),
-                        expiration.get("exchange"),
-                    ]
-                )
-
-                meta = {
-                    "root": _first_present(
-                        [
-                            option_data.get("root-symbol"),
-                            option_data.get("root"),
-                            data.get("root-symbol"),
-                        ]
-                    ),
-                    "product_type": _first_present(
-                        [
-                            option_data.get("product-type"),
-                            expiration.get("product-type"),
-                            data.get("product-type"),
-                        ]
-                    ),
-                    "settlement_type": _first_present(
-                        [
-                            option_data.get("settlement-type"),
-                            expiration.get("settlement-type"),
-                        ]
-                    ),
-                    "expiration_type": _first_present(
-                        [
-                            option_data.get("expiration-type"),
-                            expiration.get("expiration-type"),
-                        ]
-                    ),
-                }
-
-                meta = {key: value for key, value in meta.items() if value is not None}
-
-                normalized.append(
-                    {
-                        "provider": "tastytrade",
-                        "underlying": underlying,
-                        "option_symbol": option_symbol,
-                        "expiry": expiry,
-                        "right": right_label,
-                        "strike": strike_value,
-                        "multiplier": multiplier,
-                        "currency": currency,
-                        "exchange": exchange,
-                        "meta": meta,
+                    meta = {
+                        "streamer_symbol": option_streamer,
+                        "chain_type": chain_type,
                     }
-                )
+                    meta = {key: value for key, value in meta.items() if value is not None}
+
+                    normalized.append(
+                        {
+                            "provider": "tastytrade",
+                            "underlying": underlying,
+                            "option_symbol": option_symbol,
+                            "expiry": expiry,
+                            "right": right_label,
+                            "strike": strike_value,
+                            "multiplier": shares_per_contract,
+                            "currency": "USD",
+                            "exchange": None,
+                            "meta": meta,
+                        }
+                    )
 
     normalized.sort(
         key=lambda item: (
             item.get("expiry") or "",
             item.get("strike") if item.get("strike") is not None else -1.0,
             item.get("right") or "",
+            item.get("option_symbol") or "",
         )
     )
     return normalized

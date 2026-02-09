@@ -28,12 +28,23 @@ def _is_placeholder(value: str) -> bool:
 
 
 def _sample_symbols(contracts: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    def _valid(symbol: str | None) -> bool:
+        return bool(symbol) and str(symbol).lower() != "n/a"
+
     call_symbol = next(
-        (contract.get("option_symbol") for contract in contracts if contract.get("right") == "C"),
+        (
+            contract.get("option_symbol")
+            for contract in contracts
+            if contract.get("right") == "C" and _valid(contract.get("option_symbol"))
+        ),
         None,
     )
     put_symbol = next(
-        (contract.get("option_symbol") for contract in contracts if contract.get("right") == "P"),
+        (
+            contract.get("option_symbol")
+            for contract in contracts
+            if contract.get("right") == "P" and _valid(contract.get("option_symbol"))
+        ),
         None,
     )
     return call_symbol, put_symbol

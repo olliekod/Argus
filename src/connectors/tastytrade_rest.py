@@ -55,23 +55,47 @@ def parse_rfc3339_nano(timestamp: str) -> datetime:
 
 
 def _attach_nested_chain_timestamps(payload: Dict[str, Any]) -> None:
-    expirations = (
-        payload.get("expirations")
-        or payload.get("items")
-        or payload.get("option-chains")
-        or []
-    )
-    for expiration in expirations:
-        expiry_raw = (
-            expiration.get("expiration-date")
-            or expiration.get("expiration-date-time")
-            or expiration.get("expiration")
-        )
-        if isinstance(expiry_raw, str) and ("T" in expiry_raw or "Z" in expiry_raw or "+" in expiry_raw):
-            try:
-                expiration["expiration-datetime"] = parse_rfc3339_nano(expiry_raw)
-            except ValueError:
+    if not isinstance(payload, dict):
+        return
+
+    chains: list[Dict[str, Any]] = []
+    data = payload.get("data")
+    if isinstance(data, dict) and isinstance(data.get("items"), list):
+        chains = data.get("items", [])
+    elif isinstance(data, dict) and isinstance(data.get("expirations"), list):
+        chains = [data]
+    elif isinstance(payload.get("items"), list):
+        chains = payload.get("items", [])
+    elif isinstance(payload.get("expirations"), list):
+        chains = [payload]
+
+    for chain in chains:
+        if not isinstance(chain, dict):
+            continue
+        expirations = chain.get("expirations") or []
+        for expiration in expirations:
+            if not isinstance(expiration, dict):
                 continue
+            expiry_raw = (
+                expiration.get("expiration-date")
+                or expiration.get("expiration-date-time")
+                or expiration.get("expiration")
+            )
+            if not isinstance(expiry_raw, str):
+                continue
+            if "T" in expiry_raw or "Z" in expiry_raw or "+" in expiry_raw:
+                try:
+                    expiration["expiration-datetime"] = parse_rfc3339_nano(expiry_raw)
+                except ValueError:
+                    continue
+            else:
+                try:
+                    parsed = datetime.fromisoformat(expiry_raw)
+                except ValueError:
+                    continue
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                expiration["expiration-datetime"] = parsed.astimezone(timezone.utc)
 
 
 class TastytradeRestClient:
