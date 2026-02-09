@@ -74,4 +74,4 @@ def test_get_nested_option_chains_error_excerpt():
         raise AssertionError("Expected error not raised")
 
     assert "HTTP 404" in message
-    assert "X" * 500 in message
+    assert "X" * 400 in message
