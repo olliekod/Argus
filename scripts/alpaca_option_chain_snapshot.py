@@ -5,15 +5,19 @@ Options Data Quality Probe for Alpaca.
 How to run:
   python scripts/alpaca_option_chain_snapshot.py --underlying IBIT --limit 200
   python scripts/alpaca_option_chain_snapshot.py --underlying BITO --limit 200 --batch-size 50
+  python scripts/alpaca_option_chain_snapshot.py --underlying IBIT --limit 200 --json-out reports/ibit.json
+  python scripts/alpaca_option_chain_snapshot.py --underlying IBIT --sqlite-path reports/options_quality.sqlite
 """
 from __future__ import annotations
 
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 import argparse
 import json
 import os
+import sqlite3
 import time
 from typing import Iterable
 
@@ -31,6 +35,13 @@ class AuditThresholds:
 
 
 @dataclass
+class TradableConfig:
+    max_quote_age_s: float
+    max_spread_bps: float
+    max_moneyness: float
+
+
+@dataclass
 class QuoteMetrics:
     quote_age_seconds: float | None
     trade_age_seconds: float | None
@@ -39,6 +50,14 @@ class QuoteMetrics:
     bid_zero: bool
     ask_zero: bool
     missing_latest_quote: bool
+
+
+@dataclass
+class TradableCandidateResult:
+    qualifies: bool
+    quote_age_seconds: float | None
+    spread_bps: float | None
+    moneyness: float | None
 
 
 def parse_rfc3339_to_datetime(ts_str: str) -> datetime:
@@ -326,41 +345,71 @@ def build_metrics_for_snapshot(snapshot: dict, now: datetime) -> QuoteMetrics:
     )
 
 
-def audit_options_data(
-    underlying: str,
-    contracts: list[dict],
-    data_key: str,
-    data_secret: str,
-    limit: int,
-    batch_size: int,
+def is_tradable_candidate(
+    contract: dict,
+    snapshot: dict | None,
+    underlying_px: float | None,
+    now_utc: datetime,
+    cfg: TradableConfig,
+) -> TradableCandidateResult:
+    if contract.get("status") != "active" or contract.get("tradable") is not True:
+        return TradableCandidateResult(False, None, None, None)
+    if snapshot is None:
+        return TradableCandidateResult(False, None, None, None)
+
+    latest_quote = snapshot.get("latestQuote") or snapshot.get("latest_quote")
+    if not latest_quote or not latest_quote.get("t"):
+        return TradableCandidateResult(False, None, None, None)
+
+    bid = latest_quote.get("bp")
+    ask = latest_quote.get("ap")
+    if bid is None or ask is None or bid <= 0 or ask <= 0:
+        return TradableCandidateResult(False, None, None, None)
+
+    spread_bps = compute_spread_bps(bid, ask)
+    quote_age = quote_age_seconds(latest_quote["t"], now_utc)
+
+    if spread_bps is None or quote_age is None:
+        return TradableCandidateResult(False, quote_age, spread_bps, None)
+
+    if quote_age > cfg.max_quote_age_s:
+        return TradableCandidateResult(False, quote_age, spread_bps, None)
+
+    if spread_bps > cfg.max_spread_bps:
+        return TradableCandidateResult(False, quote_age, spread_bps, None)
+
+    moneyness = None
+    if underlying_px is not None:
+        strike = contract.get("strike_price")
+        if strike is not None and underlying_px > 0:
+            moneyness = abs(float(strike) / underlying_px - 1)
+            if moneyness > cfg.max_moneyness:
+                return TradableCandidateResult(False, quote_age, spread_bps, moneyness)
+
+    return TradableCandidateResult(True, quote_age, spread_bps, moneyness)
+
+
+def percentile_report(values: list[float]) -> dict[str, float | None]:
+    pcts = {"p50": 50, "p90": 90, "p95": 95, "p99": 99}
+    report = {k: percentile(values, v) for k, v in pcts.items()}
+    report["max"] = max(values) if values else None
+    return report
+
+
+def print_percentiles(label: str, report: dict[str, float | None]) -> None:
+    print(f"\n{label} percentiles:")
+    for key in ["p50", "p90", "p95", "p99", "max"]:
+        val = report.get(key)
+        display = f"{val:.4f}" if isinstance(val, (float, int)) else "n/a"
+        print(f"  {key}: {display}")
+
+
+def build_universe_report(
+    symbols: list[str],
+    snapshots: dict[str, dict],
+    now: datetime,
     spread_bps_buckets: list[float],
-    thresholds: AuditThresholds,
-) -> None:
-    print("\n[Audit] Starting options data quality probe...")
-    underlying_price = fetch_underlying_last_price(underlying, data_key, data_secret)
-    if underlying_price is not None:
-        print(f"Underlying last price: {underlying_price}")
-    else:
-        print("Underlying last price unavailable; using first N contracts.")
-
-    selected_contracts = select_contracts(contracts, limit, underlying_price)
-    symbols = [c["symbol"] for c in selected_contracts]
-
-    print(f"Selected contracts: {len(symbols)} (limit={limit})")
-
-    snapshots: dict[str, dict] = {}
-    for idx, batch in enumerate(chunked(symbols, batch_size), start=1):
-        payload = fetch_option_snapshots_by_symbols(
-            batch,
-            data_key,
-            data_secret,
-            log_rate_limit_once=(idx == 1),
-        )
-        batch_snaps = payload.get("snapshots") if isinstance(payload, dict) else None
-        if isinstance(batch_snaps, dict):
-            snapshots.update(batch_snaps)
-
-    now = datetime.now(timezone.utc)
+) -> dict:
     quote_ages: list[float] = []
     spread_bps_values: list[float] = []
     worst_spreads: list[tuple[str, float]] = []
@@ -395,63 +444,229 @@ def audit_options_data(
     worst_spreads.sort(key=lambda x: x[1], reverse=True)
     worst_quotes.sort(key=lambda x: x[1], reverse=True)
 
-    def percentile_report(values: list[float], label: str) -> dict[str, float | None]:
-        pcts = {"p50": 50, "p90": 90, "p95": 95, "p99": 99}
-        report = {k: percentile(values, v) for k, v in pcts.items()}
-        report["max"] = max(values) if values else None
-        print(f"\n{label} percentiles:")
-        for k in ["p50", "p90", "p95", "p99", "max"]:
-            val = report[k]
-            display = f"{val:.4f}" if isinstance(val, (float, int)) else "n/a"
-            print(f"  {k}: {display}")
-        return report
+    quote_report = percentile_report(quote_ages)
+    spread_report = percentile_report(spread_bps_values)
 
-    quote_report = percentile_report(quote_ages, "Quote age (seconds)")
-    spread_report = percentile_report(spread_bps_values, "Spread (bps)")
-
-    print("\nCounts:")
-    print(f"  Total contracts sampled: {len(symbols)}")
-    print(f"  Snapshots returned: {len(snapshots)}")
-    print(f"  Missing snapshots: {missing_snapshots}")
-    print(f"  Missing latestQuote: {missing_quotes}")
-    print(f"  bid==0 count: {bid_zero_count}")
-    print(f"  ask==0 count: {ask_zero_count}")
-
-    print("\nLiquidity sanity (% of contracts with spread_bps <= threshold):")
+    bucket_pcts = {}
     for bucket in spread_bps_buckets:
         if spread_bps_values:
             pct = sum(1 for v in spread_bps_values if v <= bucket) / len(spread_bps_values) * 100
-            print(f"  <= {bucket:.0f} bps: {pct:.2f}%")
+            bucket_pcts[bucket] = pct
         else:
+            bucket_pcts[bucket] = None
+
+    return {
+        "counts": {
+            "total_contracts_sampled": len(symbols),
+            "snapshots_returned": len(snapshots),
+            "missing_snapshots": missing_snapshots,
+            "missing_latest_quote": missing_quotes,
+            "bid_zero_count": bid_zero_count,
+            "ask_zero_count": ask_zero_count,
+        },
+        "quote_age_percentiles": quote_report,
+        "spread_bps_percentiles": spread_report,
+        "liquidity_buckets": bucket_pcts,
+        "worst_spread_bps": worst_spreads[:10],
+        "worst_quote_age_seconds": worst_quotes[:10],
+    }
+
+
+def build_tradable_report(
+    symbols: list[str],
+    snapshots: dict[str, dict],
+    contracts_by_symbol: dict[str, dict],
+    underlying_px: float | None,
+    now: datetime,
+    spread_bps_buckets: list[float],
+    tradable_cfg: TradableConfig,
+) -> dict:
+    qualifying_symbols: list[str] = []
+    quote_ages: list[float] = []
+    spread_bps_values: list[float] = []
+    worst_spreads: list[tuple[str, float]] = []
+    worst_quotes: list[tuple[str, float]] = []
+    expiration_counts: Counter[str] = Counter()
+
+    for symbol in symbols:
+        contract = contracts_by_symbol.get(symbol)
+        snapshot = snapshots.get(symbol)
+        if contract is None:
+            continue
+        candidate = is_tradable_candidate(contract, snapshot, underlying_px, now, tradable_cfg)
+        if not candidate.qualifies:
+            continue
+        qualifying_symbols.append(symbol)
+        if candidate.quote_age_seconds is not None:
+            quote_ages.append(candidate.quote_age_seconds)
+            worst_quotes.append((symbol, candidate.quote_age_seconds))
+        if candidate.spread_bps is not None:
+            spread_bps_values.append(candidate.spread_bps)
+            worst_spreads.append((symbol, candidate.spread_bps))
+        expiration = contract.get("expiration_date")
+        if expiration:
+            expiration_counts[expiration] += 1
+
+    worst_spreads.sort(key=lambda x: x[1], reverse=True)
+    worst_quotes.sort(key=lambda x: x[1], reverse=True)
+
+    quote_report = percentile_report(quote_ages)
+    spread_report = percentile_report(spread_bps_values)
+
+    bucket_pcts = {}
+    for bucket in spread_bps_buckets:
+        if spread_bps_values:
+            pct = sum(1 for v in spread_bps_values if v <= bucket) / len(spread_bps_values) * 100
+            bucket_pcts[bucket] = pct
+        else:
+            bucket_pcts[bucket] = None
+
+    top_expirations = expiration_counts.most_common(10)
+
+    total = len(symbols)
+    qualifying_count = len(qualifying_symbols)
+    pct_qualifying = (qualifying_count / total * 100) if total else 0
+
+    return {
+        "counts": {
+            "total_contracts_sampled": total,
+            "qualifying_contracts": qualifying_count,
+            "qualifying_percent": pct_qualifying,
+        },
+        "quote_age_percentiles": quote_report,
+        "spread_bps_percentiles": spread_report,
+        "liquidity_buckets": bucket_pcts,
+        "worst_spread_bps": worst_spreads[:10],
+        "worst_quote_age_seconds": worst_quotes[:10],
+        "top_expirations": top_expirations,
+        "qualifying_symbols": qualifying_symbols,
+    }
+
+
+def evaluate_tradable_pass_fail(
+    tradable_report: dict,
+    thresholds: AuditThresholds,
+    min_tradable_count: int,
+) -> tuple[bool, list[str]]:
+    reasons: list[str] = []
+    counts = tradable_report.get("counts", {})
+    qualifying_count = counts.get("qualifying_contracts", 0)
+    if qualifying_count < min_tradable_count:
+        reasons.append(
+            f"TRADABLE count {qualifying_count} < min_tradable_count {min_tradable_count}"
+        )
+
+    quote_report = tradable_report.get("quote_age_percentiles", {})
+    spread_report = tradable_report.get("spread_bps_percentiles", {})
+    p99_quote = quote_report.get("p99")
+    p95_spread = spread_report.get("p95")
+
+    if p99_quote is None:
+        reasons.append("TRADABLE p99 quote age unavailable")
+    elif p99_quote > thresholds.quote_age_p99:
+        reasons.append(
+            f"TRADABLE p99 quote age {p99_quote:.3f}s > {thresholds.quote_age_p99:.3f}s"
+        )
+
+    if p95_spread is None:
+        reasons.append("TRADABLE p95 spread bps unavailable")
+    elif p95_spread > thresholds.spread_bps_p95:
+        reasons.append(
+            f"TRADABLE p95 spread {p95_spread:.2f} bps > {thresholds.spread_bps_p95:.2f} bps"
+        )
+
+    return (len(reasons) == 0, reasons)
+
+
+def print_universe_report(report: dict) -> None:
+    print("\n[UNIVERSE]")
+    print_percentiles("Quote age (seconds)", report["quote_age_percentiles"])
+    print_percentiles("Spread (bps)", report["spread_bps_percentiles"])
+
+    counts = report["counts"]
+    print("\nCounts:")
+    print(f"  Total contracts sampled: {counts['total_contracts_sampled']}")
+    print(f"  Snapshots returned: {counts['snapshots_returned']}")
+    print(f"  Missing snapshots: {counts['missing_snapshots']}")
+    print(f"  Missing latestQuote: {counts['missing_latest_quote']}")
+    print(f"  bid==0 count: {counts['bid_zero_count']}")
+    print(f"  ask==0 count: {counts['ask_zero_count']}")
+
+    print("\nLiquidity sanity (% of contracts with spread_bps <= threshold):")
+    for bucket, pct in report["liquidity_buckets"].items():
+        if pct is None:
             print(f"  <= {bucket:.0f} bps: n/a")
+        else:
+            print(f"  <= {bucket:.0f} bps: {pct:.2f}%")
 
     print("\nWorst 10 by spread_bps:")
-    for symbol, value in worst_spreads[:10]:
+    for symbol, value in report["worst_spread_bps"]:
         print(f"  {symbol}: {value:.2f} bps")
 
     print("\nWorst 10 by quote_age_seconds:")
-    for symbol, value in worst_quotes[:10]:
+    for symbol, value in report["worst_quote_age_seconds"]:
         print(f"  {symbol}: {value:.3f} s")
 
-    reasons: list[str] = []
-    p99_quote = quote_report["p99"]
-    p95_spread = spread_report["p95"]
-    if p99_quote is None:
-        reasons.append("p99 quote age unavailable")
-    elif p99_quote > thresholds.quote_age_p99:
-        reasons.append(f"p99 quote age {p99_quote:.3f}s > {thresholds.quote_age_p99:.3f}s")
 
-    if p95_spread is None:
-        reasons.append("p95 spread bps unavailable")
-    elif p95_spread > thresholds.spread_bps_p95:
-        reasons.append(f"p95 spread {p95_spread:.2f} bps > {thresholds.spread_bps_p95:.2f} bps")
+def print_tradable_report(report: dict) -> None:
+    print("\n[TRADABLE SUBSET]")
+    print_percentiles("Quote age (seconds)", report["quote_age_percentiles"])
+    print_percentiles("Spread (bps)", report["spread_bps_percentiles"])
 
-    if reasons:
-        print("\nConclusion: FAIL")
-        for reason in reasons:
-            print(f"  - {reason}")
+    counts = report["counts"]
+    print("\nCounts:")
+    print(f"  Qualifying contracts: {counts['qualifying_contracts']}")
+    print(f"  % Qualifying: {counts['qualifying_percent']:.2f}%")
+
+    print("\nLiquidity sanity (% of tradable contracts with spread_bps <= threshold):")
+    for bucket, pct in report["liquidity_buckets"].items():
+        if pct is None:
+            print(f"  <= {bucket:.0f} bps: n/a")
+        else:
+            print(f"  <= {bucket:.0f} bps: {pct:.2f}%")
+
+    print("\nTop expirations by count:")
+    if report["top_expirations"]:
+        for expiration, count in report["top_expirations"]:
+            print(f"  {expiration}: {count}")
     else:
-        print("\nConclusion: PASS")
+        print("  n/a")
+
+    print("\nWorst 10 by spread_bps (tradable subset):")
+    for symbol, value in report["worst_spread_bps"]:
+        print(f"  {symbol}: {value:.2f} bps")
+
+    print("\nWorst 10 by quote_age_seconds (tradable subset):")
+    for symbol, value in report["worst_quote_age_seconds"]:
+        print(f"  {symbol}: {value:.3f} s")
+
+
+def write_json_report(report_path: Path, payload: dict) -> None:
+    report_path.parent.mkdir(parents=True, exist_ok=True)
+    report_path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+
+
+def write_sqlite_report(sqlite_path: Path, payload: dict, underlying: str, created_at: str) -> None:
+    sqlite_path.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(sqlite_path) as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS options_data_quality_reports (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_at_utc TEXT NOT NULL,
+                underlying TEXT NOT NULL,
+                report_json TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO options_data_quality_reports (created_at_utc, underlying, report_json)
+            VALUES (?, ?, ?)
+            """,
+            (created_at, underlying, json.dumps(payload)),
+        )
+        conn.commit()
 
 
 def parse_spread_bps_buckets(raw: str) -> list[float]:
@@ -459,6 +674,103 @@ def parse_spread_bps_buckets(raw: str) -> list[float]:
         return [float(item.strip()) for item in raw.split(",") if item.strip()]
     except ValueError as exc:
         raise argparse.ArgumentTypeError(f"Invalid spread bucket list: {raw}") from exc
+
+
+def audit_options_data(
+    underlying: str,
+    contracts: list[dict],
+    data_key: str,
+    data_secret: str,
+    limit: int,
+    batch_size: int,
+    spread_bps_buckets: list[float],
+    thresholds: AuditThresholds,
+    tradable_cfg: TradableConfig,
+    min_tradable_count: int,
+    json_out: Path | None,
+    json_max_symbols: int,
+    sqlite_path: Path | None,
+) -> None:
+    print("\n[Audit] Starting options data quality probe...")
+    underlying_price = fetch_underlying_last_price(underlying, data_key, data_secret)
+    if underlying_price is not None:
+        print(f"Underlying last price: {underlying_price}")
+    else:
+        print("Underlying last price unavailable; using first N contracts.")
+
+    selected_contracts = select_contracts(contracts, limit, underlying_price)
+    symbols = [c["symbol"] for c in selected_contracts]
+    contracts_by_symbol = {c["symbol"]: c for c in selected_contracts}
+
+    print(f"Selected contracts: {len(symbols)} (limit={limit})")
+
+    snapshots: dict[str, dict] = {}
+    for idx, batch in enumerate(chunked(symbols, batch_size), start=1):
+        payload = fetch_option_snapshots_by_symbols(
+            batch,
+            data_key,
+            data_secret,
+            log_rate_limit_once=(idx == 1),
+        )
+        batch_snaps = payload.get("snapshots") if isinstance(payload, dict) else None
+        if isinstance(batch_snaps, dict):
+            snapshots.update(batch_snaps)
+
+    now = datetime.now(timezone.utc)
+    universe_report = build_universe_report(symbols, snapshots, now, spread_bps_buckets)
+    tradable_report = build_tradable_report(
+        symbols,
+        snapshots,
+        contracts_by_symbol,
+        underlying_price,
+        now,
+        spread_bps_buckets,
+        tradable_cfg,
+    )
+
+    print_universe_report(universe_report)
+    print_tradable_report(tradable_report)
+
+    passed, reasons = evaluate_tradable_pass_fail(tradable_report, thresholds, min_tradable_count)
+    if passed:
+        print("\nConclusion (TRADABLE): PASS")
+    else:
+        print("\nConclusion (TRADABLE): FAIL")
+        for reason in reasons:
+            print(f"  - {reason}")
+
+    created_at = now.isoformat()
+    qualifying_symbols = tradable_report["qualifying_symbols"]
+    limited_symbols = qualifying_symbols[:json_max_symbols]
+
+    report_payload = {
+        "generated_at_utc": created_at,
+        "underlying": underlying,
+        "thresholds": {
+            "quote_age_p99": thresholds.quote_age_p99,
+            "spread_bps_p95": thresholds.spread_bps_p95,
+            "min_tradable_count": min_tradable_count,
+            "tradable_max_quote_age_s": tradable_cfg.max_quote_age_s,
+            "tradable_max_spread_bps": tradable_cfg.max_spread_bps,
+            "tradable_max_moneyness": tradable_cfg.max_moneyness,
+        },
+        "universe": universe_report,
+        "tradable": {
+            **tradable_report,
+            "qualifying_symbols": limited_symbols,
+            "qualifying_symbols_truncated": len(qualifying_symbols) > json_max_symbols,
+        },
+        "pass": passed,
+        "fail_reasons": reasons,
+    }
+
+    if json_out:
+        write_json_report(json_out, report_payload)
+        print(f"\nWrote JSON report to {json_out}")
+
+    if sqlite_path:
+        write_sqlite_report(sqlite_path, report_payload, underlying, created_at)
+        print(f"\nWrote SQLite report to {sqlite_path}")
 
 
 def main() -> None:
@@ -474,6 +786,13 @@ def main() -> None:
         type=parse_spread_bps_buckets,
         default=[25.0, 50.0, 100.0],
     )
+    parser.add_argument("--tradable-max-quote-age-s", type=float, default=5.0)
+    parser.add_argument("--tradable-max-spread-bps", type=float, default=300.0)
+    parser.add_argument("--tradable-max-moneyness", type=float, default=0.10)
+    parser.add_argument("--min-tradable-count", type=int, default=30)
+    parser.add_argument("--json-out", type=Path)
+    parser.add_argument("--json-max-symbols", type=int, default=500)
+    parser.add_argument("--sqlite-path", type=Path)
     args = parser.parse_args()
 
     secrets_path = find_secrets_file()
@@ -506,12 +825,19 @@ def main() -> None:
         raise RuntimeError("No option contracts returned; check API access and underlying symbol.")
 
     example_symbols = [c["symbol"] for c in contracts[:5]]
-    example_payload = fetch_option_snapshots_by_symbols(example_symbols, data_key, data_secret, log_rate_limit_once=True)
+    example_payload = fetch_option_snapshots_by_symbols(
+        example_symbols, data_key, data_secret, log_rate_limit_once=True
+    )
     preview_snapshots(example_payload, max_contracts=3)
 
     thresholds = AuditThresholds(
         quote_age_p99=args.quote_age_p99_threshold,
         spread_bps_p95=args.spread_bps_p95_threshold,
+    )
+    tradable_cfg = TradableConfig(
+        max_quote_age_s=args.tradable_max_quote_age_s,
+        max_spread_bps=args.tradable_max_spread_bps,
+        max_moneyness=args.tradable_max_moneyness,
     )
 
     audit_options_data(
@@ -523,6 +849,11 @@ def main() -> None:
         batch_size=args.batch_size,
         spread_bps_buckets=args.spread_bps_buckets,
         thresholds=thresholds,
+        tradable_cfg=tradable_cfg,
+        min_tradable_count=args.min_tradable_count,
+        json_out=args.json_out,
+        json_max_symbols=args.json_max_symbols,
+        sqlite_path=args.sqlite_path,
     )
 
 
