@@ -88,7 +88,7 @@ _SOURCE_TS_LOG_SYMBOL_MAX = 200
 
 _CRYPTO_SOURCES = {"bybit", "binance", "coinbase", "okx"}
 _DERIBIT_SOURCES = {"deribit"}
-_EQUITIES_SOURCES = {"yahoo"}
+_EQUITIES_SOURCES = {"yahoo", "alpaca"}
 
 _CRYPTO_LAG_CLASS = "crypto"
 _DERIBIT_LAG_CLASS = "deribit"
@@ -107,7 +107,7 @@ def _infer_source_class_from_symbol(symbol: Optional[str]) -> Optional[str]:
     symbol_upper = symbol.upper()
     if symbol_upper.endswith("-INDEX") or symbol_upper.endswith("INDEX"):
         return _DERIBIT_LAG_CLASS
-    if symbol_upper in {"IBIT", "BITO"}:
+    if symbol_upper in {"IBIT", "BITO", "SPY", "QQQ", "NVDA"}:
         return _EQUITIES_LAG_CLASS
     crypto_markers = ("USDT", "USDC", "PERP")
     if any(marker in symbol_upper for marker in crypto_markers) or symbol_upper.endswith("USD"):

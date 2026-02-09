@@ -43,7 +43,7 @@ class YahooFinanceClient:
     """
     Yahoo Finance client for ETF price data.
     
-    Used to monitor IBIT (BlackRock Bitcoin ETF) for options trading.
+    Used to monitor equities/ETFs (IBIT, BITO, SPY, QQQ, NVDA).
     """
     
     BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart"
@@ -58,11 +58,11 @@ class YahooFinanceClient:
         Initialize Yahoo Finance client.
 
         Args:
-            symbols: List of stock/ETF symbols (default: ['IBIT'])
+            symbols: List of stock/ETF symbols
             on_update: Callback for price updates
             event_bus: Optional EventBus instance for publishing QuoteEvents
         """
-        self.symbols = symbols or ['IBIT']
+        self.symbols = symbols or ['IBIT', 'BITO', 'SPY', 'QQQ', 'NVDA']
         self.on_update = on_update
         self._event_bus = event_bus
 

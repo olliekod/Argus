@@ -527,13 +527,18 @@ class ArgusOrchestrator:
         self.deribit_client = DeribitClient(testnet=False, event_bus=self.event_bus)
         self.logger.info("Deribit client configured (mainnet)")
 
-        # Yahoo Finance for IBIT ETF
-        self.yahoo_client = YahooFinanceClient(
-            symbols=['IBIT', 'BITO'],
-            on_update=self._on_yahoo_update,
-            event_bus=self.event_bus,
-        )
-        self.logger.info("Yahoo Finance client configured for IBIT/BITO")
+        # Yahoo Finance for equity/ETF quotes -> 1m bars via BarBuilder
+        yahoo_cfg = self.config.get('exchanges', {}).get('yahoo', {})
+        if yahoo_cfg.get('enabled', True):
+            yahoo_symbols = yahoo_cfg.get('symbols', ['IBIT', 'BITO', 'SPY', 'QQQ', 'NVDA'])
+            self.yahoo_client = YahooFinanceClient(
+                symbols=yahoo_symbols,
+                on_update=self._on_yahoo_update,
+                event_bus=self.event_bus,
+            )
+            self.logger.info("Yahoo Finance client configured for %s", yahoo_symbols)
+        else:
+            self.logger.info("Yahoo Finance client disabled (set exchanges.yahoo.enabled=true)")
 
         # Alpaca Data Client for IBIT/BITO bars (runs in ALL modes - data only, no execution)
         alpaca_cfg = self.config.get('exchanges', {}).get('alpaca', {})
@@ -2407,7 +2412,7 @@ class ArgusOrchestrator:
                 await asyncio.sleep(60)
 
     async def _poll_alpaca_market_hours_aware(self) -> None:
-        """Poll Alpaca for IBIT/BITO bars with market-hours awareness.
+        """Poll Alpaca for equity bars with market-hours awareness.
 
         During US market hours: poll every poll_interval (config, default 60s).
         Off-hours: poll every off_hours_sample_interval_seconds (default 600s).

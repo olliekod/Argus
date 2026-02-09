@@ -821,6 +821,22 @@ class TestBarInventory:
         finally:
             await db.close()
 
+    @pytest.mark.asyncio
+    async def test_equity_inventory_multi_provider(self):
+        db = await _make_db()
+        try:
+            bars = _make_linear_bars(2)
+            await _insert_bars(db, bars, provider="yahoo", symbol="SPY")
+            await _insert_bars(db, bars, provider="alpaca", symbol="SPY")
+
+            inv = await db.get_bar_inventory()
+            assert len(inv) == 2
+            keys = {(row["source"], row["symbol"], row["bar_duration"]) for row in inv}
+            assert ("yahoo", "SPY", BAR_DUR) in keys
+            assert ("alpaca", "SPY", BAR_DUR) in keys
+        finally:
+            await db.close()
+
 
 class TestOutcomeInventory:
     """Verify get_outcome_inventory returns correct keys and status counts."""
