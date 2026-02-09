@@ -56,6 +56,26 @@ python main.py
 
 Main config lives in `config/config.yaml`. Thresholds and strategy params in `config/thresholds.yaml` and `config/strategy_params.json`. Secrets (API keys, Telegram token) go in `config/secrets.yaml` (gitignored). Use `config/secrets.example.yaml` as the starting template.
 
+## Tastytrade OAuth Bootstrap (one-time)
+
+Prerequisites: add your OAuth client credentials to `config/secrets.yaml`:
+
+```yaml
+tastytrade_oauth2:
+  client_id: "<CLIENT_ID>"
+  client_secret: "<CLIENT_SECRET>"
+```
+
+Run the bootstrap helper:
+
+```powershell
+python scripts\tastytrade_oauth_bootstrap.py
+```
+
+This opens (or prints) `http://127.0.0.1:8777/oauth/tastytrade/start`, which redirects you to the Tastytrade consent screen. After approval, you are sent back to `/oauth/tastytrade/callback` and the refresh token is saved to `config/secrets.yaml` under `tastytrade_oauth2.refresh_token`.
+
+To re-run the flow (for example after revoking credentials), simply run the helper again and complete the browser step.
+
 ## Pre-commit secrets guard
 
 To prevent accidental secret commits, enable the repo hook:
