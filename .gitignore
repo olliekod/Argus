@@ -9,6 +9,7 @@ config/secrets.yaml
 .env
 *.env
 secrets.*
+!config/secrets.example.yaml
 
 # -----------------------------------------------------------------------------
 # Python
@@ -56,6 +57,8 @@ env/
 # Data Files & Logs (local development)
 # -----------------------------------------------------------------------------
 data/
+data/*.db
+data/*.sqlite
 logs/
 *.log
 *.db

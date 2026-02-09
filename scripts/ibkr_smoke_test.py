@@ -1,9 +1,14 @@
+"""IBKR smoke test (event-loop safe for Python 3.14+)."""
+
 import asyncio
 from ib_async import IB
 from ib_async.contract import Stock
 from ib_async.order import LimitOrder
 
+from src.core.asyncio_compat import ensure_event_loop
+
 async def main():
+    ensure_event_loop()
     ib = IB()
     await ib.connectAsync("127.0.0.1", 4002, clientId=19)
 

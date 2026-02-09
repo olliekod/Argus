@@ -54,7 +54,21 @@ python main.py
 
 ## Configuration
 
-Main config lives in `config/config.yaml`. Thresholds and strategy params in `config/thresholds.yaml` and `config/strategy_params.json`. Secrets (API keys, Telegram token) go in `config/secrets.yaml` (gitignored).
+Main config lives in `config/config.yaml`. Thresholds and strategy params in `config/thresholds.yaml` and `config/strategy_params.json`. Secrets (API keys, Telegram token) go in `config/secrets.yaml` (gitignored). Use `config/secrets.example.yaml` as the starting template.
+
+## Pre-commit secrets guard
+
+To prevent accidental secret commits, enable the repo hook:
+
+```powershell
+copy scripts\precommit_check_secrets.py .git\hooks\pre-commit
+```
+
+You can also run the check manually:
+
+```powershell
+python scripts\precommit_check_secrets.py
+```
 
 ## Rules
 
