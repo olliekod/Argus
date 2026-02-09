@@ -1,4 +1,9 @@
 import sys
+from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.core.config import ConfigurationError, load_config, load_secrets
 from src.connectors.tastytrade_rest import (

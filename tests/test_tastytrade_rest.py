@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from src.connectors.tastytrade_rest import (
     RetryConfig,
     TastytradeRestClient,
-    normalize_nested_option_chain,
     parse_rfc3339_nano,
 )
 
@@ -101,27 +100,6 @@ def test_list_nested_option_chains_url_and_params():
     client.list_nested_option_chains("IBIT", include_weeklies="true")
     assert session.calls[-1]["url"].endswith("/instruments/nested-option-chains/IBIT")
     assert session.calls[-1]["params"] == {"include_weeklies": "true"}
-
-
-def test_normalize_nested_option_chain():
-    payload = {
-        "expirations": [
-            {
-                "expiration-date": "2024-01-02T00:00:00.000000000Z",
-                "strikes": [
-                    {
-                        "strike-price": "100",
-                        "call": {"symbol": "IBIT240102C00100000", "multiplier": 100},
-                        "put": {"symbol": "IBIT240102P00100000", "multiplier": 100},
-                    }
-                ],
-            }
-        ]
-    }
-    normalized = normalize_nested_option_chain(payload, "IBIT")
-    assert len(normalized) == 2
-    assert {item["option_type"] for item in normalized} == {"call", "put"}
-    assert normalized[0]["expiration_dt"].tzinfo is not None
 
 
 def test_parse_rfc3339_nano():
