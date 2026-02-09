@@ -62,7 +62,13 @@ exchanges:
 
   alpaca:
     enabled: true
-    symbols: ["IBIT", "BITO"]
+    # Trading endpoints:
+    #   Live:  https://api.alpaca.markets
+    #   Paper: https://paper-api.alpaca.markets
+    # Market data endpoint (bars/quotes): https://data.alpaca.markets
+    # Note: Switching paper -> live does NOT change market data access.
+    #       Data availability is controlled by market data subscriptions.
+    symbols: ["IBIT", "BITO", "SPY", "QQQ", "NVDA"]
     poll_interval_seconds: 60
     bar_timeframe: "1Min"
     options:
@@ -71,6 +77,10 @@ exchanges:
       poll_interval_seconds: 60  # 1 minute between chain polls (default)
       min_dte: 7
       max_dte: 21
+
+  yahoo:
+    enabled: true
+    symbols: ["IBIT", "BITO", "SPY", "QQQ", "NVDA"]
 
 # -----------------------------------------------------------------------------
 # Alert Configuration

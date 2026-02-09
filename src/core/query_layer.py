@@ -16,7 +16,7 @@ Stream 2 additions
 ------------------
 * **Status snapshots** — ``snapshot()`` serialises the full status dict
   for periodic DB / JSON persistence.
-* **Equity-gap-aware continuity** — equity symbols (IBIT, BITO) are not
+* **Equity-gap-aware continuity** — equity symbols (IBIT, BITO, SPY, QQQ, NVDA) are not
   flagged stale during known market-close hours (weekends, overnight).
 """
 
@@ -45,7 +45,7 @@ logger = logging.getLogger("argus.query")
 _EASTERN = ZoneInfo("America/New_York")
 
 # Symbols that only trade during US equity hours
-_EQUITY_SYMBOLS = {"IBIT", "BITO"}
+_EQUITY_SYMBOLS = {"IBIT", "BITO", "SPY", "QQQ", "NVDA"}
 
 
 def _is_equity_market_open(now_utc: Optional[datetime] = None) -> bool:

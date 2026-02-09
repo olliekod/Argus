@@ -361,7 +361,7 @@ def dict_to_market_regime(d: Dict[str, Any]) -> MarketRegimeEvent:
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Symbols that belong to EQUITIES market
-EQUITIES_SYMBOLS = {"IBIT", "BITO", "SPY", "QQQ"}
+EQUITIES_SYMBOLS = {"IBIT", "BITO", "SPY", "QQQ", "NVDA"}
 
 # All other symbols default to CRYPTO
 
