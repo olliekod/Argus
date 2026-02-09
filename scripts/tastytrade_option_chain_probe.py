@@ -2,11 +2,17 @@
 
 Usage:
   python scripts/tastytrade_option_chain_probe.py --underlying IBIT
+  python scripts/tastytrade_option_chain_probe.py --symbol SPY
 """
 
 import argparse
 import sys
+from pathlib import Path
 from typing import Any
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from src.core.config import ConfigurationError, load_config, load_secrets
 from src.core.options_normalize import normalize_tastytrade_nested_chain
@@ -59,7 +65,8 @@ def _sample_contracts(contracts: list[dict[str, Any]], underlying_price: float |
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--underlying", default="IBIT")
+    parser.add_argument("--underlying", default="IBIT", help="Underlying symbol (e.g. IBIT)")
+    parser.add_argument("--symbol", dest="underlying", help="Alias for --underlying")
     args = parser.parse_args()
 
     try:
