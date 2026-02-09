@@ -49,8 +49,29 @@ def test_get_nested_option_chains_path_and_auth_header():
     client = TastytradeRestClient("user", "pass", session=session)
 
     client.login()
-    client.get_nested_option_chains("IBIT")
+    payload = client.get_nested_option_chains("IBIT")
 
     last_call = session.calls[-1]
-    assert last_call["url"].endswith("/instruments/nested-option-chains/IBIT")
+    assert last_call["url"].endswith("/option-chains/IBIT/nested")
     assert last_call["headers"].get("Authorization") == "token-abc"
+    assert payload == {"data": {"expirations": []}}
+
+
+def test_get_nested_option_chains_error_excerpt():
+    responses = [
+        DummyResponse(200, {"data": {"session-token": "token-abc"}}),
+        DummyResponse(404, {"error": "X" * 600}),
+    ]
+    session = DummySession(responses)
+    client = TastytradeRestClient("user", "pass", session=session)
+    client.login()
+
+    try:
+        client.get_nested_option_chains("IBIT")
+    except Exception as exc:
+        message = str(exc)
+    else:
+        raise AssertionError("Expected error not raised")
+
+    assert "HTTP 404" in message
+    assert "X" * 500 in message
