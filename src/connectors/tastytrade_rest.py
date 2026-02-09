@@ -54,72 +54,24 @@ def parse_rfc3339_nano(timestamp: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def normalize_nested_option_chain(chain: Dict[str, Any], underlying: str) -> list[Dict[str, Any]]:
-    """Normalize nested option chain response into a flat list."""
-    if not chain:
-        return []
-
+def _attach_nested_chain_timestamps(payload: Dict[str, Any]) -> None:
     expirations = (
-        chain.get("expirations")
-        or chain.get("items")
-        or chain.get("data")
-        or chain.get("option-chains")
+        payload.get("expirations")
+        or payload.get("items")
+        or payload.get("option-chains")
         or []
     )
-    normalized: list[Dict[str, Any]] = []
-
     for expiration in expirations:
         expiry_raw = (
             expiration.get("expiration-date")
+            or expiration.get("expiration-date-time")
             or expiration.get("expiration")
-            or expiration.get("expirationDate")
-            or expiration.get("date")
         )
-        expiry_parsed = None
         if isinstance(expiry_raw, str) and ("T" in expiry_raw or "Z" in expiry_raw or "+" in expiry_raw):
             try:
-                expiry_parsed = parse_rfc3339_nano(expiry_raw)
+                expiration["expiration-datetime"] = parse_rfc3339_nano(expiry_raw)
             except ValueError:
-                expiry_parsed = None
-
-        strikes = (
-            expiration.get("strikes")
-            or expiration.get("strike-prices")
-            or expiration.get("strike-price-list")
-            or []
-        )
-        for strike in strikes:
-            strike_price = (
-                strike.get("strike-price")
-                or strike.get("strike")
-                or strike.get("price")
-                or strike.get("strike_price")
-                or strike
-            )
-
-            for side, option_key in (("call", "call"), ("put", "put")):
-                option_data = strike.get(option_key) if isinstance(strike, dict) else None
-                if not option_data:
-                    continue
-                symbol = (
-                    option_data.get("symbol")
-                    or option_data.get("occ-symbol")
-                    or option_data.get("streamer-symbol")
-                )
-                multiplier = option_data.get("multiplier") or option_data.get("contract-size")
-                normalized.append(
-                    {
-                        "underlying": underlying,
-                        "expiration": expiry_raw,
-                        "expiration_dt": expiry_parsed,
-                        "strike": strike_price,
-                        "option_type": side,
-                        "symbol": symbol,
-                        "multiplier": multiplier,
-                    }
-                )
-
-    return normalized
+                continue
 
 
 class TastytradeRestClient:
@@ -181,12 +133,18 @@ class TastytradeRestClient:
         return data.get("data", data)
 
     def list_nested_option_chains(self, underlying: str, **params: Any) -> Any:
+        return self.get_nested_option_chains(underlying, **params)
+
+    def get_nested_option_chains(self, symbol: str, **params: Any) -> Any:
         data = self._request(
             "GET",
-            f"/instruments/nested-option-chains/{underlying}",
+            f"/instruments/nested-option-chains/{symbol}",
             params=params or None,
         )
-        return data.get("data", data)
+        payload = data.get("data", data)
+        if isinstance(payload, dict):
+            _attach_nested_chain_timestamps(payload)
+        return payload
 
     def get_quotes(self, symbols: list[str]) -> Any:
         logger.warning("Quotes endpoint not yet implemented.")
