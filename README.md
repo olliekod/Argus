@@ -46,7 +46,7 @@ cd C:\Users\Oliver\Desktop\Desktop\Projects\argus
 python -m venv venv
 .\venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-copy config\secrets.example.yaml config\secrets.yaml
+copy config\secrets.template.yaml config\secrets.yaml
 # Secrets.yaml need to have updated api keys
 python scripts\init_database.py
 python main.py
@@ -54,7 +54,21 @@ python main.py
 
 ## Configuration
 
-Main config lives in `config/config.yaml`. Thresholds and strategy params in `config/thresholds.yaml` and `config/strategy_params.json`. Secrets (API keys, Telegram token) go in `config/secrets.yaml` (gitignored).
+Main config lives in `config/config.yaml`. Thresholds and strategy params in `config/thresholds.yaml` and `config/strategy_params.json`. Secrets (API keys, Telegram token) go in `config/secrets.yaml` (gitignored). Use `config/secrets.template.yaml` as the starting template.
+
+## Pre-commit secrets guard
+
+To prevent accidental secret commits, enable the repo hook:
+
+```powershell
+copy scripts\precommit_check_secrets.py .git\hooks\pre-commit
+```
+
+You can also run the check manually:
+
+```powershell
+python scripts\precommit_check_secrets.py
+```
 
 ## Rules
 

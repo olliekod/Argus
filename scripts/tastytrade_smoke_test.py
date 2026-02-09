@@ -1,5 +1,11 @@
+import sys
+
 from src.core.config import ConfigurationError, load_config, load_secrets
-from src.connectors.tastytrade_rest import RetryConfig, TastytradeRestClient
+from src.connectors.tastytrade_rest import (
+    RetryConfig,
+    TastytradeError,
+    TastytradeRestClient,
+)
 
 
 def _is_placeholder(value: str) -> bool:
@@ -39,13 +45,33 @@ def main() -> None:
 
     try:
         client.login()
-        accounts = client.get_accounts()
-        print(f"Accounts returned: {len(accounts) if accounts else 0}")
-        for symbol in ("IBIT", "BITO"):
-            chain = client.get_option_chain(symbol)
-            print(f"Chain {symbol}: {bool(chain)}")
-    finally:
+        accounts = client.get_accounts() or []
+    except TastytradeError as exc:
         client.close()
+        print(f"Tastytrade auth failed: {exc}")
+        sys.exit(1)
+
+    masked_accounts = []
+    for account in accounts:
+        account_id = (
+            account.get("account-number")
+            or account.get("account_number")
+            or account.get("id")
+            or ""
+        )
+        if account_id:
+            masked_accounts.append(f"****{str(account_id)[-4:]}")
+        else:
+            masked_accounts.append("****")
+    print(f"Accounts returned: {len(accounts)}")
+    if masked_accounts:
+        print(f"Account IDs: {', '.join(masked_accounts)}")
+
+    for symbol in ("IBIT", "BITO"):
+        chain = client.get_option_chain(symbol)
+        print(f"Chain {symbol}: {bool(chain)}")
+
+    client.close()
 
 
 if __name__ == "__main__":

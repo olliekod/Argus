@@ -22,6 +22,23 @@ def load_yaml(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+def find_repo_root(start: Optional[Path] = None) -> Path:
+    """Locate the repo root by walking upward for known anchors."""
+    start_path = (start or Path.cwd()).resolve()
+    for current in [start_path, *start_path.parents]:
+        if (current / ".git").exists() or (current / "config" / "config.yaml").exists():
+            return current
+    return start_path
+
+
+def _resolve_path(path: str) -> Path:
+    candidate = Path(path)
+    if candidate.is_absolute():
+        return candidate
+    repo_root = find_repo_root(Path(__file__).resolve())
+    return repo_root / candidate
+
+
 def load_config(config_path: str = "config/config.yaml") -> Dict[str, Any]:
     """
     Load main configuration file.
@@ -32,7 +49,7 @@ def load_config(config_path: str = "config/config.yaml") -> Dict[str, Any]:
     Returns:
         Configuration dictionary
     """
-    path = Path(config_path)
+    path = _resolve_path(config_path)
     if not path.exists():
         raise ConfigurationError(f"Config file not found: {config_path}")
     
@@ -53,11 +70,11 @@ def load_secrets(secrets_path: str = "config/secrets.yaml") -> Dict[str, Any]:
     if override_path:
         secrets_path = override_path
 
-    path = Path(secrets_path)
+    path = _resolve_path(secrets_path)
     if not path.exists():
         raise ConfigurationError(
             f"Secrets file not found: {secrets_path}\n"
-            f"Copy secrets.example.yaml to secrets.yaml and add your API keys."
+            f"Copy config/secrets.template.yaml to config/secrets.yaml and add your API keys."
         )
     
     return load_yaml(str(path))
@@ -73,7 +90,7 @@ def load_thresholds(thresholds_path: str = "config/thresholds.yaml") -> Dict[str
     Returns:
         Thresholds dictionary
     """
-    path = Path(thresholds_path)
+    path = _resolve_path(thresholds_path)
     if not path.exists():
         raise ConfigurationError(f"Thresholds file not found: {thresholds_path}")
     

@@ -1,11 +1,12 @@
-import asyncio
+"""Minimal ib_insync connection test (Python 3.14+ event loop safe)."""
 
-from ib_insync import IB
+from ib_insync import IB, util
 
 from src.core.asyncio_compat import ensure_event_loop, run_sync
 
 
 async def main() -> None:
+    util.startLoop()
     ensure_event_loop()
     ib = IB()
     ib.connect("127.0.0.1", 4002, clientId=42)
