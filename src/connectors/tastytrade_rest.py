@@ -138,13 +138,14 @@ class TastytradeRestClient:
     def get_nested_option_chains(self, symbol: str, **params: Any) -> Any:
         data = self._request(
             "GET",
-            f"/instruments/nested-option-chains/{symbol}",
+            f"/option-chains/{symbol}/nested",
             params=params or None,
+            error_excerpt_limit=500,
         )
         payload = data.get("data", data)
         if isinstance(payload, dict):
             _attach_nested_chain_timestamps(payload)
-        return payload
+        return data
 
     def get_quotes(self, symbols: list[str]) -> Any:
         logger.warning("Quotes endpoint not yet implemented.")
@@ -163,6 +164,7 @@ class TastytradeRestClient:
         params: Optional[Dict[str, Any]] = None,
         json: Optional[Dict[str, Any]] = None,
         auth: bool = True,
+        error_excerpt_limit: int = 200,
     ) -> Dict[str, Any]:
         if auth and not self._token:
             raise TastytradeError("Not authenticated. Call login() first.")
@@ -190,7 +192,7 @@ class TastytradeRestClient:
                     continue
             if not response.ok:
                 raise TastytradeError(
-                    f"Tastytrade HTTP {response.status_code}: {response.text[:200]}"
+                    f"Tastytrade HTTP {response.status_code}: {response.text[:error_excerpt_limit]}"
                 )
             try:
                 payload = response.json()
