@@ -80,6 +80,32 @@ def load_secrets(secrets_path: str = "config/secrets.yaml") -> Dict[str, Any]:
     return load_yaml(str(path))
 
 
+def resolve_secrets_path(secrets_path: str = "config/secrets.yaml") -> Path:
+    """Resolve the secrets path, honoring ARGUS_SECRETS overrides."""
+    override_path = os.getenv("ARGUS_SECRETS")
+    if override_path:
+        secrets_path = override_path
+    return _resolve_path(secrets_path)
+
+
+def save_secrets(secrets: Dict[str, Any], secrets_path: str = "config/secrets.yaml") -> Path:
+    """
+    Persist secrets to disk.
+
+    Args:
+        secrets: Secrets dictionary to write.
+        secrets_path: Path to secrets.yaml (ARGUS_SECRETS overrides).
+
+    Returns:
+        Path to the written secrets file.
+    """
+    path = resolve_secrets_path(secrets_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        yaml.safe_dump(secrets, f, sort_keys=False, default_flow_style=False)
+    return path
+
+
 def load_thresholds(thresholds_path: str = "config/thresholds.yaml") -> Dict[str, Any]:
     """
     Load detection thresholds configuration.

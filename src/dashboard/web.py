@@ -12,10 +12,12 @@ import json
 import logging
 import os
 import time
+import secrets as secrets_lib
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional
 
 from aiohttp import web
+from yarl import URL
 
 logger = logging.getLogger('argus.dashboard')
 
@@ -173,12 +175,15 @@ class ArgusWebDashboard:
         self._get_recent_logs: Optional[Callable] = None
         self._get_soak_summary: Optional[Callable] = None
         self._boot_phases: str = ''
+        self._oauth_states: Dict[str, float] = {}
 
         self._app.router.add_get('/', self._handle_index)
         self._app.router.add_get('/api/status', self._handle_status)
         self._app.router.add_get('/debug/soak', self._handle_soak)
         self._app.router.add_get('/debug/tape/export', self._handle_tape_export)
         self._app.router.add_post('/api/command', self._handle_command)
+        self._app.router.add_get('/oauth/tastytrade/start', self._handle_tastytrade_oauth_start)
+        self._app.router.add_get('/oauth/tastytrade/callback', self._handle_tastytrade_oauth_callback)
 
     def set_callbacks(
         self,
@@ -374,3 +379,154 @@ class ArgusWebDashboard:
         finally:
             duration_ms = (time.perf_counter() - start) * 1000
             logger.info(f"/debug/tape/export in {duration_ms:.1f}ms")
+
+    async def _handle_tastytrade_oauth_start(self, request):
+        from ..core.config import load_secrets
+        from ..connectors.tastytrade_oauth import (
+            TastytradeOAuthConfig,
+            TASTYTRADE_AUTH_URL,
+            TASTYTRADE_TOKEN_URL,
+            build_authorize_url,
+            parse_scopes,
+            prune_states,
+        )
+
+        prune_states(self._oauth_states)
+        secrets = load_secrets()
+        oauth_cfg = secrets.get("tastytrade_oauth2", {}) or {}
+        client_id = oauth_cfg.get("client_id", "")
+        client_secret = oauth_cfg.get("client_secret", "")
+        refresh_token = oauth_cfg.get("refresh_token")
+        raw_scopes = oauth_cfg.get("scopes")
+        if refresh_token:
+            html = (
+                "<html><body><h3>Tastytrade OAuth already configured.</h3>"
+                "<p>Refresh token is already saved. You can close this tab.</p></body></html>"
+            )
+            return web.Response(text=html, content_type="text/html")
+        if not client_id or not client_secret:
+            html = (
+                "<html><body><h3>Missing Tastytrade OAuth credentials.</h3>"
+                "<p>Please set tastytrade_oauth2.client_id/client_secret in secrets.yaml.</p>"
+                "</body></html>"
+            )
+            return web.Response(text=html, content_type="text/html", status=500)
+
+        callback_url = str(
+            URL.build(
+                scheme=request.url.scheme,
+                host=request.url.host,
+                port=request.url.port,
+                path="/oauth/tastytrade/callback",
+            )
+        )
+        state = secrets_lib.token_urlsafe(24)
+        self._oauth_states[state] = time.time()
+        config = TastytradeOAuthConfig(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=callback_url,
+            scopes=parse_scopes(raw_scopes),
+            auth_url=oauth_cfg.get("auth_url")
+            or os.getenv("TASTYTRADE_AUTH_URL")
+            or TASTYTRADE_AUTH_URL,
+            token_url=oauth_cfg.get("token_url")
+            or os.getenv("TASTYTRADE_TOKEN_URL")
+            or TASTYTRADE_TOKEN_URL,
+        )
+        auth_url = build_authorize_url(config, state)
+        raise web.HTTPFound(auth_url)
+
+    async def _handle_tastytrade_oauth_callback(self, request):
+        from ..core.config import load_secrets, save_secrets
+        from ..connectors.tastytrade_oauth import (
+            TastytradeOAuthConfig,
+            TASTYTRADE_AUTH_URL,
+            TASTYTRADE_TOKEN_URL,
+            exchange_code_for_tokens,
+            parse_scopes,
+            prune_states,
+        )
+
+        prune_states(self._oauth_states)
+        params = request.query
+        if "error" in params:
+            html = (
+                "<html><body><h3>OAuth error returned.</h3>"
+                f"<p>{params.get('error_description') or params.get('error')}</p>"
+                "</body></html>"
+            )
+            return web.Response(text=html, content_type="text/html", status=400)
+
+        code = params.get("code")
+        state = params.get("state")
+        if not code:
+            html = "<html><body><h3>Missing authorization code.</h3></body></html>"
+            return web.Response(text=html, content_type="text/html", status=400)
+        if not state or state not in self._oauth_states:
+            html = (
+                "<html><body><h3>Invalid or expired OAuth state.</h3>"
+                "<p>Restart the flow from /oauth/tastytrade/start.</p></body></html>"
+            )
+            return web.Response(text=html, content_type="text/html", status=400)
+        self._oauth_states.pop(state, None)
+
+        secrets = load_secrets()
+        oauth_cfg = secrets.get("tastytrade_oauth2", {}) or {}
+        client_id = oauth_cfg.get("client_id", "")
+        client_secret = oauth_cfg.get("client_secret", "")
+        raw_scopes = oauth_cfg.get("scopes")
+        callback_url = str(request.url.with_path("/oauth/tastytrade/callback").with_query({}))
+        if not client_id or not client_secret:
+            html = (
+                "<html><body><h3>Missing Tastytrade OAuth credentials.</h3>"
+                "<p>Set tastytrade_oauth2.client_id/client_secret in secrets.yaml.</p>"
+                "</body></html>"
+            )
+            return web.Response(text=html, content_type="text/html", status=500)
+
+        config = TastytradeOAuthConfig(
+            client_id=client_id,
+            client_secret=client_secret,
+            redirect_uri=callback_url,
+            scopes=parse_scopes(raw_scopes),
+            auth_url=oauth_cfg.get("auth_url")
+            or os.getenv("TASTYTRADE_AUTH_URL")
+            or TASTYTRADE_AUTH_URL,
+            token_url=oauth_cfg.get("token_url")
+            or os.getenv("TASTYTRADE_TOKEN_URL")
+            or TASTYTRADE_TOKEN_URL,
+        )
+        try:
+            token_data = await exchange_code_for_tokens(config, code)
+        except Exception as exc:
+            logger.error("Tastytrade token exchange failed: %s", exc)
+            html = (
+                "<html><body><h3>Token exchange failed.</h3>"
+                f"<p>{exc}</p></body></html>"
+            )
+            return web.Response(text=html, content_type="text/html", status=500)
+
+        refresh_token = token_data.get("refresh_token")
+        if not refresh_token and isinstance(token_data.get("data"), dict):
+            refresh_token = token_data["data"].get("refresh_token")
+        if not refresh_token:
+            html = (
+                "<html><body><h3>No refresh token returned.</h3>"
+                "<p>Check your OAuth client scopes and permissions.</p></body></html>"
+            )
+            return web.Response(text=html, content_type="text/html", status=500)
+
+        oauth_section = secrets.setdefault("tastytrade_oauth2", {})
+        oauth_section["refresh_token"] = refresh_token
+        access_token = token_data.get("access_token")
+        if not access_token and isinstance(token_data.get("data"), dict):
+            access_token = token_data["data"].get("access_token")
+        if access_token:
+            oauth_section["access_token"] = access_token
+        save_secrets(secrets)
+        html = (
+            "<html><body><h3>Refresh token saved.</h3>"
+            "<p>You can close this tab.</p></body></html>"
+        )
+        return web.Response(text=html, content_type="text/html")
