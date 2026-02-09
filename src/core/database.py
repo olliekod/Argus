@@ -599,6 +599,54 @@ class Database:
             "ON option_chain_snapshots(timestamp_ms)"
         )
 
+        # Phase 4A.1: Bar outcomes (backtest ground truth)
+        await self._connection.execute("""
+            CREATE TABLE IF NOT EXISTS bar_outcomes (
+                provider TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                bar_duration_seconds INTEGER NOT NULL,
+                timestamp_ms INTEGER NOT NULL,
+                horizon_seconds INTEGER NOT NULL,
+                outcome_version TEXT NOT NULL,
+                
+                -- Core metrics (quantized REAL)
+                close_now REAL,
+                close_at_horizon REAL,
+                fwd_return REAL,
+                max_runup REAL,
+                max_drawdown REAL,
+                realized_vol REAL,
+                
+                -- Path helpers (for exit simulation)
+                max_high_in_window REAL,
+                min_low_in_window REAL,
+                max_runup_ts_ms INTEGER,
+                max_drawdown_ts_ms INTEGER,
+                time_to_max_runup_ms INTEGER,
+                time_to_max_drawdown_ms INTEGER,
+                
+                -- Coverage & debug
+                status TEXT NOT NULL,
+                close_ref_ms INTEGER,
+                window_start_ms INTEGER,
+                window_end_ms INTEGER,
+                bars_expected INTEGER,
+                bars_found INTEGER,
+                gap_count INTEGER,
+                computed_at_ms INTEGER,
+                
+                PRIMARY KEY (provider, symbol, bar_duration_seconds, timestamp_ms, horizon_seconds, outcome_version)
+            ) WITHOUT ROWID
+        """)
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bar_outcomes_lookup "
+            "ON bar_outcomes(provider, symbol, bar_duration_seconds, timestamp_ms)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_bar_outcomes_status "
+            "ON bar_outcomes(status, provider, symbol)"
+        )
+
         await self._connection.commit()
 
         logger.debug("Database tables created/verified")
@@ -1812,4 +1860,356 @@ class Database:
             """, (symbol,))
         rows = await cursor.fetchall()
         return [dict(row) for row in rows]
+
+    # =========================================================================
+    # Phase 4A.1: Bar Outcomes (Backtest Ground Truth)
+    # =========================================================================
+
+    async def upsert_bar_outcome(
+        self,
+        provider: str,
+        symbol: str,
+        bar_duration_seconds: int,
+        timestamp_ms: int,
+        horizon_seconds: int,
+        outcome_version: str,
+        close_now: float,
+        close_at_horizon: float | None,
+        fwd_return: float | None,
+        max_runup: float | None,
+        max_drawdown: float | None,
+        realized_vol: float | None,
+        max_high_in_window: float | None,
+        min_low_in_window: float | None,
+        max_runup_ts_ms: int | None,
+        max_drawdown_ts_ms: int | None,
+        time_to_max_runup_ms: int | None,
+        time_to_max_drawdown_ms: int | None,
+        status: str,
+        close_ref_ms: int,
+        window_start_ms: int,
+        window_end_ms: int,
+        bars_expected: int,
+        bars_found: int,
+        gap_count: int,
+        computed_at_ms: int | None,
+    ) -> bool:
+        """Upsert a bar outcome record (idempotent).
+        
+        Status upgrade rules:
+        - INCOMPLETE records can be updated to OK or GAP
+        - OK/GAP records are only updated if outcome_version changes
+        
+        Returns:
+            True if inserted/updated, False on error.
+        """
+        try:
+            await self._connection.execute("""
+                INSERT INTO bar_outcomes (
+                    provider, symbol, bar_duration_seconds, timestamp_ms,
+                    horizon_seconds, outcome_version,
+                    close_now, close_at_horizon, fwd_return, max_runup, max_drawdown,
+                    realized_vol, max_high_in_window, min_low_in_window,
+                    max_runup_ts_ms, max_drawdown_ts_ms,
+                    time_to_max_runup_ms, time_to_max_drawdown_ms,
+                    status, close_ref_ms, window_start_ms, window_end_ms,
+                    bars_expected, bars_found, gap_count, computed_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, symbol, bar_duration_seconds, timestamp_ms, horizon_seconds, outcome_version) DO UPDATE SET
+                    close_at_horizon = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.close_at_horizon
+                        ELSE bar_outcomes.close_at_horizon
+                    END,
+                    fwd_return = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.fwd_return
+                        ELSE bar_outcomes.fwd_return
+                    END,
+                    max_runup = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_runup
+                        ELSE bar_outcomes.max_runup
+                    END,
+                    max_drawdown = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_drawdown
+                        ELSE bar_outcomes.max_drawdown
+                    END,
+                    realized_vol = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.realized_vol
+                        ELSE bar_outcomes.realized_vol
+                    END,
+                    max_high_in_window = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_high_in_window
+                        ELSE bar_outcomes.max_high_in_window
+                    END,
+                    min_low_in_window = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.min_low_in_window
+                        ELSE bar_outcomes.min_low_in_window
+                    END,
+                    max_runup_ts_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_runup_ts_ms
+                        ELSE bar_outcomes.max_runup_ts_ms
+                    END,
+                    max_drawdown_ts_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_drawdown_ts_ms
+                        ELSE bar_outcomes.max_drawdown_ts_ms
+                    END,
+                    time_to_max_runup_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.time_to_max_runup_ms
+                        ELSE bar_outcomes.time_to_max_runup_ms
+                    END,
+                    time_to_max_drawdown_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.time_to_max_drawdown_ms
+                        ELSE bar_outcomes.time_to_max_drawdown_ms
+                    END,
+                    status = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.status
+                        ELSE bar_outcomes.status
+                    END,
+                    bars_found = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.bars_found
+                        ELSE bar_outcomes.bars_found
+                    END,
+                    gap_count = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.gap_count
+                        ELSE bar_outcomes.gap_count
+                    END,
+                    computed_at_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.computed_at_ms
+                        ELSE bar_outcomes.computed_at_ms
+                    END
+            """, (
+                provider, symbol, bar_duration_seconds, timestamp_ms,
+                horizon_seconds, outcome_version,
+                close_now, close_at_horizon, fwd_return, max_runup, max_drawdown,
+                realized_vol, max_high_in_window, min_low_in_window,
+                max_runup_ts_ms, max_drawdown_ts_ms,
+                time_to_max_runup_ms, time_to_max_drawdown_ms,
+                status, close_ref_ms, window_start_ms, window_end_ms,
+                bars_expected, bars_found, gap_count, computed_at_ms,
+            ))
+            await self._connection.commit()
+            return True
+        except Exception as e:
+            logger.warning("upsert_bar_outcome failed: %s", e)
+            return False
+
+    async def upsert_bar_outcomes_batch(
+        self,
+        outcomes: List[tuple],
+    ) -> int:
+        """Batch upsert bar outcomes. Returns count of rows affected.
+        
+        Each outcome tuple should have 26 elements matching upsert_bar_outcome params.
+        Uses executemany for efficiency.
+        """
+        if not outcomes:
+            return 0
+        try:
+            await self._connection.executemany("""
+                INSERT INTO bar_outcomes (
+                    provider, symbol, bar_duration_seconds, timestamp_ms,
+                    horizon_seconds, outcome_version,
+                    close_now, close_at_horizon, fwd_return, max_runup, max_drawdown,
+                    realized_vol, max_high_in_window, min_low_in_window,
+                    max_runup_ts_ms, max_drawdown_ts_ms,
+                    time_to_max_runup_ms, time_to_max_drawdown_ms,
+                    status, close_ref_ms, window_start_ms, window_end_ms,
+                    bars_expected, bars_found, gap_count, computed_at_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(provider, symbol, bar_duration_seconds, timestamp_ms, horizon_seconds, outcome_version) DO UPDATE SET
+                    close_at_horizon = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.close_at_horizon
+                        ELSE bar_outcomes.close_at_horizon
+                    END,
+                    fwd_return = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.fwd_return
+                        ELSE bar_outcomes.fwd_return
+                    END,
+                    max_runup = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_runup
+                        ELSE bar_outcomes.max_runup
+                    END,
+                    max_drawdown = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_drawdown
+                        ELSE bar_outcomes.max_drawdown
+                    END,
+                    realized_vol = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.realized_vol
+                        ELSE bar_outcomes.realized_vol
+                    END,
+                    max_high_in_window = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_high_in_window
+                        ELSE bar_outcomes.max_high_in_window
+                    END,
+                    min_low_in_window = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.min_low_in_window
+                        ELSE bar_outcomes.min_low_in_window
+                    END,
+                    max_runup_ts_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_runup_ts_ms
+                        ELSE bar_outcomes.max_runup_ts_ms
+                    END,
+                    max_drawdown_ts_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_drawdown_ts_ms
+                        ELSE bar_outcomes.max_drawdown_ts_ms
+                    END,
+                    time_to_max_runup_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.time_to_max_runup_ms
+                        ELSE bar_outcomes.time_to_max_runup_ms
+                    END,
+                    time_to_max_drawdown_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.time_to_max_drawdown_ms
+                        ELSE bar_outcomes.time_to_max_drawdown_ms
+                    END,
+                    status = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.status
+                        ELSE bar_outcomes.status
+                    END,
+                    bars_found = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.bars_found
+                        ELSE bar_outcomes.bars_found
+                    END,
+                    gap_count = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.gap_count
+                        ELSE bar_outcomes.gap_count
+                    END,
+                    computed_at_ms = CASE
+                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.computed_at_ms
+                        ELSE bar_outcomes.computed_at_ms
+                    END
+            """, outcomes)
+            await self._connection.commit()
+            return len(outcomes)
+        except Exception as e:
+            logger.warning("upsert_bar_outcomes_batch failed: %s", e)
+            return 0
+
+    async def get_bars_for_outcome_computation(
+        self,
+        source: str,
+        symbol: str,
+        bar_duration: int,
+        start_ms: int,
+        end_ms: int,
+        limit: int = 100000,
+    ) -> List[Dict[str, Any]]:
+        """Fetch bars for outcome computation, ordered by timestamp.
+        
+        Returns bars in [start_ms, end_ms] range plus lookahead bars
+        needed for forward returns.
+        """
+        cursor = await self._connection.execute("""
+            SELECT 
+                source, symbol, bar_duration, timestamp,
+                open, high, low, close, volume
+            FROM market_bars
+            WHERE source = ? AND symbol = ? AND bar_duration = ?
+              AND timestamp >= datetime(?, 'unixepoch', 'subsec')
+            ORDER BY timestamp ASC
+            LIMIT ?
+        """, (source, symbol, bar_duration, start_ms / 1000.0, limit))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_bar_outcomes(
+        self,
+        provider: str,
+        symbol: str,
+        bar_duration_seconds: int | None = None,
+        horizon_seconds: int | None = None,
+        status: str | None = None,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+        limit: int = 10000,
+    ) -> List[Dict[str, Any]]:
+        """Query bar outcomes with optional filters."""
+        sql = "SELECT * FROM bar_outcomes WHERE provider = ? AND symbol = ?"
+        params: list = [provider, symbol]
+        
+        if bar_duration_seconds is not None:
+            sql += " AND bar_duration_seconds = ?"
+            params.append(bar_duration_seconds)
+        if horizon_seconds is not None:
+            sql += " AND horizon_seconds = ?"
+            params.append(horizon_seconds)
+        if status is not None:
+            sql += " AND status = ?"
+            params.append(status)
+        if start_ms is not None:
+            sql += " AND timestamp_ms >= ?"
+            params.append(start_ms)
+        if end_ms is not None:
+            sql += " AND timestamp_ms <= ?"
+            params.append(end_ms)
+        
+        sql += " ORDER BY timestamp_ms ASC LIMIT ?"
+        params.append(limit)
+        
+        cursor = await self._connection.execute(sql, tuple(params))
+        rows = await cursor.fetchall()
+        return [dict(row) for row in rows]
+
+    async def get_outcome_coverage_stats(
+        self,
+        provider: str | None = None,
+        symbol: str | None = None,
+    ) -> Dict[str, Any]:
+        """Get coverage statistics for bar outcomes.
+        
+        Returns min/max timestamps, counts by status, and coverage metrics.
+        """
+        where_parts = []
+        params: list = []
+        if provider:
+            where_parts.append("provider = ?")
+            params.append(provider)
+        if symbol:
+            where_parts.append("symbol = ?")
+            params.append(symbol)
+        
+        where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+        
+        cursor = await self._connection.execute(f"""
+            SELECT 
+                COUNT(*) as total_outcomes,
+                MIN(timestamp_ms) as min_ts_ms,
+                MAX(timestamp_ms) as max_ts_ms,
+                SUM(CASE WHEN status = 'OK' THEN 1 ELSE 0 END) as ok_count,
+                SUM(CASE WHEN status = 'INCOMPLETE' THEN 1 ELSE 0 END) as incomplete_count,
+                SUM(CASE WHEN status = 'GAP' THEN 1 ELSE 0 END) as gap_count
+            FROM bar_outcomes
+            {where_clause}
+        """, tuple(params))
+        row = await cursor.fetchone()
+        return dict(row) if row else {}
+
+    async def get_bar_coverage_stats(
+        self,
+        source: str | None = None,
+        symbol: str | None = None,
+    ) -> Dict[str, Any]:
+        """Get coverage statistics for market_bars.
+        
+        Returns min/max timestamps, total count, and span.
+        """
+        where_parts = []
+        params: list = []
+        if source:
+            where_parts.append("source = ?")
+            params.append(source)
+        if symbol:
+            where_parts.append("symbol = ?")
+            params.append(symbol)
+        
+        where_clause = "WHERE " + " AND ".join(where_parts) if where_parts else ""
+        
+        cursor = await self._connection.execute(f"""
+            SELECT 
+                COUNT(*) as total_bars,
+                MIN(timestamp) as min_ts,
+                MAX(timestamp) as max_ts
+            FROM market_bars
+            {where_clause}
+        """, tuple(params))
+        row = await cursor.fetchone()
+        return dict(row) if row else {}
 
