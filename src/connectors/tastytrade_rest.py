@@ -211,3 +211,23 @@ class TastytradeRestClient:
 
 class TastytradeClient(TastytradeRestClient):
     """Backward-compatible alias for TastytradeRestClient."""
+
+    def __init__(
+        self,
+        username: str,
+        password: str,
+        environment: str | None = None,
+        use_sandbox: bool | None = None,
+        **kwargs: Any,
+    ) -> None:
+        if environment is None:
+            if use_sandbox:
+                environment = "sandbox"
+            else:
+                environment = "live"
+        super().__init__(
+            username=username,
+            password=password,
+            environment=environment,
+            **kwargs,
+        )
