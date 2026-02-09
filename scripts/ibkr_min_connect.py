@@ -6,8 +6,8 @@ from src.core.asyncio_compat import ensure_event_loop, run_sync
 
 
 async def main() -> None:
-    util.startLoop()
     ensure_event_loop()
+    util.startLoop()
     ib = IB()
     ib.connect("127.0.0.1", 4002, clientId=42)
     print("Connected", ib.isConnected())

@@ -74,7 +74,7 @@ def load_secrets(secrets_path: str = "config/secrets.yaml") -> Dict[str, Any]:
     if not path.exists():
         raise ConfigurationError(
             f"Secrets file not found: {secrets_path}\n"
-            f"Copy config/secrets.template.yaml to config/secrets.yaml and add your API keys."
+            f"Copy config/secrets.example.yaml to config/secrets.yaml and add your API keys."
         )
     
     return load_yaml(str(path))

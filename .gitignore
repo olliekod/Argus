@@ -9,7 +9,7 @@ config/secrets.yaml
 .env
 *.env
 secrets.*
-!config/secrets.template.yaml
+!config/secrets.example.yaml
 
 # -----------------------------------------------------------------------------
 # Python

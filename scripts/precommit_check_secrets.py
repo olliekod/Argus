@@ -53,7 +53,7 @@ def main() -> int:
 
     pattern = re.compile("|".join(re.escape(key) for key in SUSPECT_KEYS), re.IGNORECASE)
     for path in staged_files:
-        if path.endswith("config/secrets.template.yaml"):
+        if path.endswith("config/secrets.example.yaml"):
             continue
         blob = _run_git(["show", f":{path}"])
         if not blob:
