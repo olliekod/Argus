@@ -181,25 +181,70 @@ class DataQualityReport:
         end_ts: float,
     ) -> List[Dict[str, Any]]:
         """Fetch bars from database."""
+        start_iso = datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat()
+        end_iso = datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat()
+
+        def _parse_timestamp(value: Any) -> float:
+            if value is None:
+                return 0.0
+            if isinstance(value, (int, float)):
+                return float(value)
+            if isinstance(value, str):
+                ts = value
+                if ts.endswith("Z"):
+                    ts = ts[:-1] + "+00:00"
+                try:
+                    parsed = datetime.fromisoformat(ts)
+                except ValueError:
+                    return 0.0
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                return parsed.timestamp()
+            return 0.0
+
+        def _normalize_row(row: Dict[str, Any]) -> Dict[str, Any]:
+            row = dict(row)
+            row["timestamp"] = _parse_timestamp(row.get("timestamp"))
+            event_ts = row.get("last_source_ts")
+            if event_ts is None:
+                event_ts = row.get("first_source_ts")
+            if event_ts is None:
+                event_ts = row.get("event_ts")
+            row["event_ts"] = _parse_timestamp(event_ts) if event_ts is not None else row["timestamp"]
+            return row
+
         try:
             # Use the database's bar query method
             # Assumes db has a method like get_bars_by_source
             if hasattr(self._db, "get_bars_by_source"):
-                return await self._db.get_bars_by_source(
+                rows = await self._db.get_bars_by_source(
                     source=provider,
                     symbol=symbol,
-                    start_timestamp=datetime.fromtimestamp(start_ts, tz=timezone.utc).isoformat(),
-                    end_timestamp=datetime.fromtimestamp(end_ts, tz=timezone.utc).isoformat(),
+                    start_timestamp=start_iso,
+                    end_timestamp=end_iso,
                 )
+                return [_normalize_row(row) for row in rows]
+            elif hasattr(self._db, "fetch_all"):
+                query = """
+                    SELECT timestamp, symbol, source, open, high, low, close,
+                           first_source_ts, last_source_ts
+                    FROM market_bars
+                    WHERE source = ? AND symbol = ?
+                    AND timestamp >= ? AND timestamp <= ?
+                    ORDER BY timestamp
+                """
+                rows = await self._db.fetch_all(query, (provider, symbol, start_iso, end_iso))
+                return [_normalize_row(row) for row in rows]
             elif hasattr(self._db, "query"):
                 # Fallback: direct query
                 query = """
-                    SELECT * FROM bars 
+                    SELECT * FROM market_bars 
                     WHERE source = ? AND symbol = ? 
                     AND timestamp >= ? AND timestamp <= ?
                     ORDER BY timestamp
                 """
-                return await self._db.query(query, (provider, symbol, start_ts, end_ts))
+                rows = await self._db.query(query, (provider, symbol, start_iso, end_iso))
+                return [_normalize_row(row) for row in rows]
             else:
                 logger.warning("Database doesn't support bar queries")
                 return []
@@ -243,7 +288,7 @@ class DataQualityReport:
         dict
             Complete report with metrics per provider+symbol.
         """
-        providers = providers or ["alpaca", "yahoo", "bybit"]
+        providers = providers or ["alpaca", "yahoo", "bybit", "tastytrade"]
         symbols = symbols or ["IBIT", "BITO"]
         
         report = {

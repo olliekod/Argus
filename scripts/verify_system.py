@@ -8,6 +8,7 @@ Run: python scripts/verify_system.py
 
 import sys
 import asyncio
+import time
 from pathlib import Path
 from datetime import datetime
 
@@ -34,6 +35,10 @@ def warn(msg):
 
 def info(msg):
     print(f"  {CYAN}[INFO]{RESET} {msg}")
+
+
+def _is_placeholder(value: str) -> bool:
+    return not value or value.startswith("PASTE_") or value.startswith("YOUR_")
 
 
 async def verify_system():
@@ -122,8 +127,110 @@ async def verify_system():
     
     print()
     
-    # === 3. DETECTORS ===
-    print("3. Detectors")
+    # === 3. TASTYTRADE ===
+    print("3. Tastytrade Verification")
+    print("-" * 40)
+
+    try:
+        from src.core.config import load_config, load_secrets
+        from src.connectors.tastytrade_rest import (
+            RetryConfig,
+            TastytradeError,
+            TastytradeRestClient,
+        )
+        from src.connectors.tastytrade_oauth import TastytradeOAuthClient
+        from src.core.options_normalize import normalize_tastytrade_nested_chain
+    except Exception as e:
+        fail("Tastytrade imports", str(e))
+        results["failed"] += 1
+    else:
+        try:
+            config = load_config()
+            secrets = load_secrets()
+        except Exception as e:
+            fail("Load config/secrets for Tastytrade", str(e))
+            results["failed"] += 1
+        else:
+            tasty_secrets = secrets.get("tastytrade", {})
+            username = tasty_secrets.get("username", "")
+            password = tasty_secrets.get("password", "")
+
+            if _is_placeholder(username) or _is_placeholder(password):
+                warn("Tastytrade credentials missing; skipping legacy auth test")
+                results["warnings"] += 1
+            else:
+                tt_config = config.get("tastytrade", {})
+                retry_cfg = tt_config.get("retries", {})
+                retry = RetryConfig(
+                    max_attempts=retry_cfg.get("max_attempts", 3),
+                    backoff_seconds=retry_cfg.get("backoff_seconds", 1.0),
+                    backoff_multiplier=retry_cfg.get("backoff_multiplier", 2.0),
+                )
+                client = TastytradeRestClient(
+                    username=username,
+                    password=password,
+                    environment=tt_config.get("environment", "live"),
+                    timeout_seconds=tt_config.get("timeout_seconds", 20),
+                    retries=retry,
+                )
+                try:
+                    start = time.perf_counter()
+                    client.login()
+                    ok(f"Tastytrade legacy login ({(time.perf_counter() - start):.2f}s)")
+                    results["passed"] += 1
+
+                    start = time.perf_counter()
+                    chain = client.get_nested_option_chains("SPY")
+                    normalized = normalize_tastytrade_nested_chain(chain)
+                    if normalized:
+                        ok(
+                            f"Tastytrade nested chain (SPY) ({len(normalized)} contracts, "
+                            f"{(time.perf_counter() - start):.2f}s)"
+                        )
+                        results["passed"] += 1
+                    else:
+                        fail("Tastytrade nested chain normalization (empty result)")
+                        results["failed"] += 1
+                except TastytradeError as e:
+                    fail("Tastytrade legacy auth/chain", str(e))
+                    results["failed"] += 1
+                finally:
+                    client.close()
+
+            oauth_cfg = secrets.get("tastytrade_oauth2", {}) or {}
+            client_id = oauth_cfg.get("client_id", "")
+            client_secret = oauth_cfg.get("client_secret", "")
+            refresh_token = oauth_cfg.get("refresh_token", "")
+            if (
+                _is_placeholder(client_id)
+                or _is_placeholder(client_secret)
+                or _is_placeholder(refresh_token)
+            ):
+                warn("Tastytrade OAuth refresh token missing; skipping OAuth test")
+                results["warnings"] += 1
+            else:
+                try:
+                    oauth_client = TastytradeOAuthClient(
+                        client_id=client_id,
+                        client_secret=client_secret,
+                        refresh_token=refresh_token,
+                    )
+                    token_result = oauth_client.refresh_access_token()
+                    ttl = (
+                        f"{token_result.expires_in}s"
+                        if token_result.expires_in is not None
+                        else "unknown TTL"
+                    )
+                    ok(f"Tastytrade OAuth refresh ({ttl})")
+                    results["passed"] += 1
+                except Exception as e:
+                    fail("Tastytrade OAuth refresh", str(e))
+                    results["failed"] += 1
+
+    print()
+
+    # === 4. DETECTORS ===
+    print("4. Detectors")
     print("-" * 40)
     
     try:
@@ -136,8 +243,8 @@ async def verify_system():
     
     print()
     
-    # === 4. ANALYSIS ===
-    print("4. Analysis Components")
+    # === 5. ANALYSIS ===
+    print("5. Analysis Components")
     print("-" * 40)
     
     try:
@@ -174,8 +281,8 @@ async def verify_system():
     
     print()
     
-    # === 5. ALERTS ===
-    print("5. Alerts")
+    # === 6. ALERTS ===
+    print("6. Alerts")
     print("-" * 40)
     
     try:
@@ -188,8 +295,8 @@ async def verify_system():
     
     print()
     
-    # === 6. ORCHESTRATOR ===
-    print("6. Main Orchestrator")
+    # === 7. ORCHESTRATOR ===
+    print("7. Main Orchestrator")
     print("-" * 40)
     
     try:
@@ -202,8 +309,8 @@ async def verify_system():
     
     print()
     
-    # === 7. CONFIG FILES ===
-    print("7. Configuration Files")
+    # === 8. CONFIG FILES ===
+    print("8. Configuration Files")
     print("-" * 40)
     
     config_dir = Path(__file__).parent.parent / "config"
@@ -229,8 +336,8 @@ async def verify_system():
     
     print()
     
-    # === 8. DATABASE ===
-    print("8. Database")
+    # === 9. DATABASE ===
+    print("9. Database")
     print("-" * 40)
     
     db_path = Path(__file__).parent.parent / "data" / "argus.db"
@@ -257,8 +364,8 @@ async def verify_system():
     
     print()
     
-    # === 9. LIVE DATA TESTS ===
-    print("9. Live Data Tests")
+    # === 10. LIVE DATA TESTS ===
+    print("10. Live Data Tests")
     print("-" * 40)
     
     # Test IBIT Options Client

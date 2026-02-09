@@ -8,6 +8,7 @@ from typing import Iterable, Optional
 from urllib.parse import urlencode
 
 from aiohttp import ClientSession, ClientTimeout
+import requests
 
 TASTYTRADE_AUTH_URL = "https://my.tastytrade.com/oauth/authorize"
 TASTYTRADE_TOKEN_URL = "https://api.tastyworks.com/oauth/token"
@@ -76,3 +77,60 @@ def prune_states(states: dict[str, float], *, ttl_s: float = 900.0) -> None:
     for key, ts in list(states.items()):
         if ts < cutoff:
             states.pop(key, None)
+
+
+@dataclass(frozen=True)
+class OAuthTokenResult:
+    access_token: str
+    refresh_token: Optional[str]
+    expires_in: Optional[int]
+    token_type: Optional[str]
+
+
+class TastytradeOAuthClient:
+    """Synchronous OAuth client for refreshing access tokens."""
+
+    def __init__(
+        self,
+        client_id: str,
+        client_secret: str,
+        refresh_token: str,
+        token_url: str = TASTYTRADE_TOKEN_URL,
+        timeout_s: float = 15.0,
+    ) -> None:
+        self._client_id = client_id
+        self._client_secret = client_secret
+        self._refresh_token = refresh_token
+        self._token_url = token_url
+        self._timeout_s = timeout_s
+
+    def refresh_access_token(self) -> OAuthTokenResult:
+        payload = {
+            "grant_type": "refresh_token",
+            "client_id": self._client_id,
+            "client_secret": self._client_secret,
+            "refresh_token": self._refresh_token,
+        }
+        response = requests.post(self._token_url, data=payload, timeout=self._timeout_s)
+        text = response.text
+        if response.status_code >= 400:
+            raise RuntimeError(
+                f"Tastytrade refresh failed ({response.status_code}): {text[:200]}"
+            )
+        try:
+            data = response.json()
+        except ValueError as exc:
+            raise RuntimeError("Invalid JSON response from token endpoint.") from exc
+
+        if isinstance(data.get("data"), dict):
+            data = data["data"]
+
+        access_token = data.get("access_token")
+        if not access_token:
+            raise RuntimeError("No access_token returned from refresh.")
+        return OAuthTokenResult(
+            access_token=access_token,
+            refresh_token=data.get("refresh_token"),
+            expires_in=data.get("expires_in"),
+            token_type=data.get("token_type"),
+        )
