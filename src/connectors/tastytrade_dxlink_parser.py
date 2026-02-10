@@ -69,6 +69,7 @@ class QuoteEvent:
     bid_time: Optional[int] = None
     ask_time: Optional[int] = None
     sequence: Optional[int] = None
+    receipt_time: Optional[int] = None
 
 
 @dataclass(frozen=True)
@@ -82,6 +83,8 @@ class GreeksEvent:
     theta: Optional[float] = None
     rho: Optional[float] = None
     vega: Optional[float] = None
+    timestamp: Optional[int] = None
+    receipt_time: Optional[int] = None
 
 
 # ---------------------------------------------------------------------------
@@ -146,22 +149,40 @@ def _zip_header_data(header: Sequence[str], data_row: Sequence[Any]) -> Dict[str
     return result
 
 
-def _parse_quote_dict(d: Dict[str, Any]) -> QuoteEvent:
+def _parse_quote_dict(d: Dict[str, Any], receipt_time: Optional[int] = None) -> QuoteEvent:
+    # Selection logic for timestamps: prefer specific bid/ask time, then general event/time.
+    # We must be careful as TT often sends 0 for bidTime/askTime on underlyings.
+    raw_time = d.get("bidTime")
+    if raw_time is None or raw_time == 0:
+        raw_time = d.get("askTime")
+    if raw_time is None or raw_time == 0:
+        raw_time = (
+            d.get("time") or 
+            d.get("eventTime") or 
+            d.get("event_time") or 
+            d.get("exchangeTime") or 
+            d.get("indexTime")
+        )
+        
+    ts = _safe_int(raw_time)
+    
     return QuoteEvent(
-        event_symbol=d.get("eventSymbol", ""),
+        event_symbol=d.get("eventSymbol") or d.get("symbol") or "",
         bid_price=_safe_float(d.get("bidPrice")),
         ask_price=_safe_float(d.get("askPrice")),
         bid_size=_safe_float(d.get("bidSize")),
         ask_size=_safe_float(d.get("askSize")),
-        bid_time=_safe_int(d.get("bidTime")),
-        ask_time=_safe_int(d.get("askTime")),
+        bid_time=ts,
+        ask_time=ts,
         sequence=_safe_int(d.get("sequence")),
+        receipt_time=receipt_time,
     )
+    
 
 
-def _parse_greeks_dict(d: Dict[str, Any]) -> GreeksEvent:
+def _parse_greeks_dict(d: Dict[str, Any], receipt_time: Optional[int] = None) -> GreeksEvent:
     return GreeksEvent(
-        event_symbol=d.get("eventSymbol", ""),
+        event_symbol=d.get("eventSymbol") or d.get("symbol") or "",
         price=_safe_float(d.get("price")),
         volatility=_safe_float(d.get("volatility")),
         delta=_safe_float(d.get("delta")),
@@ -169,6 +190,8 @@ def _parse_greeks_dict(d: Dict[str, Any]) -> GreeksEvent:
         theta=_safe_float(d.get("theta")),
         rho=_safe_float(d.get("rho")),
         vega=_safe_float(d.get("vega")),
+        timestamp=_safe_int(d.get("timestamp") or d.get("time")),
+        receipt_time=receipt_time,
     )
 
 
@@ -191,7 +214,7 @@ def _safe_int(v: Any) -> Optional[int]:
         return None
 
 
-def parse_feed_data(frame: DXLinkFrame) -> List[QuoteEvent | GreeksEvent]:
+def parse_feed_data(frame: DXLinkFrame, receipt_time: Optional[int] = None) -> List[QuoteEvent | GreeksEvent]:
     """Extract typed events from a FEED_DATA frame.
 
     Supports both:
@@ -213,9 +236,9 @@ def parse_feed_data(frame: DXLinkFrame) -> List[QuoteEvent | GreeksEvent]:
         if isinstance(item, dict):
             event_type = item.get("eventType")
             if event_type == "Quote":
-                events.append(_parse_quote_dict(item))
+                events.append(_parse_quote_dict(item, receipt_time))
             elif event_type == "Greeks":
-                events.append(_parse_greeks_dict(item))
+                events.append(_parse_greeks_dict(item, receipt_time))
             idx += 1
             continue
 
@@ -238,9 +261,9 @@ def parse_feed_data(frame: DXLinkFrame) -> List[QuoteEvent | GreeksEvent]:
             row = raw_data[idx]
             d = _zip_header_data(header, row)
             if event_type == "Quote":
-                events.append(_parse_quote_dict(d))
+                events.append(_parse_quote_dict(d, receipt_time))
             elif event_type == "Greeks":
-                events.append(_parse_greeks_dict(d))
+                events.append(_parse_greeks_dict(d, receipt_time))
             idx += 1
 
     return events

@@ -14,16 +14,19 @@ import argparse
 import asyncio
 import json
 import time
+import requests
 from datetime import datetime, timezone
 from typing import Any
 
-from scripts.tastytrade_health_audit import _load_tasty_client, audit_oauth, run_quotes_probe
+from scripts.tastytrade_health_audit import audit_oauth, run_quotes_audit
 from src.connectors.alpaca_client import AlpacaDataClient
 from src.connectors.yahoo_client import YahooFinanceClient
+from src.connectors.tastytrade_streamer import TastytradeStreamer
 from src.core.bus import EventBus
 from src.core.config import ConfigurationError, load_config, load_secrets
 from src.core.liquid_etf_universe import LIQUID_ETF_UNIVERSE
 from src.core.options_normalize import normalize_tastytrade_nested_chain
+from src.connectors.tastytrade_dxlink_parser import QuoteEvent
 
 BARS_WEIGHTS = {"success_rate": 0.5, "latency_p95": 0.25, "bar_age_p95": 0.25}
 BARS_THRESHOLDS = {"latency_ms": 3000.0, "bar_age_sec": 300.0}
@@ -131,23 +134,121 @@ async def _options_rows(config: dict[str, Any], secrets: dict[str, Any], duratio
     rows: list[dict[str, Any]] = []
     skips: list[str] = []
     try:
-        client = _load_tasty_client(config, secrets)
+        from scripts.tastytrade_health_audit import TastytradeRestClient # Local import to avoid circularity if any
+        creds = secrets.get("tastytrade", {})
+        client = TastytradeRestClient(
+            username=creds.get("username", ""),
+            password=creds.get("password", ""),
+            environment=config.get("tastytrade", {}).get("environment", "live")
+        )
+        client.login()
         oauth = audit_oauth(secrets)
     except Exception as exc:
         skips.append(f"tastytrade options skipped: {exc}")
         return rows, skips
 
     try:
-        for sym in LIQUID_ETF_UNIVERSE:
+        # We audit a subset to keep benchmark duration reasonable
+        subset = list(LIQUID_ETF_UNIVERSE)[:5]
+        for sym in subset:
             chain = client.get_nested_option_chains(sym)
             normalized = normalize_tastytrade_nested_chain(chain)
-            probe = await run_quotes_probe(sym, normalized, oauth["access_token"], duration=duration, greeks=greeks)
+            probe = await run_quotes_audit(sym, normalized, oauth["access_token"], duration=duration, greeks=greeks)
             rows.append({"provider": "tastytrade_dxlink", **probe})
     except Exception as exc:
-        skips.append(f"tastytrade options error: {exc}")
+        import traceback
+        skips.append(f"tastytrade options error: {exc}\n{traceback.format_exc()}")
     finally:
         client.close()
     return rows, skips
+
+
+async def _underlying_head_to_head(secrets: dict[str, Any], duration: int = 5) -> list[dict[str, Any]]:
+    """Compare Alpaca REST vs Tastytrade DXLink for underlying quotes."""
+    results = []
+    symbols = ["SPY", "IBIT", "QQQ"]
+    
+    # 1. Tastytrade DXLink
+    try:
+        from scripts.tastytrade_health_audit import audit_oauth
+        oauth = audit_oauth(secrets)
+        
+        quote_resp = requests.get(
+            "https://api.tastytrade.com/api-quote-tokens",
+            headers={"Authorization": f"Bearer {oauth['access_token']}"},
+            timeout=20
+        )
+        quote_resp.raise_for_status()
+        quote_data = quote_resp.json().get("data", {})
+        
+        streamer = TastytradeStreamer(quote_data["dxlink-url"], quote_data["token"], symbols)
+        events = await streamer.run_for(duration)
+        
+        tasty_lags = []
+        event_counts = {}
+        for e in events:
+            etype = type(e).__name__
+            event_counts[etype] = event_counts.get(etype, 0) + 1
+            if isinstance(e, QuoteEvent):
+                exch_ts = max(e.bid_time or 0, e.ask_time or 0)
+                if exch_ts > 0 and e.receipt_time:
+                    tasty_lags.append(e.receipt_time - exch_ts)
+        
+        if tasty_lags:
+            results.append({
+                "provider": "tastytrade_dxlink",
+                "type": "streaming",
+                "lag_p50": _pct(tasty_lags, 50),
+                "lag_p95": _pct(tasty_lags, 95),
+                "events": len(tasty_lags)
+            })
+        else:
+            # Fallback to general event count if no timestamps
+            results.append({
+                "provider": "tastytrade_dxlink",
+                "type": "streaming",
+                "lag_p50": None,
+                "lag_p95": None,
+                "events": len(events),
+                "note": "no exchange_ts in underlyings"
+            })
+    except Exception as e:
+        results.append({"provider": "tastytrade_dxlink", "error": str(e)})
+
+    # 2. Alpaca REST Snapshot
+    try:
+        key = secrets.get("alpaca", {}).get("api_key", "")
+        sec = secrets.get("alpaca", {}).get("api_secret", "")
+        if not _is_placeholder(key):
+            alpaca_lags = []
+            headers = {"APCA-API-KEY-ID": key, "APCA-API-SECRET-KEY": sec}
+            
+            for sym in symbols:
+                url = f"https://data.alpaca.markets/v2/stocks/{sym}/snapshot"
+                r = requests.get(url, headers=headers, timeout=5)
+                receipt = int(time.time() * 1000)
+                if r.status_code == 200:
+                    snap = r.json()
+                    q = snap.get("latestQuote")
+                    if q and q.get("t"):
+                        ts_dt = datetime.fromisoformat(q["t"].replace("Z", "+00:00"))
+                        ts_ms = int(ts_dt.timestamp() * 1000)
+                        lag = receipt - ts_ms
+                        # If lag is slightly negative, it's clock skew (Alpaca clock is ahead)
+                        # We use 0 as floor for freshness comparison.
+                        alpaca_lags.append(max(0, lag))
+            
+            results.append({
+                "provider": "alpaca_rest",
+                "type": "polling",
+                "lag_p50": _pct(alpaca_lags, 50),
+                "lag_p95": _pct(alpaca_lags, 95),
+                "events": len(alpaca_lags)
+            })
+    except Exception as e:
+        results.append({"provider": "alpaca_rest", "error": str(e)})
+        
+    return results
 
 
 def _build_scorecards(bar_rows: list[dict[str, Any]], option_rows: list[dict[str, Any]], greeks_enabled: bool) -> dict[str, Any]:
@@ -170,10 +271,10 @@ def _build_scorecards(bar_rows: list[dict[str, Any]], option_rows: list[dict[str
 
     options_card: list[dict[str, Any]] = []
     if option_rows:
-        missing = [float(r["missing_quote_rate"]) for r in option_rows]
-        lat = [float(r["time_to_first_option_quote_ms"]) for r in option_rows if r.get("time_to_first_option_quote_ms") is not None]
-        stale = [float(r["stale_age_sec_p95"]) for r in option_rows if r.get("stale_age_sec_p95") is not None]
-        spread = [float(r["spread_bps_p95"]) for r in option_rows if r.get("spread_bps_p95") is not None]
+        missing = [float(r["missing_rate"]) for r in option_rows]
+        lat = [float(r["handshake_latency"]) for r in option_rows if r.get("handshake_latency") is not None]
+        stale = [float(r["lag_p95"] / 1000.0) for r in option_rows if r.get("lag_p95") is not None]
+        spread = [float(r["spread_p95"]) for r in option_rows if r.get("spread_p95") is not None]
         row = {
             "provider": "tastytrade_dxlink",
             "time_to_first_quote_ms_p50": _pct(lat, 50),
@@ -183,13 +284,18 @@ def _build_scorecards(bar_rows: list[dict[str, Any]], option_rows: list[dict[str
             "spread_bps_p50": _pct(spread, 50),
             "spread_bps_p95": _pct(spread, 95),
         }
-        row["score"] = options_score(row["missing_quote_rate"] or 1.0, row["time_to_first_quote_ms_p95"], row["stale_p95"], row["spread_bps_p95"])
+        row["score"] = options_score(
+            row["missing_quote_rate"] if row["missing_quote_rate"] is not None else 1.0, 
+            row["time_to_first_quote_ms_p95"], 
+            row["stale_p95"], 
+            row["spread_bps_p95"]
+        )
         options_card.append(row)
 
     greeks_card: list[dict[str, Any]] = []
     if greeks_enabled and option_rows:
-        presence = [float(r.get("greeks_presence_rate", 0.0)) for r in option_rows]
-        stale = [float(r["stale_age_sec_p95"]) for r in option_rows if r.get("stale_age_sec_p95") is not None]
+        presence = [float(r.get("greeks_presence", 0.0)) for r in option_rows]
+        stale = [float(r["lag_p95"] / 1000.0) for r in option_rows if r.get("lag_p95") is not None]
         row = {
             "provider": "tastytrade_dxlink",
             "greeks_presence_rate": round(sum(presence) / len(presence), 4) if presence else 0.0,
@@ -254,21 +360,33 @@ def main() -> int:
 
     bar_rows, bar_skips = asyncio.run(_bars_rows(secrets))
     opt_rows, opt_skips = asyncio.run(_options_rows(config, secrets, args.duration, args.greeks))
+    head_to_head = asyncio.run(_underlying_head_to_head(secrets))
+    
     payload["skips"].extend(bar_skips + opt_skips)
     payload["bars_raw"] = bar_rows
     payload["options_raw"] = opt_rows
+    payload["head_to_head"] = head_to_head
     payload.update(_build_scorecards(bar_rows, opt_rows, args.greeks))
 
-    print("BarsScorecard:")
+    print("\nHead-to-Head Latency (Underlying):")
+    for res in head_to_head:
+        if "error" in res:
+            print(f"  {res['provider']}: ERROR {res['error']}")
+        else:
+            print(f"  {res['provider']} ({res['type']}): p50={res['lag_p50'] or 0:.0f}ms p95={res['lag_p95'] or 0:.0f}ms events={res['events']}")
+
+    print("\nBarsScorecard:")
     for row in payload["BarsScorecard"]["rows"]:
         print(f"  {row['provider']}: success={row['success_rate']:.2%} score={row['score']}")
     print("OptionsQuoteScorecard:")
     for row in payload["OptionsQuoteScorecard"]["rows"]:
-        print(f"  {row['provider']}: missing={row['missing_quote_rate']} score={row['score']}")
+        mqr = f"{row['missing_quote_rate']:.2%}" if row['missing_quote_rate'] is not None else "n/a"
+        print(f"  {row['provider']}: missing={mqr} score={row['score']}")
     if args.greeks:
         print("OptionsGreeksScorecard:")
         for row in payload["OptionsGreeksScorecard"]["rows"]:
-            print(f"  {row['provider']}: presence={row['greeks_presence_rate']} score={row['score']}")
+            gpr = f"{row['greeks_presence_rate']:.2%}" if row['greeks_presence_rate'] is not None else "n/a"
+            print(f"  {row['provider']}: presence={gpr} score={row['score']}")
     print(f"Composite: {payload['Composite']}")
 
     out = Path(args.json_out) if args.json_out else Path("logs") / f"provider_benchmark_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"

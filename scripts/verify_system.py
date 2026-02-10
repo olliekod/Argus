@@ -10,6 +10,7 @@ import sys
 import asyncio
 import time
 import argparse
+import requests
 from pathlib import Path
 from datetime import datetime
 
@@ -431,6 +432,46 @@ async def verify_system(deep: bool = False):
             results["warnings"] += 1
     except Exception as e:
         fail("BITO Price", str(e))
+        results["failed"] += 1
+
+    # Live DXLink Options Probe
+    try:
+        from src.connectors.tastytrade_oauth import TastytradeOAuthClient
+        from src.connectors.tastytrade_rest import TastytradeRestClient
+        from src.connectors.tastytrade_streamer import TastytradeStreamer
+        from src.core.options_normalize import normalize_tastytrade_nested_chain
+
+        conf = load_config()
+        sec = load_secrets()
+        tt_sec = sec.get("tastytrade_oauth2", {})
+        
+        oauth = TastytradeOAuthClient(tt_sec["client_id"], tt_sec["client_secret"], tt_sec["refresh_token"])
+        token = oauth.refresh_access_token().access_token
+        
+        # Get one token for DXLink
+        quote_resp = requests.get("https://api.tastytrade.com/api-quote-tokens", headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        quote_data = quote_resp.json()["data"]
+        
+        rest = TastytradeRestClient(sec["tastytrade"]["username"], sec["tastytrade"]["password"])
+        rest.login()
+        chain = rest.get_nested_option_chains("IBIT")
+        norm = normalize_tastytrade_nested_chain(chain)
+        rest.close()
+        
+        sample_syms = [c["meta"].get("streamer_symbol") or c["option_symbol"] for c in norm if c["expiry"] >= datetime.now().date().isoformat()][:5]
+        
+        streamer = TastytradeStreamer(quote_data["dxlink-url"], quote_data["token"], ["IBIT"] + sample_syms)
+        events = await streamer.run_for(5.0)
+        
+        received = len({e.event_symbol for e in events})
+        if received > 0:
+            ok(f"DXLink Live Probe: received data for {received} symbols (IBIT + options)")
+            results["passed"] += 1
+        else:
+            fail("DXLink Live Probe: zero events received in 5s")
+            results["failed"] += 1
+    except Exception as e:
+        fail("DXLink Live Probe", str(e))
         results["failed"] += 1
     
         # Test Alpaca bar pull (SPY default, universe with --deep)

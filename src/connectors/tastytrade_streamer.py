@@ -285,14 +285,12 @@ class TastytradeStreamer:
             "FEED_CONFIG",
         )
         accepted = frame.raw.get("acceptedEventTypes") or frame.raw.get("eventTypes") or []
-        if "Greeks" in self._event_types and "Greeks" not in accepted:
-            logger.warning(
-                "Greeks event type rejected by server; continuing with Quote only"
-            )
         self._phase = _Phase.FEED_SETUP_DONE
 
         # 6. FEED_SUBSCRIPTION
-        sub_types = [t for t in self._event_types if t in accepted] or ["Quote"]
+        # We try all requested types because some servers (Tastytrade) return 
+        # an empty accepted list even when Quote/Greeks are supported.
+        sub_types = self._event_types
         await self._send(
             build_feed_subscription(self._feed_channel, self._symbols, sub_types)
         )
@@ -363,7 +361,8 @@ class TastytradeStreamer:
             return
 
         if frame.msg_type == "FEED_DATA":
-            events = parse_feed_data(frame)
+            receipt_time = int(time.time() * 1000)
+            events = parse_feed_data(frame, receipt_time)
             for event in events:
                 self.events.append(event)
                 if self._on_event:
