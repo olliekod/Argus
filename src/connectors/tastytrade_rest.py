@@ -25,6 +25,13 @@ class TastytradeError(RuntimeError):
     """Raised when Tastytrade REST calls fail."""
 
 
+def ensure_bearer_prefix(token: str) -> str:
+    """Ensure the token starts with 'Bearer '."""
+    if token.startswith("Bearer "):
+        return token
+    return f"Bearer {token}"
+
+
 @dataclass(frozen=True)
 class RetryConfig:
     max_attempts: int = 3

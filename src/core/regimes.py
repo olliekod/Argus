@@ -16,6 +16,8 @@ from dataclasses import dataclass, field
 from enum import IntEnum
 from typing import Any, Dict
 
+from src.core.liquid_etf_universe import LIQUID_ETF_UNIVERSE
+
 # ═══════════════════════════════════════════════════════════════════════════
 # Schema Version
 # ═══════════════════════════════════════════════════════════════════════════

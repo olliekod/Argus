@@ -1,5 +1,5 @@
 """
-Unit tests for deterministic option-symbol sampling and Bearer prefix helper.
+Unit tests for deterministic option-symbol sampling, spot fallback, and Bearer prefix.
 
 Verify that given a fixed spot and normalized chain fixture, the sampled
 symbols list remains stable across invocations.
@@ -7,13 +7,9 @@ symbols list remains stable across invocations.
 
 from __future__ import annotations
 
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
-
-# ---------------------------------------------------------------------------
-# Import targets
-# ---------------------------------------------------------------------------
 
 import sys
 from pathlib import Path
@@ -22,7 +18,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from scripts.tastytrade_health_audit import sample_option_symbols
+from scripts.tastytrade_health_audit import _select_sampled_contracts, select_spot
 from src.connectors.tastytrade_rest import ensure_bearer_prefix
 
 
@@ -66,7 +62,6 @@ def _make_chain(
                     "exchange": None,
                     "meta": {"streamer_symbol": sym},
                 })
-    # Sort deterministically (matches normalize_tastytrade_nested_chain order)
     chain.sort(
         key=lambda item: (
             item.get("expiry") or "",
@@ -79,58 +74,103 @@ def _make_chain(
 
 
 # ---------------------------------------------------------------------------
-# Tests: deterministic sampling
+# Tests: deterministic sampling via _select_sampled_contracts
 # ---------------------------------------------------------------------------
 
-class TestSampleOptionSymbols:
+class TestSelectSampledContracts:
     def test_determinism(self):
         """Same input must always produce the same output."""
         chain = _make_chain()
-        result1 = sample_option_symbols(chain, spot=500.0)
-        result2 = sample_option_symbols(chain, spot=500.0)
-        assert result1 == result2
-        assert len(result1) > 0
+        now = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        r1 = _select_sampled_contracts(chain, 500.0, now)
+        r2 = _select_sampled_contracts(chain, 500.0, now)
+        assert [c["option_symbol"] for c in r1] == [c["option_symbol"] for c in r2]
+        assert len(r1) > 0
 
-    def test_respects_n_expiries(self):
+    def test_reversed_input_same_output(self):
+        """Order of input contracts must not matter."""
         chain = _make_chain()
-        result = sample_option_symbols(chain, spot=500.0, n_expiries=1)
-        expiries = {s.split("C")[0].split("P")[0] for s in result}
-        # All sampled symbols should be from the same (nearest) expiry
-        assert len(expiries) <= 1 or len(result) > 0
+        now = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        r1 = _select_sampled_contracts(chain, 500.0, now)
+        r2 = _select_sampled_contracts(list(reversed(chain)), 500.0, now)
+        assert [c["option_symbol"] for c in r1] == [c["option_symbol"] for c in r2]
 
-    def test_respects_n_strikes_per_side(self):
+    def test_respects_expiry_count(self):
         chain = _make_chain()
-        result = sample_option_symbols(chain, spot=500.0, n_expiries=1, n_strikes_per_side=2)
-        # With 2 strikes above and 2 below, up to 4 strikes * 2 rights = 8 syms
-        assert len(result) <= 8
+        now = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        result = _select_sampled_contracts(chain, 500.0, now, expiry_count=1)
+        expiries = {c["expiry"] for c in result}
+        assert len(expiries) == 1
+
+    def test_respects_strike_window(self):
+        chain = _make_chain()
+        now = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        result = _select_sampled_contracts(chain, 500.0, now, expiry_count=1, strike_window=1)
+        # Window of 1 = center +/- 1 = up to 3 strikes * 2 rights = 6
+        assert len(result) <= 6
 
     def test_no_spot_uses_median(self):
-        """When spot=None the sampler uses the median strike."""
         chain = _make_chain()
-        result = sample_option_symbols(chain, spot=None)
+        now = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        result = _select_sampled_contracts(chain, None, now)
         assert len(result) > 0
 
     def test_empty_chain(self):
-        assert sample_option_symbols([], spot=100.0) == []
+        now = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        assert _select_sampled_contracts([], 100.0, now) == []
 
     def test_expired_contracts_excluded(self):
-        """Contracts with past expiry should not appear."""
         yesterday = (date.today() - timedelta(days=1)).isoformat()
         chain = _make_chain(expiries=[yesterday])
-        result = sample_option_symbols(chain, spot=500.0)
+        now = datetime.now(timezone.utc)
+        result = _select_sampled_contracts(chain, 500.0, now)
         assert result == []
 
     def test_symbols_are_unique(self):
         chain = _make_chain()
-        result = sample_option_symbols(chain, spot=500.0)
-        assert len(result) == len(set(result))
+        now = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        result = _select_sampled_contracts(chain, 500.0, now)
+        syms = [c["option_symbol"] for c in result]
+        assert len(syms) == len(set(syms))
+
+    def test_max_contracts_respected(self):
+        chain = _make_chain()
+        now = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        result = _select_sampled_contracts(chain, 500.0, now, max_contracts=10)
+        assert len(result) <= 10
 
     def test_stability_across_runs(self):
-        """Run sampling 10 times; all results must be identical."""
         chain = _make_chain()
-        first = sample_option_symbols(chain, spot=505.0)
+        now = datetime(2025, 12, 1, tzinfo=timezone.utc)
+        first = [c["option_symbol"] for c in _select_sampled_contracts(chain, 505.0, now)]
         for _ in range(9):
-            assert sample_option_symbols(chain, spot=505.0) == first
+            assert [c["option_symbol"] for c in _select_sampled_contracts(chain, 505.0, now)] == first
+
+
+# ---------------------------------------------------------------------------
+# Tests: select_spot fallback hierarchy
+# ---------------------------------------------------------------------------
+
+class TestSelectSpot:
+    def test_dxlink_preferred(self):
+        spot = select_spot(
+            {"bidPrice": 99.0, "askPrice": 101.0, "eventTime": 1000.0, "_recv_ts": 1001.0},
+            123.0,
+            [90.0, 100.0, 110.0],
+        )
+        assert spot["spot_source"] == "dxlink"
+        assert spot["spot_value"] == 100.0
+
+    def test_cli_fallback(self):
+        spot = select_spot(None, 123.0, [90.0, 100.0, 110.0])
+        assert spot["spot_source"] == "cli"
+        assert spot["spot_value"] == 123.0
+
+    def test_median_strike_last_resort(self):
+        spot = select_spot(None, None, [90.0, 100.0, 110.0])
+        assert spot["spot_source"] == "median_strike"
+        assert spot["spot_value"] == 100.0
+        assert "WARNING" in spot["warning"]
 
 
 # ---------------------------------------------------------------------------

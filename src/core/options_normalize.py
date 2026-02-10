@@ -1,10 +1,22 @@
-"""Option chain normalization utilities."""
+"""Option chain normalization utilities.
+
+Multiplier handling
+-------------------
+The ``shares_per_contract`` (multiplier) is extracted from the API response
+and defaults to 100 when absent.  Non-standard multipliers (≠ 100) may
+occur after corporate actions (stock splits, mergers, special dividends).
+Such contracts are flagged in ``meta["non_standard_multiplier"]`` so
+downstream consumers can apply conservative handling.
+"""
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Dict, Iterable
 
 from src.connectors.tastytrade_rest import parse_rfc3339_nano
+
+logger = logging.getLogger(__name__)
 
 
 def _first_present(values: Iterable[Any]) -> Any:
@@ -160,6 +172,20 @@ def normalize_tastytrade_nested_chain(raw: Dict[str, Any]) -> list[Dict[str, Any
                         "chain_type": chain_type,
                     }
                     meta = {key: value for key, value in meta.items() if value is not None}
+
+                    # Flag non-standard multipliers (corporate actions)
+                    if shares_per_contract != 100:
+                        meta["non_standard_multiplier"] = True
+                        logger.warning(
+                            "Non-standard multiplier %d for %s %s %s %.2f%s — "
+                            "possible corporate action; verify before trading",
+                            shares_per_contract,
+                            underlying,
+                            expiry or "?",
+                            right_label,
+                            strike_value if strike_value is not None else 0.0,
+                            f" ({option_symbol})" if option_symbol else "",
+                        )
 
                     normalized.append(
                         {

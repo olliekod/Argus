@@ -14,6 +14,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+from src.core.liquid_etf_universe import LIQUID_ETF_UNIVERSE
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 #  A) Uptime from heartbeats

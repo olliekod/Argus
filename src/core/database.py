@@ -1390,15 +1390,35 @@ class Database:
         Delete old data based on retention policy.
         
         Args:
-            retention_days: Dict mapping table names to retention days
+            retention_days: Dict mapping table names to retention days.
+                Special keys:
+                - ``"option_chain_snapshots"`` — uses ``timestamp_ms``
+                  (epoch ms) instead of an ISO ``timestamp`` column.
+                - ``"option_quotes"`` — same ``timestamp_ms`` column.
+                - ``"paper_trades"`` — only deletes closed trades.
         """
+        # Tables with epoch-ms timestamps need a different cutoff
+        _MS_TABLES = {"option_chain_snapshots", "option_quotes"}
+
         for table, days in retention_days.items():
-            cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
-            await self._connection.execute(
-                f"DELETE FROM {table} WHERE timestamp < ?",
-                (cutoff,)
-            )
-            logger.info(f"Cleaned up {table} older than {days} days")
+            if table in ("paper_trades",):
+                continue  # handled below
+            if table in _MS_TABLES:
+                cutoff_ms = int(
+                    (datetime.now(timezone.utc) - timedelta(days=days)).timestamp() * 1000
+                )
+                await self._connection.execute(
+                    f"DELETE FROM {table} WHERE timestamp_ms < ?",
+                    (cutoff_ms,),
+                )
+                logger.info("Cleaned up %s older than %d days (cutoff_ms=%d)", table, days, cutoff_ms)
+            else:
+                cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+                await self._connection.execute(
+                    f"DELETE FROM {table} WHERE timestamp < ?",
+                    (cutoff,)
+                )
+                logger.info(f"Cleaned up {table} older than {days} days")
 
         await self._connection.commit()
 

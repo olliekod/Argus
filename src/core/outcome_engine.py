@@ -387,7 +387,9 @@ class OutcomeEngine:
         
         # Quantize all float metrics
         q = self.quantize_decimals
-        computed_at_ms = int(time.time() * 1000)
+        # Deterministic computed_at_ms: derived from window_end so reruns
+        # on the same bars produce the exact same output (no wall-clock).
+        computed_at_ms = window_end_ms
         
         return OutcomeResult(
             provider=provider,

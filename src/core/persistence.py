@@ -61,6 +61,7 @@ from .events import (
     TOPIC_SYSTEM_HEARTBEAT,
     TOPIC_SYSTEM_COMPONENT_HEARTBEAT,
 )
+from .liquid_etf_universe import LIQUID_ETF_UNIVERSE
 from .option_events import OptionChainSnapshotEvent, option_chain_to_dict
 from .signals import SignalEvent as Phase3SignalEvent, normalize_snapshot
 
@@ -70,6 +71,7 @@ logger = logging.getLogger("argus.persistence")
 _FLUSH_INTERVAL = 1.0
 _SIGNAL_QUEUE_MAXSIZE = 5_000     # Medium priority (signals)
 _TELEMETRY_QUEUE_MAXSIZE = 5_000  # Low priority (metrics / heartbeats)
+_SIGNAL_PUT_TIMEOUT_S = 0.5      # Block up to 0.5s before dropping signal
 _BAR_FLUSH_MAX_RETRIES = 3        # Retry failed bar flushes
 _WRITE_STOP = object()
 
@@ -233,7 +235,7 @@ class PersistenceManager:
         self._bars_writes_total: int = 0
         self._signals_writes_total: int = 0
         self._consecutive_failures: int = 0
-        self._start_time = time.time()
+        self._start_time = time.monotonic()
         self._signals_dropped_total: int = 0
         self._metrics_dropped_total: int = 0
         self._heartbeats_dropped_total: int = 0
@@ -489,7 +491,7 @@ class PersistenceManager:
         """Enter the ingestion-paused state.  Called under _bar_lock."""
         if not self._ingestion_paused:
             self._ingestion_paused = True
-            self._pause_entered_ts = time.time()
+            self._pause_entered_ts = time.monotonic()
             self._pause_log_ts = None  # allow immediate first log
             logger.critical(
                 "INGESTION PAUSED (%s): spool=%d bytes, %d bars pending, "
@@ -518,8 +520,8 @@ class PersistenceManager:
             buffer_ok = len(self._bar_buffer) < self._bar_buffer_max
 
             if spool_ok and buffer_ok:
-                pause_duration = time.time() - (
-                    self._pause_entered_ts or time.time()
+                pause_duration = time.monotonic() - (
+                    self._pause_entered_ts or time.monotonic()
                 )
                 rejected = self._bars_rejected_paused
                 self._ingestion_paused = False
@@ -656,22 +658,40 @@ class PersistenceManager:
                 self._bar_buffer.append(event)
 
     def _on_signal(self, event: SignalEvent) -> None:
-        """Persist signal via medium-priority queue."""
+        """Persist signal via medium-priority queue.
+
+        Uses a blocking put with a short timeout so that transient queue
+        pressure doesn't silently discard signals.  The signal is only
+        dropped after the timeout expires.
+        """
         try:
-            self._signal_queue.put_nowait(("signal", event))
+            self._signal_queue.put(("signal", event), timeout=_SIGNAL_PUT_TIMEOUT_S)
         except Full:
             with self._status_lock:
                 self._signals_dropped_total += 1
-            logger.warning("Signal queue full — dropping signal event")
+            logger.warning(
+                "Signal queue full after %.1fs backpressure — dropping signal event "
+                "(total dropped=%d)",
+                _SIGNAL_PUT_TIMEOUT_S,
+                self._signals_dropped_total,
+            )
 
     def _on_signal_raw(self, event: Phase3SignalEvent) -> None:
-        """Persist Phase 3 signals via medium-priority queue."""
+        """Persist Phase 3 signals via medium-priority queue.
+
+        Same backpressure strategy as ``_on_signal``.
+        """
         try:
-            self._signal_queue.put_nowait(("signal_raw", event))
+            self._signal_queue.put(("signal_raw", event), timeout=_SIGNAL_PUT_TIMEOUT_S)
         except Full:
             with self._status_lock:
                 self._signals_dropped_total += 1
-            logger.warning("Signal queue full — dropping raw signal event")
+            logger.warning(
+                "Signal queue full after %.1fs backpressure — dropping raw signal event "
+                "(total dropped=%d)",
+                _SIGNAL_PUT_TIMEOUT_S,
+                self._signals_dropped_total,
+            )
 
     def _on_heartbeat(self, event: HeartbeatEvent) -> None:
         """Flush buffered bars on heartbeat boundary."""
@@ -1065,7 +1085,7 @@ class PersistenceManager:
 
     def emit_heartbeat(self) -> ComponentHeartbeatEvent:
         """Create and publish a structured heartbeat for PersistenceManager."""
-        now = time.time()
+        now = time.monotonic()
         with self._status_lock:
             total_writes = self._bars_writes_total + self._metrics_writes_total + self._signals_writes_total
             lag_ms = self._last_persist_lag_ms
