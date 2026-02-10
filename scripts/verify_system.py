@@ -9,6 +9,7 @@ Run: python scripts/verify_system.py
 import sys
 import asyncio
 import time
+import argparse
 from pathlib import Path
 from datetime import datetime
 
@@ -48,7 +49,7 @@ def _contains_universe(config_symbols):
     missing = [sym for sym in LIQUID_ETF_UNIVERSE if sym not in symbols]
     return missing
 
-async def verify_system():
+async def verify_system(deep: bool = False):
     """Run all verification checks."""
     print("=" * 60)
     print("ARGUS SYSTEM VERIFICATION")
@@ -187,17 +188,23 @@ async def verify_system():
                     results["passed"] += 1
 
                     start = time.perf_counter()
-                    chain = client.get_nested_option_chains("SPY")
-                    normalized = normalize_tastytrade_nested_chain(chain)
-                    if normalized:
-                        ok(
-                            f"Tastytrade nested chain (SPY) ({len(normalized)} contracts, "
-                            f"{(time.perf_counter() - start):.2f}s)"
-                        )
-                        results["passed"] += 1
-                    else:
-                        fail("Tastytrade nested chain normalization (empty result)")
+                    tasty_symbols = list(LIQUID_ETF_UNIVERSE) if deep else ["SPY"]
+                    chain_fail = False
+                    for tsym in tasty_symbols:
+                        chain = client.get_nested_option_chains(tsym)
+                        normalized = normalize_tastytrade_nested_chain(chain)
+                        if normalized:
+                            ok(
+                                f"Tastytrade nested chain ({tsym}) ({len(normalized)} contracts, "
+                                f"{(time.perf_counter() - start):.2f}s)"
+                            )
+                        else:
+                            fail(f"Tastytrade nested chain normalization empty ({tsym})")
+                            chain_fail = True
+                    if chain_fail:
                         results["failed"] += 1
+                    else:
+                        results["passed"] += 1
                 except TastytradeError as e:
                     fail("Tastytrade legacy auth/chain", str(e))
                     results["failed"] += 1
@@ -426,7 +433,7 @@ async def verify_system():
         fail("BITO Price", str(e))
         results["failed"] += 1
     
-    # Test Alpaca representative bar pull for SPY
+        # Test Alpaca bar pull (SPY default, universe with --deep)
     try:
         from src.core.config import load_config, load_secrets
         from src.connectors.alpaca_client import AlpacaDataClient
@@ -439,30 +446,42 @@ async def verify_system():
             warn("Alpaca credentials missing; skipping SPY bars pull")
             results["warnings"] += 1
         else:
-            c = AlpacaDataClient(api_key=key, api_secret=sec, symbols=["SPY"], event_bus=EventBus(), poll_interval=60)
-            bars = await c.fetch_bars("SPY", limit=1)
+            test_symbols = list(LIQUID_ETF_UNIVERSE) if deep else ["SPY"]
+            c = AlpacaDataClient(api_key=key, api_secret=sec, symbols=test_symbols, event_bus=EventBus(), poll_interval=60)
+            ok_all = True
+            for tsym in test_symbols:
+                bars = await c.fetch_bars(tsym, limit=1)
+                if bars:
+                    ok(f"Alpaca {tsym} bars pull succeeded")
+                else:
+                    fail(f"Alpaca {tsym} bars pull returned empty")
+                    ok_all = False
             await c.close()
-            if bars:
-                ok("Alpaca SPY bars pull succeeded")
+            if ok_all:
                 results["passed"] += 1
             else:
-                fail("Alpaca SPY bars pull returned empty")
                 results["failed"] += 1
     except Exception as e:
         fail("Alpaca SPY bars pull", str(e))
         results["failed"] += 1
 
-    # Test Yahoo representative quote pull for SPY
+        # Test Yahoo quote pull (SPY default, universe with --deep)
     try:
         from src.connectors.yahoo_client import YahooFinanceClient
-        y = YahooFinanceClient(symbols=["SPY"])
-        quote = await y.get_quote("SPY")
+        test_symbols = list(LIQUID_ETF_UNIVERSE) if deep else ["SPY"]
+        y = YahooFinanceClient(symbols=test_symbols)
+        ok_all = True
+        for tsym in test_symbols:
+            quote = await y.get_quote(tsym)
+            if quote and quote.get("price"):
+                ok(f"Yahoo {tsym} quote pull succeeded")
+            else:
+                fail(f"Yahoo {tsym} quote pull returned empty")
+                ok_all = False
         await y.close()
-        if quote and quote.get("price"):
-            ok("Yahoo SPY quote pull succeeded")
+        if ok_all:
             results["passed"] += 1
         else:
-            fail("Yahoo SPY quote pull returned empty")
             results["failed"] += 1
     except Exception as e:
         fail("Yahoo SPY quote pull", str(e))
@@ -528,5 +547,8 @@ async def verify_system():
 
 
 if __name__ == "__main__":
-    success = asyncio.run(verify_system())
+    parser = argparse.ArgumentParser(description="Argus system verification")
+    parser.add_argument("--deep", action="store_true", help="Run full-universe provider checks")
+    args = parser.parse_args()
+    success = asyncio.run(verify_system(deep=args.deep))
     sys.exit(0 if success else 1)

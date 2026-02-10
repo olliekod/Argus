@@ -28,11 +28,20 @@ tastytrade:
 
 (Argus does not delete these rows automatically unless a separate retention job is run.)
 
+Guardrails:
+- `--max-snapshots-per-underlying-per-run` defaults to `200` and blocks oversized writes unless `--force` is used.
+- Snapshot writes are append-only and keep `provider` + `recv_ts` for provenance.
+
 ## Commands
 
 ```bash
 python scripts/verify_system.py
-python scripts/tastytrade_health_audit.py --symbol SPY --quotes --duration 15
-python scripts/tastytrade_health_audit.py --universe --quotes --duration 10
-python scripts/provider_benchmark.py --duration 10
+python scripts/verify_system.py --deep
+python scripts/tastytrade_health_audit.py --symbol SPY --quotes --duration 15 --json-out logs/spy.json
+python scripts/tastytrade_health_audit.py --universe --quotes --duration 10 --json-out logs/universe.json
+python scripts/provider_benchmark.py --duration 10 --json-out logs/bench.json
+python scripts/prune_option_snapshots.py --days 14
 ```
+
+
+Greeks scaffolding: pass `--greeks` (and optional `--require-greeks`) to request DXLink Greeks events. If unavailable, output includes a TODO fallback note for derived greeks via IV solve + Black–Scholes.

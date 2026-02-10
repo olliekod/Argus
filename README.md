@@ -85,9 +85,11 @@ Verification and audits:
 
 ```bash
 python scripts/verify_system.py
-python scripts/tastytrade_health_audit.py --symbol SPY --quotes --duration 15
-python scripts/tastytrade_health_audit.py --universe --quotes --duration 10
-python scripts/provider_benchmark.py --duration 10
+python scripts/verify_system.py --deep
+python scripts/tastytrade_health_audit.py --symbol SPY --quotes --duration 15 --json-out logs/spy.json
+python scripts/tastytrade_health_audit.py --universe --quotes --duration 10 --json-out logs/universe.json
+python scripts/provider_benchmark.py --duration 10 --json-out logs/bench.json
+python scripts/prune_option_snapshots.py --days 14
 ```
 
 Storage policy: Argus persists sampled options quote snapshots (deterministic slice) and does **not** persist full-chain option ticks.
