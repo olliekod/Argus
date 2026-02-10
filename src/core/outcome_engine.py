@@ -17,6 +17,8 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 
+from .sessions import get_session_regime
+
 logger = logging.getLogger(__name__)
 
 
@@ -72,6 +74,9 @@ class OutcomeResult:
     bars_found: int
     gap_count: int
     computed_at_ms: Optional[int]
+
+    # Session awareness (not persisted to DB — computed on-the-fly)
+    session_regime: str = ""
     
     def to_tuple(self) -> tuple:
         """Convert to tuple for batch DB insert."""
@@ -391,6 +396,9 @@ class OutcomeEngine:
         # on the same bars produce the exact same output (no wall-clock).
         computed_at_ms = window_end_ms
         
+        # Session regime at bar open (deterministic from timestamp)
+        session = get_session_regime("EQUITIES", bar.timestamp_ms)
+
         return OutcomeResult(
             provider=provider,
             symbol=symbol,
@@ -418,6 +426,7 @@ class OutcomeEngine:
             bars_found=bars_found,
             gap_count=gap_count,
             computed_at_ms=computed_at_ms,
+            session_regime=session,
         )
     
     def _compute_realized_vol(self, bars: List[BarData]) -> Optional[float]:
