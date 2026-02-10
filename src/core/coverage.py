@@ -355,7 +355,7 @@ def diagnose_coverage(
 EQUITY_PROVIDERS = {"yahoo", "alpaca"}
 
 # Known equity/ETF symbols (extend as needed)
-EQUITY_SYMBOLS = {"IBIT", "BITO", "SPY", "QQQ", "NVDA", "IWM", "TLT", "GLD"}
+EQUITY_SYMBOLS = set(LIQUID_ETF_UNIVERSE) | {"IBIT", "BITO", "NVDA"}
 
 
 def is_likely_equity(provider: str, symbol: str) -> bool:
