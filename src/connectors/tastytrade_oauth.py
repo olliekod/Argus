@@ -10,7 +10,7 @@ from urllib.parse import urlencode
 from aiohttp import ClientSession, ClientTimeout
 import requests
 
-TASTYTRADE_AUTH_URL = "https://my.tastytrade.com/oauth/authorize"
+TASTYTRADE_AUTH_URL = "https://my.tastytrade.com/auth.html"
 TASTYTRADE_TOKEN_URL = "https://api.tastyworks.com/oauth/token"
 
 

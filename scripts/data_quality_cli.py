@@ -64,17 +64,22 @@ async def main():
     args = parser.parse_args()
     
     # Load config and initialize database
-    config, secrets = load_all_config(args.config_dir)
+    full_config = load_all_config(args.config_dir)
+    config = full_config
     db_path = config.get("database", {}).get("path", "data/argus.db")
     db = Database(db_path)
+    await db.connect()
     
-    # Generate report
-    report = DataQualityReport(db)
-    result = await report.generate_report(
-        providers=args.providers,
-        symbols=args.symbols,
-        days=args.days,
-    )
+    try:
+        # Generate report
+        report = DataQualityReport(db)
+        result = await report.generate_report(
+            providers=args.providers,
+            symbols=args.symbols,
+            days=args.days,
+        )
+    finally:
+        await db.close()
     
     # Format output
     output = json.dumps(result, indent=2)

@@ -184,6 +184,7 @@ class ArgusWebDashboard:
         self._app.router.add_post('/api/command', self._handle_command)
         self._app.router.add_get('/oauth/tastytrade/start', self._handle_tastytrade_oauth_start)
         self._app.router.add_get('/oauth/tastytrade/callback', self._handle_tastytrade_oauth_callback)
+        self._app.router.add_get('/callback', self._handle_tastytrade_oauth_callback)
 
     def set_callbacks(
         self,
