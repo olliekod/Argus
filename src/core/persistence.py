@@ -107,7 +107,7 @@ def _infer_source_class_from_symbol(symbol: Optional[str]) -> Optional[str]:
     symbol_upper = symbol.upper()
     if symbol_upper.endswith("-INDEX") or symbol_upper.endswith("INDEX"):
         return _DERIBIT_LAG_CLASS
-    if symbol_upper in {"IBIT", "BITO", "SPY", "QQQ", "NVDA"}:
+    if symbol_upper in (set(LIQUID_ETF_UNIVERSE) | {"IBIT", "BITO", "NVDA"}):
         return _EQUITIES_LAG_CLASS
     crypto_markers = ("USDT", "USDC", "PERP")
     if any(marker in symbol_upper for marker in crypto_markers) or symbol_upper.endswith("USD"):

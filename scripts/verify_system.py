@@ -15,6 +15,8 @@ from datetime import datetime
 # Add project root
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
+from src.core.liquid_etf_universe import LIQUID_ETF_UNIVERSE
+
 # Colors for output
 GREEN = "\033[92m"
 RED = "\033[91m"
@@ -40,6 +42,11 @@ def info(msg):
 def _is_placeholder(value: str) -> bool:
     return not value or value.startswith("PASTE_") or value.startswith("YOUR_")
 
+
+def _contains_universe(config_symbols):
+    symbols = {str(sym).upper() for sym in (config_symbols or [])}
+    missing = [sym for sym in LIQUID_ETF_UNIVERSE if sym not in symbols]
+    return missing
 
 async def verify_system():
     """Run all verification checks."""
@@ -333,6 +340,27 @@ async def verify_system():
     else:
         warn("thresholds.yaml missing (using defaults)")
         results["warnings"] += 1
+
+    try:
+        from src.core.config import load_config
+        cfg = load_config()
+        alpaca_missing = _contains_universe(cfg.get("exchanges", {}).get("alpaca", {}).get("symbols", []))
+        yahoo_missing = _contains_universe(cfg.get("exchanges", {}).get("yahoo", {}).get("symbols", []))
+        if not alpaca_missing:
+            ok("Alpaca symbol config includes full liquid ETF universe")
+            results["passed"] += 1
+        else:
+            fail("Alpaca symbol config missing universe tickers", str(alpaca_missing))
+            results["failed"] += 1
+        if not yahoo_missing:
+            ok("Yahoo symbol config includes full liquid ETF universe")
+            results["passed"] += 1
+        else:
+            fail("Yahoo symbol config missing universe tickers", str(yahoo_missing))
+            results["failed"] += 1
+    except Exception as e:
+        fail("Universe configuration check", str(e))
+        results["failed"] += 1
     
     print()
     
@@ -398,6 +426,48 @@ async def verify_system():
         fail("BITO Price", str(e))
         results["failed"] += 1
     
+    # Test Alpaca representative bar pull for SPY
+    try:
+        from src.core.config import load_config, load_secrets
+        from src.connectors.alpaca_client import AlpacaDataClient
+        from src.core.bus import EventBus
+        cfg = load_config()
+        secrets = load_secrets()
+        key = secrets.get("alpaca", {}).get("api_key")
+        sec = secrets.get("alpaca", {}).get("api_secret")
+        if _is_placeholder(key or "") or _is_placeholder(sec or ""):
+            warn("Alpaca credentials missing; skipping SPY bars pull")
+            results["warnings"] += 1
+        else:
+            c = AlpacaDataClient(api_key=key, api_secret=sec, symbols=["SPY"], event_bus=EventBus(), poll_interval=60)
+            bars = await c.fetch_bars("SPY", limit=1)
+            await c.close()
+            if bars:
+                ok("Alpaca SPY bars pull succeeded")
+                results["passed"] += 1
+            else:
+                fail("Alpaca SPY bars pull returned empty")
+                results["failed"] += 1
+    except Exception as e:
+        fail("Alpaca SPY bars pull", str(e))
+        results["failed"] += 1
+
+    # Test Yahoo representative quote pull for SPY
+    try:
+        from src.connectors.yahoo_client import YahooFinanceClient
+        y = YahooFinanceClient(symbols=["SPY"])
+        quote = await y.get_quote("SPY")
+        await y.close()
+        if quote and quote.get("price"):
+            ok("Yahoo SPY quote pull succeeded")
+            results["passed"] += 1
+        else:
+            fail("Yahoo SPY quote pull returned empty")
+            results["failed"] += 1
+    except Exception as e:
+        fail("Yahoo SPY quote pull", str(e))
+        results["failed"] += 1
+
     # Test sentiment
     try:
         from src.core.sentiment_collector import SentimentCollector
@@ -441,8 +511,8 @@ async def verify_system():
         print(f"{GREEN}System is ready for paper trading!{RESET}")
         print()
         print("Configured Tickers:")
-        print(f"  • IBIT (BlackRock Bitcoin ETF)")
-        print(f"  • BITO (ProShares Bitcoin ETF)")
+        print("  • IBIT, BITO")
+        print("  • Liquid ETF universe: " + ", ".join(LIQUID_ETF_UNIVERSE))
         print()
         print("Next steps:")
         print("  1. Double-click 'Start Argus.vbs' to start monitoring")

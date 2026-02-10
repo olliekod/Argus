@@ -4,7 +4,7 @@ Argus is a real-time market data ingestion and strategy research platform. It co
 
 ## What It Does:
 
-Argus pulls market data from multiple sources: crypto perpetuals via Bybit, options IV via Deribit, and ETFs (IBIT, BITO) via Alpaca and Yahoo. Raw ticks are normalized and aggregated into 1-minute OHLCV bars. A feature builder computes returns, volatility, and jump scores. A regime detector classifies each symbol and the overall market (trend, volatility state, session). Detectors look for specific setups (e.g., BTC IV spike plus IBIT drawdown) and emit signals. A paper trader farm runs hundreds of thousands of virtual traders with different parameter sets to evaluate which strategies would have performed well.
+Argus pulls market data from multiple sources: crypto perpetuals via Bybit, options IV via Deribit, and ETFs (IBIT, BITO + liquid ETF universe: SPY, QQQ, IWM, DIA, TLT, GLD, XLF, XLK, XLE, SMH) via Alpaca and Yahoo. Raw ticks are normalized and aggregated into 1-minute OHLCV bars. A feature builder computes returns, volatility, and jump scores. A regime detector classifies each symbol and the overall market (trend, volatility state, session). Detectors look for specific setups (e.g., BTC IV spike plus IBIT drawdown) and emit signals. A paper trader farm runs hundreds of thousands of virtual traders with different parameter sets to evaluate which strategies would have performed well.
 
 Determinism is central. Same tape input produces same bars, same regimes, same signals. No randomness or wall-clock dependency in the core pipeline. A tape recorder captures events for replay and backtesting.
 
@@ -75,6 +75,22 @@ python scripts\tastytrade_oauth_bootstrap.py
 This opens (or prints) `http://127.0.0.1:8777/oauth/tastytrade/start`, which redirects you to the Tastytrade consent screen. After approval, you are sent back to `/oauth/tastytrade/callback` and the refresh token is saved to `config/secrets.yaml` under `tastytrade_oauth2.refresh_token`.
 
 To re-run the flow (for example after revoking credentials), simply run the helper again and complete the browser step.
+
+
+## Liquid ETF Universe Operations
+
+Universe tickers: `SPY, QQQ, IWM, DIA, TLT, GLD, XLF, XLK, XLE, SMH`.
+
+Verification and audits:
+
+```bash
+python scripts/verify_system.py
+python scripts/tastytrade_health_audit.py --symbol SPY --quotes --duration 15
+python scripts/tastytrade_health_audit.py --universe --quotes --duration 10
+python scripts/provider_benchmark.py --duration 10
+```
+
+Storage policy: Argus persists sampled options quote snapshots (deterministic slice) and does **not** persist full-chain option ticks.
 
 ## Pre-commit secrets guard
 
