@@ -165,6 +165,26 @@ DEFAULT_REGIME_THRESHOLDS = {
 
     # Warmup requirements
     "warmup_bars": 30,
+
+    # Robustness controls (disabled by default for backward compatibility)
+    "vol_hysteresis_enabled": False,
+    "vol_hysteresis_band": 0.0,
+    "trend_hysteresis_enabled": False,
+    "trend_hysteresis_slope_band": 0.0,
+    "trend_hysteresis_strength_band": 0.0,
+    "min_dwell_bars": 0,
+
+    # Gap-aware confidence/warmup behavior (neutral defaults preserve old behavior)
+    "gap_confidence_decay_threshold_ms": 0,
+    "gap_confidence_decay_multiplier": 1.0,
+    "gap_reset_window_threshold_ms": 0,
+
+    # Quote-derived liquidity (disabled by default)
+    "quote_liquidity_enabled": False,
+    "quote_history_maxlen": 512,
+
+    # Trend acceleration metric (classification impact disabled by default)
+    "trend_accel_classification_enabled": False,
 }
 
 
@@ -222,6 +242,7 @@ class SymbolRegimeEvent:
 
     # Traceability
     config_hash: str
+    trend_accel: float = 0.0    # optional curvature/acceleration metric
 
     v: int = REGIME_SCHEMA_VERSION
 
@@ -253,7 +274,8 @@ class MarketRegimeEvent:
     
     # Traceability
     config_hash: str
-    
+    metrics_json: str = ""
+
     v: int = REGIME_SCHEMA_VERSION
 
 
@@ -322,6 +344,7 @@ def symbol_regime_to_dict(event: SymbolRegimeEvent) -> Dict[str, Any]:
         "rsi": _round_float(event.rsi),
         "spread_pct": _round_float(event.spread_pct),
         "volume_pctile": _round_float(event.volume_pctile),
+        "trend_accel": _round_float(event.trend_accel),
         "confidence": _round_float(event.confidence),
         "is_warm": event.is_warm,
         "data_quality_flags": event.data_quality_flags,
@@ -353,6 +376,7 @@ def dict_to_symbol_regime(d: Dict[str, Any]) -> SymbolRegimeEvent:
         rsi=float(d["rsi"]),
         spread_pct=float(d.get("spread_pct", 0.0)),
         volume_pctile=float(d.get("volume_pctile", 0.0)),
+        trend_accel=float(d.get("trend_accel", 0.0)),
         confidence=float(d["confidence"]),
         is_warm=bool(d["is_warm"]),
         data_quality_flags=int(d["data_quality_flags"]),
@@ -373,13 +397,14 @@ def market_regime_to_dict(event: MarketRegimeEvent) -> Dict[str, Any]:
         "confidence": _round_float(event.confidence),
         "data_quality_flags": event.data_quality_flags,
         "config_hash": event.config_hash,
+        "metrics_json": event.metrics_json,
         "v": event.v,
     }
 
 
 def dict_to_market_regime(d: Dict[str, Any]) -> MarketRegimeEvent:
     """Deserialize dict to MarketRegimeEvent.
-    
+
     Backwards compatible: accepts float timestamps and converts to int ms.
     """
     return MarketRegimeEvent(
@@ -391,6 +416,7 @@ def dict_to_market_regime(d: Dict[str, Any]) -> MarketRegimeEvent:
         confidence=float(d["confidence"]),
         data_quality_flags=int(d["data_quality_flags"]),
         config_hash=str(d["config_hash"]),
+        metrics_json=str(d.get("metrics_json", "")),
         v=int(d.get("v", REGIME_SCHEMA_VERSION)),
     )
 

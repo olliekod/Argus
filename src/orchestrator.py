@@ -44,6 +44,7 @@ from .core.bar_builder import BarBuilder
 from .core.persistence import PersistenceManager
 from .core.feature_builder import FeatureBuilder
 from .core.regime_detector import RegimeDetector
+from .core.market_regime_detector import MarketRegimeDetector
 from .core.gap_risk_tracker import GapRiskTracker
 from .core.reddit_monitor import RedditMonitor
 from .core.conditions_monitor import ConditionsMonitor
@@ -149,6 +150,7 @@ class ArgusOrchestrator:
         self.query_layer: Optional[QueryLayer] = None
         self.feature_builder: Optional[FeatureBuilder] = None
         self.regime_detector: Optional[RegimeDetector] = None
+        self.market_regime_detector: Optional[MarketRegimeDetector] = None
         self._provider_names = [
             "bybit",
             "deribit",
@@ -402,6 +404,8 @@ class ArgusOrchestrator:
         # Phase 2c: Intelligence pipeline (downstream-only, safe in collector mode)
         self.feature_builder = FeatureBuilder(self.event_bus)
         self.regime_detector = RegimeDetector(self.event_bus)
+        risk_basket = self.config.get("system", {}).get("risk_basket_symbols", [])
+        self.market_regime_detector = MarketRegimeDetector(self.event_bus, risk_basket_symbols=risk_basket)
         self._wire_activity_tracking()
         self._phase("event_bus_wired")
 
