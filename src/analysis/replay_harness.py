@@ -55,8 +55,41 @@ from typing import Any, Callable, Dict, List, Literal, Optional, Sequence
 
 from src.core.outcome_engine import BarData, OutcomeResult
 from src.core.sessions import get_session_regime
+from src.core.quote_freshness import is_quote_fresh
 
 logger = logging.getLogger("argus.replay_harness")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Market Data Snapshot (for data availability barrier)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass(frozen=True)
+class MarketDataSnapshot:
+    """Point-in-time market data snapshot with receipt timestamp.
+
+    Used by the replay harness to enforce the data availability barrier:
+    strategies must only see snapshots whose ``recv_ts_ms`` is <= ``sim_ts_ms``.
+
+    This prevents strategies from accessing quotes or Greeks that had not
+    yet been received at simulation time — making delayed feeds
+    realistically delayed in replay.
+    """
+    symbol: str
+    recv_ts_ms: int           # local receipt time (epoch ms)
+    bid: float = 0.0
+    ask: float = 0.0
+    bid_size: int = 0
+    ask_size: int = 0
+    quote_ts_ms: int = 0      # provider timestamp (may be 0)
+    # Greeks (optional)
+    delta: Optional[float] = None
+    gamma: Optional[float] = None
+    theta: Optional[float] = None
+    vega: Optional[float] = None
+    iv: Optional[float] = None
+    greeks_ts_ms: int = 0     # greeks event timestamp
+    source: str = ""
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -338,6 +371,8 @@ class ReplayConfig:
     market: str = "EQUITIES"
     # Contract multiplier for options
     multiplier: int = 100
+    # Maximum quote age for execution (ms) — used in snapshot barrier
+    max_quote_age_ms: int = 120_000
 
 
 @dataclass
@@ -388,6 +423,7 @@ class ReplayHarness:
         strategy: ReplayStrategy,
         execution_model: Any,  # ExecutionModel — avoid circular import
         config: Optional[ReplayConfig] = None,
+        snapshots: Optional[List[MarketDataSnapshot]] = None,
     ) -> None:
         self._bars = sorted(bars, key=lambda b: b.timestamp_ms)
         self._cfg = config or ReplayConfig()
@@ -408,6 +444,11 @@ class ReplayHarness:
             key=lambda x: x[0],
         )
 
+        # Market data snapshots sorted by recv_ts_ms for availability barrier
+        self._snapshots_sorted: List[MarketDataSnapshot] = sorted(
+            snapshots or [], key=lambda s: s.recv_ts_ms
+        )
+
         self._session_counts: Dict[str, int] = {}
 
     def run(self) -> ReplayResult:
@@ -416,16 +457,21 @@ class ReplayHarness:
         This is the core of the backtester.  It enforces:
         1. Bars are processed in strict chronological order.
         2. Outcomes are only visible when ``sim_time >= window_end_ms``.
-        3. Strategy only sees data it could have observed at that point.
+        3. Market data snapshots are only visible when
+           ``sim_time >= snapshot.recv_ts_ms`` (data availability barrier).
+        4. Strategy only sees data it could have observed at that point.
         """
         bar_duration_ms = self._cfg.bar_duration_seconds * 1000
         visible_outcomes: Dict[int, OutcomeResult] = {}
+        visible_snapshots: List[MarketDataSnapshot] = []
         outcome_cursor = 0  # pointer into _outcomes_sorted
+        snapshot_cursor = 0  # pointer into _snapshots_sorted
         outcomes_used = 0
 
         logger.info(
-            "Replay starting: %d bars, %d outcomes, strategy=%s",
-            len(self._bars), len(self._outcomes_sorted), self._strategy.strategy_id,
+            "Replay starting: %d bars, %d outcomes, %d snapshots, strategy=%s",
+            len(self._bars), len(self._outcomes_sorted),
+            len(self._snapshots_sorted), self._strategy.strategy_id,
         )
 
         for bar in self._bars:
@@ -443,12 +489,33 @@ class ReplayHarness:
                 outcome_cursor += 1
                 outcomes_used += 1
 
+            # ── Data Availability Barrier: release snapshots received by now ──
+            while snapshot_cursor < len(self._snapshots_sorted):
+                snap = self._snapshots_sorted[snapshot_cursor]
+                if snap.recv_ts_ms > sim_ts_ms:
+                    break  # Not yet received at sim time
+                visible_snapshots.append(snap)
+                snapshot_cursor += 1
+
             # ── Session regime ───────────────────────────────────────────
             session = get_session_regime(self._cfg.market, sim_ts_ms)
             self._session_counts[session] = self._session_counts.get(session, 0) + 1
 
             # ── Strategy evaluation ──────────────────────────────────────
-            self._strategy.on_bar(bar, sim_ts_ms, session, visible_outcomes)
+            # Pass visible_snapshots only if there are snapshots — this
+            # maintains backward compat with old strategies that don't
+            # accept the parameter.
+            if self._snapshots_sorted:
+                try:
+                    self._strategy.on_bar(
+                        bar, sim_ts_ms, session, visible_outcomes,
+                        visible_snapshots=list(visible_snapshots),
+                    )
+                except TypeError:
+                    # Old strategy doesn't accept visible_snapshots
+                    self._strategy.on_bar(bar, sim_ts_ms, session, visible_outcomes)
+            else:
+                self._strategy.on_bar(bar, sim_ts_ms, session, visible_outcomes)
             intents = self._strategy.generate_intents(sim_ts_ms)
 
             # ── Execution ────────────────────────────────────────────────
@@ -511,6 +578,7 @@ class ReplayHarness:
             bid_size=0,        # unknown → skip size check
             ask_size=0,
             quote_ts_ms=sim_ts_ms,
+            recv_ts_ms=sim_ts_ms,
             symbol=intent.symbol,
         )
 
@@ -523,6 +591,7 @@ class ReplayHarness:
                 bid_size=q.get("bid_size", 0),
                 ask_size=q.get("ask_size", 0),
                 quote_ts_ms=q.get("quote_ts_ms", sim_ts_ms),
+                recv_ts_ms=q.get("recv_ts_ms", sim_ts_ms),
                 symbol=intent.symbol,
             )
 
