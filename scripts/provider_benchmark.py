@@ -186,31 +186,49 @@ async def _underlying_head_to_head(secrets: dict[str, Any], duration: int = 5) -
         
         tasty_lags = []
         event_counts = {}
+        events_missing_ts = 0
+        first_event_time = None
         for e in events:
             etype = type(e).__name__
             event_counts[etype] = event_counts.get(etype, 0) + 1
             if isinstance(e, QuoteEvent):
+                if first_event_time is None and hasattr(e, 'receipt_time') and e.receipt_time:
+                    first_event_time = e.receipt_time
                 exch_ts = max(e.bid_time or 0, e.ask_time or 0)
                 if exch_ts > 0 and e.receipt_time:
                     tasty_lags.append(e.receipt_time - exch_ts)
-        
+                elif exch_ts <= 0:
+                    events_missing_ts += 1
+
+        total_events = sum(event_counts.values())
+        # Receipt-time based metrics: quote_update_rate, quote_age
+        quote_update_rate = total_events / max(1.0, duration) if total_events > 0 else 0.0
+
         if tasty_lags:
             results.append({
                 "provider": "tastytrade_dxlink",
                 "type": "streaming",
                 "lag_p50": _pct(tasty_lags, 50),
                 "lag_p95": _pct(tasty_lags, 95),
-                "events": len(tasty_lags)
+                "events": len(tasty_lags),
+                "total_events": total_events,
+                "events_missing_ts": events_missing_ts,
+                "timestamp_missing_rate": round(events_missing_ts / max(1, total_events), 4),
+                "quote_update_rate": round(quote_update_rate, 2),
             })
         else:
-            # Fallback to general event count if no timestamps
+            # All timestamps are zero — report receipt-based metrics only
             results.append({
                 "provider": "tastytrade_dxlink",
                 "type": "streaming",
                 "lag_p50": None,
                 "lag_p95": None,
-                "events": len(events),
-                "note": "no exchange_ts in underlyings"
+                "events": total_events,
+                "total_events": total_events,
+                "events_missing_ts": events_missing_ts,
+                "timestamp_missing_rate": round(events_missing_ts / max(1, total_events), 4),
+                "quote_update_rate": round(quote_update_rate, 2),
+                "note": "provider timestamps zero — latency not measurable"
             })
     except Exception as e:
         results.append({"provider": "tastytrade_dxlink", "error": str(e)})
@@ -273,21 +291,35 @@ def _build_scorecards(bar_rows: list[dict[str, Any]], option_rows: list[dict[str
     if option_rows:
         missing = [float(r["missing_rate"]) for r in option_rows]
         lat = [float(r["handshake_latency"]) for r in option_rows if r.get("handshake_latency") is not None]
-        stale = [float(r["lag_p95"] / 1000.0) for r in option_rows if r.get("lag_p95") is not None]
+        # Use receipt-time-based staleness — filter out rows with zero/missing lag
+        stale = [float(r["lag_p95"] / 1000.0) for r in option_rows if r.get("lag_p95") is not None and r["lag_p95"] > 0]
         spread = [float(r["spread_p95"]) for r in option_rows if r.get("spread_p95") is not None]
+
+        # Count events with missing timestamps
+        total_events = sum(int(r.get("total_events", 0)) for r in option_rows)
+        events_missing_ts = sum(int(r.get("events_missing_ts", 0)) for r in option_rows)
+        ts_missing_rate = events_missing_ts / max(1, total_events)
+
+        # Quote update rate (events/sec)
+        total_duration_sec = sum(float(r.get("duration_sec", 0)) for r in option_rows)
+        quote_update_rate = total_events / max(1.0, total_duration_sec)
+
         row = {
             "provider": "tastytrade_dxlink",
             "time_to_first_quote_ms_p50": _pct(lat, 50),
             "time_to_first_quote_ms_p95": _pct(lat, 95),
             "missing_quote_rate": round(sum(missing) / len(missing), 4) if missing else None,
-            "stale_p95": _pct(stale, 95),
+            "quote_update_rate": round(quote_update_rate, 2),
+            "quote_age_p50": _pct(stale, 50),
+            "quote_age_p95": _pct(stale, 95),
             "spread_bps_p50": _pct(spread, 50),
             "spread_bps_p95": _pct(spread, 95),
+            "timestamp_missing_rate": round(ts_missing_rate, 4),
         }
         row["score"] = options_score(
-            row["missing_quote_rate"] if row["missing_quote_rate"] is not None else 1.0, 
-            row["time_to_first_quote_ms_p95"], 
-            row["stale_p95"], 
+            row["missing_quote_rate"] if row["missing_quote_rate"] is not None else 1.0,
+            row["time_to_first_quote_ms_p95"],
+            row["quote_age_p95"] if row["quote_age_p95"] is not None else row.get("stale_p95"),
             row["spread_bps_p95"]
         )
         options_card.append(row)
@@ -295,13 +327,18 @@ def _build_scorecards(bar_rows: list[dict[str, Any]], option_rows: list[dict[str
     greeks_card: list[dict[str, Any]] = []
     if greeks_enabled and option_rows:
         presence = [float(r.get("greeks_presence", 0.0)) for r in option_rows]
-        stale = [float(r["lag_p95"] / 1000.0) for r in option_rows if r.get("lag_p95") is not None]
+        # Greeks staleness based on effective timestamp (event or receipt)
+        greeks_age = [float(r.get("greeks_age_p95", 0.0)) for r in option_rows if r.get("greeks_age_p95") is not None and r["greeks_age_p95"] > 0]
+        # Fallback to lag_p95 if greeks_age_p95 not available
+        if not greeks_age:
+            greeks_age = [float(r["lag_p95"] / 1000.0) for r in option_rows if r.get("lag_p95") is not None and r["lag_p95"] > 0]
         row = {
             "provider": "tastytrade_dxlink",
             "greeks_presence_rate": round(sum(presence) / len(presence), 4) if presence else 0.0,
-            "stale_p95": _pct(stale, 95),
+            "greeks_age_p50": _pct(greeks_age, 50),
+            "greeks_age_p95": _pct(greeks_age, 95),
         }
-        row["score"] = greeks_score(row["greeks_presence_rate"], row["stale_p95"])
+        row["score"] = greeks_score(row["greeks_presence_rate"], row["greeks_age_p95"])
         greeks_card.append(row)
 
     composite_required = bool(bars_card) and bool(options_card) and (bool(greeks_card) if greeks_enabled else True)
