@@ -56,6 +56,23 @@ python main.py
 
 Main config lives in `config/config.yaml`. Thresholds and strategy params in `config/thresholds.yaml` and `config/strategy_params.json`. Secrets (API keys, Telegram token) go in `config/secrets.yaml` (gitignored). Use `config/secrets.example.yaml` as the starting template.
 
+### Regime detector robustness toggles (backward-compatible defaults)
+
+All of the following are configured via `RegimeDetector` thresholds and are **off / neutral by default** so existing strategy behavior is unchanged unless you opt in:
+
+- Hysteresis + dwell: `vol_hysteresis_enabled`, `vol_hysteresis_band`, `trend_hysteresis_enabled`, `trend_hysteresis_slope_band`, `trend_hysteresis_strength_band`, `min_dwell_bars`.
+- Gap-aware warmth/confidence: `gap_confidence_decay_threshold_ms`, `gap_confidence_decay_multiplier`, `gap_warmth_decay_bars`, `gap_reset_window_threshold_ms`.
+- Quote-based liquidity spread: `quote_liquidity_enabled` (when true, spread uses latest quote snapshot with `recv_ts_ms <= asof_ts`; otherwise bar proxy is used).
+- Trend acceleration metric: persisted in regime metrics as `trend_accel`; classification impact remains disabled unless `trend_accel_classification_enabled=true`.
+
+### Market risk regime scaffold
+
+A `MarketRegimeDetector` scaffold is available and can be enabled with `system.risk_basket_symbols` in `config/config.yaml` (default empty/disabled).
+
+- Example: `risk_basket_symbols: ["SPY", "TLT", "GLD"]`
+- Emits global market events on `regimes.market` with `risk_regime` and `metrics_json`.
+- If basket symbols are missing, emits `UNKNOWN`.
+
 ## Tastytrade OAuth Bootstrap (one-time)
 
 Prerequisites: add your OAuth client credentials to `config/secrets.yaml`:

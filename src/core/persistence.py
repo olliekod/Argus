@@ -771,6 +771,7 @@ class PersistenceManager:
             "ema_slow": event.ema_slow,
             "ema_slope": event.ema_slope,
             "rsi": event.rsi,
+            "trend_accel": event.trend_accel,
         }
         future = asyncio.run_coroutine_threadsafe(
             self._db.write_regime(
@@ -808,6 +809,7 @@ class PersistenceManager:
                 risk_regime=event.risk_regime,
                 confidence=event.confidence,
                 data_quality_flags=event.data_quality_flags,
+                metrics_json=event.metrics_json or None,
             ),
             self._loop,
         )
