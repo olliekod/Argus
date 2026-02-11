@@ -71,6 +71,15 @@ class SessionRegime(IntEnum):
     OFFPEAK = 13
 
 
+class LiquidityRegime(IntEnum):
+    """Liquidity regime based on spread and volume."""
+    UNKNOWN = 0
+    LIQ_HIGH = 1     # tight spreads, high volume
+    LIQ_NORMAL = 2   # normal conditions
+    LIQ_LOW = 3      # wide spreads or low volume
+    LIQ_DRIED = 4    # extremely poor liquidity
+
+
 class RiskRegime(IntEnum):
     """Global risk regime (stub for future)."""
     UNKNOWN = 0
@@ -110,6 +119,14 @@ SESSION_REGIME_NAMES = {
     SessionRegime.OFFPEAK: "OFFPEAK",
 }
 
+LIQUIDITY_REGIME_NAMES = {
+    LiquidityRegime.UNKNOWN: "UNKNOWN",
+    LiquidityRegime.LIQ_HIGH: "LIQ_HIGH",
+    LiquidityRegime.LIQ_NORMAL: "LIQ_NORMAL",
+    LiquidityRegime.LIQ_LOW: "LIQ_LOW",
+    LiquidityRegime.LIQ_DRIED: "LIQ_DRIED",
+}
+
 RISK_REGIME_NAMES = {
     RiskRegime.UNKNOWN: "UNKNOWN",
     RiskRegime.RISK_ON: "RISK_ON",
@@ -127,18 +144,25 @@ DEFAULT_REGIME_THRESHOLDS = {
     "vol_spike_z": 2.5,
     "vol_high_z": 1.0,
     "vol_low_z": -0.5,
-    
+
     # Trend regime thresholds
     "trend_slope_threshold": 0.5,
     "trend_strength_threshold": 1.0,
-    
+
+    # Liquidity regime thresholds
+    "liq_spread_high_pct": 0.05,    # < 5% spread = high liquidity
+    "liq_spread_low_pct": 0.20,     # > 20% spread = low liquidity
+    "liq_spread_dried_pct": 0.50,   # > 50% spread = dried up
+    "liq_volume_high_pctile": 75,   # above 75th percentile = high
+    "liq_volume_low_pctile": 25,    # below 25th percentile = low
+
     # ATR guard
     "atr_epsilon": 1e-8,
-    
+
     # Gap detection
     "gap_tolerance_bars": 1,
     "gap_flag_duration_bars": 2,
-    
+
     # Warmup requirements
     "warmup_bars": 30,
 }
@@ -163,20 +187,21 @@ def compute_config_hash(thresholds: Dict[str, Any]) -> str:
 class SymbolRegimeEvent:
     """
     Per-symbol regime classification.
-    
-    Emitted on every bar for the symbol. Contains volatility
-    and trend regimes computed from incremental indicators.
-    
+
+    Emitted on every bar for the symbol. Contains volatility,
+    trend, and liquidity regimes computed from incremental indicators.
+
     Published to: regimes.symbol
     """
     symbol: str
     timeframe: int              # bar_duration in seconds
     timestamp_ms: int           # bar timestamp (UTC epoch ms)
-    
+
     # Regime classifications (string for serialization)
     vol_regime: str             # VOL_LOW | VOL_NORMAL | VOL_HIGH | VOL_SPIKE
     trend_regime: str           # TREND_UP | TREND_DOWN | RANGE
-    
+    liquidity_regime: str       # LIQ_HIGH | LIQ_NORMAL | LIQ_LOW | LIQ_DRIED
+
     # Core metrics
     atr: float
     atr_pct: float              # ATR / close (normalized)
@@ -185,15 +210,19 @@ class SymbolRegimeEvent:
     ema_slow: float
     ema_slope: float            # (ema_fast - prev) / ATR
     rsi: float
-    
+
+    # Liquidity metrics
+    spread_pct: float           # current bar spread as fraction of mid
+    volume_pctile: float        # volume percentile (0-100)
+
     # Quality & confidence
     confidence: float           # 0-1
     is_warm: bool
     data_quality_flags: int     # bitmask (DQ_*)
-    
+
     # Traceability
     config_hash: str
-    
+
     v: int = REGIME_SCHEMA_VERSION
 
 
@@ -283,6 +312,7 @@ def symbol_regime_to_dict(event: SymbolRegimeEvent) -> Dict[str, Any]:
         "timestamp_ms": event.timestamp_ms,
         "vol_regime": event.vol_regime,
         "trend_regime": event.trend_regime,
+        "liquidity_regime": event.liquidity_regime,
         "atr": _round_float(event.atr),
         "atr_pct": _round_float(event.atr_pct),
         "vol_z": _round_float(event.vol_z),
@@ -290,6 +320,8 @@ def symbol_regime_to_dict(event: SymbolRegimeEvent) -> Dict[str, Any]:
         "ema_slow": _round_float(event.ema_slow),
         "ema_slope": _round_float(event.ema_slope),
         "rsi": _round_float(event.rsi),
+        "spread_pct": _round_float(event.spread_pct),
+        "volume_pctile": _round_float(event.volume_pctile),
         "confidence": _round_float(event.confidence),
         "is_warm": event.is_warm,
         "data_quality_flags": event.data_quality_flags,
@@ -300,8 +332,10 @@ def symbol_regime_to_dict(event: SymbolRegimeEvent) -> Dict[str, Any]:
 
 def dict_to_symbol_regime(d: Dict[str, Any]) -> SymbolRegimeEvent:
     """Deserialize dict to SymbolRegimeEvent.
-    
+
     Backwards compatible: accepts float timestamps and converts to int ms.
+    New fields (liquidity_regime, spread_pct, volume_pctile) default
+    gracefully for data persisted before they existed.
     """
     return SymbolRegimeEvent(
         symbol=d["symbol"],
@@ -309,6 +343,7 @@ def dict_to_symbol_regime(d: Dict[str, Any]) -> SymbolRegimeEvent:
         timestamp_ms=_to_int_ms(d["timestamp_ms"]),
         vol_regime=d["vol_regime"],
         trend_regime=d["trend_regime"],
+        liquidity_regime=d.get("liquidity_regime", "UNKNOWN"),
         atr=float(d["atr"]),
         atr_pct=float(d["atr_pct"]),
         vol_z=float(d["vol_z"]),
@@ -316,6 +351,8 @@ def dict_to_symbol_regime(d: Dict[str, Any]) -> SymbolRegimeEvent:
         ema_slow=float(d["ema_slow"]),
         ema_slope=float(d["ema_slope"]),
         rsi=float(d["rsi"]),
+        spread_pct=float(d.get("spread_pct", 0.0)),
+        volume_pctile=float(d.get("volume_pctile", 0.0)),
         confidence=float(d["confidence"]),
         is_warm=bool(d["is_warm"]),
         data_quality_flags=int(d["data_quality_flags"]),

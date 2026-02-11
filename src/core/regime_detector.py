@@ -84,31 +84,39 @@ class SymbolState:
     """Per-symbol indicator state for regime detection."""
     symbol: str
     timeframe: int
-    
+
     # Indicators
     ema_fast: EMAState
     ema_slow: EMAState
     rsi: RSIState
     atr: ATRState
     vol: RollingVolState
-    
+
     # Previous values for slope calculation
     prev_ema_fast: Optional[float] = None
     prev_close: Optional[float] = None
-    
+
     # Gap detection
     last_bar_ts_ms: Optional[int] = None
     gap_flag_remaining: int = 0
-    
+
     # Volatility z-score tracking
     vol_history: Deque[float] = None
-    
+
+    # Liquidity tracking
+    spread_history: Deque[float] = None   # recent spread % values
+    volume_history: Deque[float] = None   # recent volume values
+
     # Warmup tracking
     bars_processed: int = 0
-    
+
     def __post_init__(self):
         if self.vol_history is None:
             self.vol_history = deque(maxlen=50)
+        if self.spread_history is None:
+            self.spread_history = deque(maxlen=50)
+        if self.volume_history is None:
+            self.volume_history = deque(maxlen=50)
 
 
 def create_symbol_state(symbol: str, timeframe: int = 60) -> SymbolState:
@@ -122,6 +130,8 @@ def create_symbol_state(symbol: str, timeframe: int = 60) -> SymbolState:
         atr=ATRState(ATR_PERIOD),
         vol=RollingVolState(VOL_WINDOW, ANNUALIZE_1M),
         vol_history=deque(maxlen=50),
+        spread_history=deque(maxlen=50),
+        volume_history=deque(maxlen=50),
     )
 
 
@@ -319,24 +329,36 @@ class RegimeDetector:
         close = bar.close
         high = bar.high
         low = bar.low
-        
+
         # Store previous EMA for slope calculation
         if state.ema_fast._ema is not None:
             state.prev_ema_fast = state.ema_fast._ema
-        
+
         # Update indicators
         state.ema_fast.update(close)
         state.ema_slow.update(close)
         state.rsi.update(close)
         state.atr.update(high, low, close)
-        
+
         # Log return for volatility
         if state.prev_close is not None and state.prev_close > 0:
             log_ret = math.log(close / state.prev_close)
             vol = state.vol.update(log_ret)
             if vol is not None:
                 state.vol_history.append(vol)
-        
+
+        # Track spread (high-low as proxy for intra-bar spread)
+        mid = (high + low) / 2.0
+        if mid > 0:
+            spread_pct = (high - low) / mid
+            state.spread_history.append(spread_pct)
+        else:
+            state.spread_history.append(0.0)
+
+        # Track volume
+        volume = getattr(bar, "volume", 0) or 0
+        state.volume_history.append(float(volume))
+
         state.prev_close = close
         state.bars_processed += 1
 
@@ -407,17 +429,32 @@ class RegimeDetector:
         
         # Classify volatility regime
         vol_regime = self._classify_vol_regime(vol_z)
-        
+
         # Classify trend regime
         trend_regime = self._classify_trend_regime(ema_slope, trend_strength, is_warm)
-        
+
+        # Classify liquidity regime
+        current_spread = state.spread_history[-1] if state.spread_history else 0.0
+        current_volume = state.volume_history[-1] if state.volume_history else 0.0
+
+        # Compute volume percentile from history
+        volume_pctile = 50.0  # default
+        if len(state.volume_history) >= 5 and current_volume > 0:
+            vol_list = sorted(state.volume_history)
+            rank = sum(1 for v in vol_list if v <= current_volume)
+            volume_pctile = (rank / len(vol_list)) * 100.0
+
+        liq_regime, spread_pct_val, vol_pctile_val = self._classify_liquidity_regime(
+            current_spread, volume_pctile
+        )
+
         # Compute confidence
         confidence = 1.0 if is_warm else 0.5
         if dq_flags & DQ_REPAIRED_INPUT:
             confidence *= 0.9
         if dq_flags & DQ_GAP_WINDOW:
             confidence *= 0.8
-        
+
         # Create and emit event
         event = SymbolRegimeEvent(
             symbol=state.symbol,
@@ -425,6 +462,7 @@ class RegimeDetector:
             timestamp_ms=ts_ms,
             vol_regime=vol_regime,
             trend_regime=trend_regime,
+            liquidity_regime=liq_regime,
             atr=atr,
             atr_pct=atr_pct,
             vol_z=vol_z,
@@ -432,12 +470,14 @@ class RegimeDetector:
             ema_slow=ema_slow,
             ema_slope=ema_slope,
             rsi=rsi,
+            spread_pct=current_spread,
+            volume_pctile=vol_pctile_val,
             confidence=confidence,
             is_warm=is_warm,
             data_quality_flags=dq_flags,
             config_hash=self._config_hash,
         )
-        
+
         self._bus.publish(TOPIC_REGIMES_SYMBOL, event)
         self._symbol_events_emitted += 1
 
@@ -462,17 +502,36 @@ class RegimeDetector:
         """Classify trend regime."""
         if not is_warm:
             return "RANGE"
-        
+
         slope_thresh = self._thresholds.get("trend_slope_threshold", 0.5)
         strength_thresh = self._thresholds.get("trend_strength_threshold", 1.0)
-        
+
         if trend_strength > strength_thresh:
             if ema_slope > slope_thresh:
                 return "TREND_UP"
             elif ema_slope < -slope_thresh:
                 return "TREND_DOWN"
-        
+
         return "RANGE"
+
+    def _classify_liquidity_regime(
+        self, spread_pct: float, volume_pctile: float
+    ) -> Tuple[str, float, float]:
+        """Classify liquidity regime from spread and volume.
+
+        Returns (regime, spread_pct, volume_pctile).
+        """
+        dried_pct = self._thresholds.get("liq_spread_dried_pct", 0.50)
+        low_pct = self._thresholds.get("liq_spread_low_pct", 0.20)
+        high_pct = self._thresholds.get("liq_spread_high_pct", 0.05)
+
+        if spread_pct > dried_pct:
+            return "LIQ_DRIED", spread_pct, volume_pctile
+        if spread_pct > low_pct or volume_pctile < self._thresholds.get("liq_volume_low_pctile", 25):
+            return "LIQ_LOW", spread_pct, volume_pctile
+        if spread_pct < high_pct and volume_pctile > self._thresholds.get("liq_volume_high_pctile", 75):
+            return "LIQ_HIGH", spread_pct, volume_pctile
+        return "LIQ_NORMAL", spread_pct, volume_pctile
 
     def _emit_market_regime(
         self, market: str, timeframe: int, ts_ms: int, dq_flags: int
