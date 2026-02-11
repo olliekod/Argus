@@ -39,6 +39,13 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _poll_time_ms() -> int:
+    """Poll time normalized to minute boundary (for timestamp_ms uniqueness).
+    Matches Alpaca so both providers use the same granularity for
+    ON CONFLICT(provider, symbol, timestamp_ms). recv_ts_ms stays _now_ms()."""
+    return (_now_ms() // 60_000) * 60_000
+
+
 def _date_to_ms(date_str: str) -> int:
     """Convert date string (YYYY-MM-DD) to UTC midnight milliseconds."""
     dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -204,8 +211,8 @@ class TastytradeOptionsConnector:
         Returns:
             OptionChainSnapshotEvent or None if chain is empty.
         """
-        now_ms = _now_ms()
-        recv_ts_ms = now_ms
+        recv_ts_ms = _now_ms()  # Actual receipt time (for replay gating)
+        timestamp_ms = _poll_time_ms()  # Minute-aligned for DB uniqueness
         expiration_ms = _date_to_ms(expiration)
 
         # Filter to this expiration
@@ -258,8 +265,8 @@ class TastytradeOptionsConnector:
                 gamma=None,
                 theta=None,
                 vega=None,
-                timestamp_ms=now_ms,
-                source_ts_ms=now_ms,
+                timestamp_ms=timestamp_ms,
+                source_ts_ms=recv_ts_ms,
                 recv_ts_ms=recv_ts_ms,
                 provider=self.PROVIDER,
                 sequence_id=self._next_sequence_id(),
@@ -287,7 +294,7 @@ class TastytradeOptionsConnector:
             atm_put = min(puts, key=lambda q: abs(q.strike - underlying_price))
             atm_iv = atm_put.iv
 
-        snapshot_id = compute_snapshot_id(symbol, expiration_ms, now_ms)
+        snapshot_id = compute_snapshot_id(symbol, expiration_ms, timestamp_ms)
 
         return OptionChainSnapshotEvent(
             symbol=symbol,
@@ -299,8 +306,8 @@ class TastytradeOptionsConnector:
             calls=tuple(calls),
             n_strikes=len(puts),
             atm_iv=atm_iv,
-            timestamp_ms=now_ms,
-            source_ts_ms=now_ms,
+            timestamp_ms=timestamp_ms,
+            source_ts_ms=recv_ts_ms,
             recv_ts_ms=recv_ts_ms,
             provider=self.PROVIDER,
             snapshot_id=snapshot_id,

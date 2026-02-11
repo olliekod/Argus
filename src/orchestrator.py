@@ -1362,7 +1362,10 @@ class ArgusOrchestrator:
 
         Publishes OptionChainSnapshotEvent to options.chains topic.
         SpreadCandidateGenerator is already subscribed via event bus.
-        Runs independently from Tastytrade polling.
+        Runs in its own task; backoff and interval are independent of
+        _poll_tastytrade_options_chains (no shared counter). Resumes
+        normal interval after transient failure once consecutive_errors
+        is reset.
         """
         if not self.alpaca_options:
             return
@@ -1372,7 +1375,7 @@ class ArgusOrchestrator:
         min_dte = getattr(self, '_alpaca_options_min_dte', 7)
         max_dte = getattr(self, '_alpaca_options_max_dte', 21)
 
-        # Rate-limit warning aggregation
+        # Per-loop state (not shared with Tastytrade polling)
         last_warning_ts = 0
         warning_count = 0
         consecutive_errors = 0
@@ -1435,7 +1438,9 @@ class ArgusOrchestrator:
         """Poll Tastytrade for options chain snapshots via REST.
 
         Publishes OptionChainSnapshotEvents to options.chains topic.
-        Runs independently from Alpaca polling — if one fails the other continues.
+        Own task; backoff and interval independent of Alpaca polling.
+        If one provider fails the other continues; normal interval
+        resumes after consecutive_errors is reset.
         """
         if not self.tastytrade_options:
             return
@@ -1445,7 +1450,7 @@ class ArgusOrchestrator:
         min_dte = getattr(self, '_tastytrade_options_min_dte', 7)
         max_dte = getattr(self, '_tastytrade_options_max_dte', 21)
 
-        # Rate-limit warning aggregation
+        # Per-loop state (not shared with Alpaca polling)
         last_warning_ts = 0
         warning_count = 0
         consecutive_errors = 0

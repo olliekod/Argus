@@ -41,6 +41,14 @@ def _now_ms() -> int:
     return int(time.time() * 1000)
 
 
+def _poll_time_ms() -> int:
+    """Poll time normalized to minute boundary (for timestamp_ms uniqueness).
+    Use this for timestamp_ms so Alpaca and Tastytrade share the same
+    granularity and ON CONFLICT(provider, symbol, timestamp_ms) behaves
+    predictably. Keep recv_ts_ms as _now_ms() for accurate receipt time."""
+    return (_now_ms() // 60_000) * 60_000
+
+
 def _date_to_ms(date_str: str) -> int:
     """Convert date string (YYYY-MM-DD) to UTC midnight milliseconds."""
     dt = datetime.strptime(date_str, "%Y-%m-%d").replace(tzinfo=timezone.utc)
@@ -242,8 +250,8 @@ class AlpacaOptionsConnector:
         Returns:
             OptionChainSnapshotEvent or None if chain unavailable.
         """
-        now_ms = _now_ms()
-        recv_ts_ms = now_ms
+        recv_ts_ms = _now_ms()  # Actual receipt time (for replay gating)
+        timestamp_ms = _poll_time_ms()  # Minute-aligned for DB uniqueness
         expiration_ms = _date_to_ms(expiration)
 
         # Get underlying quote
@@ -318,8 +326,8 @@ class AlpacaOptionsConnector:
                 gamma=greeks.get("gamma"),
                 theta=greeks.get("theta"),
                 vega=greeks.get("vega"),
-                timestamp_ms=now_ms,
-                source_ts_ms=quote_data.get("t", now_ms),
+                timestamp_ms=timestamp_ms,
+                source_ts_ms=quote_data.get("t", recv_ts_ms),
                 recv_ts_ms=recv_ts_ms,
                 provider=self.PROVIDER,
                 sequence_id=self._next_sequence_id(),
@@ -358,7 +366,7 @@ class AlpacaOptionsConnector:
             atm_put = min(puts, key=lambda q: abs(q.strike - underlying_price))
             atm_iv = atm_put.iv
 
-        snapshot_id = compute_snapshot_id(symbol, expiration_ms, now_ms)
+        snapshot_id = compute_snapshot_id(symbol, expiration_ms, timestamp_ms)
 
         return OptionChainSnapshotEvent(
             symbol=symbol,
@@ -370,8 +378,8 @@ class AlpacaOptionsConnector:
             calls=tuple(calls),
             n_strikes=len(puts),
             atm_iv=atm_iv,
-            timestamp_ms=now_ms,
-            source_ts_ms=now_ms,
+            timestamp_ms=timestamp_ms,
+            source_ts_ms=recv_ts_ms,
             recv_ts_ms=recv_ts_ms,
             provider=self.PROVIDER,
             snapshot_id=snapshot_id,

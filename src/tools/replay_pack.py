@@ -31,8 +31,12 @@ async def _fetch_snapshots(
     symbol: str,
     start_ms: int,
     end_ms: int,
+    provider_filter: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Load option chain snapshots for a symbol and date range.
+
+    By default includes all providers (Alpaca + Tastytrade) for cross-validation.
+    Pass provider_filter to restrict to one provider (e.g. "alpaca" or "tastytrade").
 
     Returns a list of snapshot dicts ordered chronologically by
     ``recv_ts_ms`` (falling back to ``timestamp_ms`` for legacy rows).
@@ -50,6 +54,8 @@ async def _fetch_snapshots(
 
     snapshots: List[Dict[str, Any]] = []
     for row in raw:
+        if provider_filter is not None and row.get("provider") != provider_filter:
+            continue
         recv_ts = row.get("recv_ts_ms")
         if recv_ts is None:
             recv_ts = row.get("timestamp_ms", 0)
@@ -78,6 +84,7 @@ async def create_replay_pack(
     provider: str = "tastytrade",
     bar_duration: int = 60,
     db_path: str = "data/argus.db",
+    snapshot_provider: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create a replay pack for a single symbol.
 
@@ -122,8 +129,10 @@ async def create_replay_pack(
         all_regimes = symbol_regimes + market_regimes
         print(f"  Fetched {len(all_regimes)} regimes ({len(symbol_regimes)} symbol, {len(market_regimes)} market).")
 
-        # 5. Fetch Option Chain Snapshots (graceful — empty if no options data)
-        snapshots = await _fetch_snapshots(db, symbol, start_ms, end_ms)
+        # 5. Fetch Option Chain Snapshots (all providers by default; use snapshot_provider to filter)
+        snapshots = await _fetch_snapshots(
+            db, symbol, start_ms, end_ms, provider_filter=snapshot_provider
+        )
         print(f"  Fetched {len(snapshots)} option chain snapshots.")
 
         # 6. Build Pack
@@ -166,6 +175,7 @@ async def create_universe_packs(
     bar_duration: int = 60,
     db_path: str = "data/argus.db",
     symbols: Optional[List[str]] = None,
+    snapshot_provider: Optional[str] = None,
 ) -> List[str]:
     """Create replay packs for every symbol in the liquid ETF universe.
 
@@ -188,6 +198,7 @@ async def create_universe_packs(
                 provider=provider,
                 bar_duration=bar_duration,
                 db_path=db_path,
+                snapshot_provider=snapshot_provider,
             )
             written.append(out_path)
         except Exception as exc:
@@ -222,7 +233,12 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output path (single-symbol mode) or directory (universe mode). "
              "Defaults to data/packs/",
     )
-    parser.add_argument("--provider", default="tastytrade")
+    parser.add_argument("--provider", default="tastytrade", help="Provider for bars/outcomes")
+    parser.add_argument(
+        "--snapshot-provider",
+        default=None,
+        help="Restrict option chain snapshots to this provider (e.g. alpaca, tastytrade). Default: include all providers.",
+    )
     parser.add_argument("--db", default="data/argus.db", help="Path to argus.db")
     return parser
 
@@ -239,6 +255,7 @@ def main() -> None:
             output_dir=out_dir,
             provider=args.provider,
             db_path=args.db,
+            snapshot_provider=getattr(args, "snapshot_provider", None),
         ))
     else:
         out_path = args.out or f"data/packs/{args.symbol}_{args.start}_{args.end}.json"
@@ -249,6 +266,7 @@ def main() -> None:
             output_path=out_path,
             provider=args.provider,
             db_path=args.db,
+            snapshot_provider=getattr(args, "snapshot_provider", None),
         ))
 
 

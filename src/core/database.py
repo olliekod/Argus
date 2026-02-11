@@ -628,8 +628,10 @@ class Database:
 
         # Phase 3B: Option chain snapshots (atomic snapshots)
         # Unique constraint: (provider, symbol, timestamp_ms)
-        # Each snapshot represents the full chain at a point in time.
-        # expiration_ms is stored in the quote payload, not in uniqueness.
+        # - Prevents same-provider duplicates; Alpaca and Tastytrade can both
+        #   have a row at the same timestamp_ms (different provider).
+        # - Connectors use poll-time floored to minute for timestamp_ms so
+        #   granularity is consistent; recv_ts_ms stores actual receipt time.
         await self._connection.execute("""
             CREATE TABLE IF NOT EXISTS option_chain_snapshots (
                 snapshot_id TEXT PRIMARY KEY,
