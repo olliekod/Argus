@@ -89,14 +89,21 @@ class Quote:
     """Point-in-time quote snapshot used for fill simulation.
 
     All prices are per-share / per-contract (not notional).
+
+    .. note::
+
+        ``recv_ts_ms`` is the local receipt timestamp and is the
+        **preferred** freshness reference.  Provider timestamps
+        (``quote_ts_ms``) are often zero from Tastytrade/DXLink.
     """
     bid: float
     ask: float
     bid_size: int = 0          # 0 = unknown
     ask_size: int = 0          # 0 = unknown
-    quote_ts_ms: int = 0       # UTC epoch ms of this quote
+    quote_ts_ms: int = 0       # UTC epoch ms of this quote (provider)
     symbol: str = ""
     source: str = ""           # e.g. "alpaca", "tastytrade"
+    recv_ts_ms: int = 0        # local receipt timestamp (epoch ms)
 
 
 @dataclass(frozen=True)
@@ -424,13 +431,16 @@ class ExecutionModel:
                     f"spread={spread_pct:.2%} > max={self._cfg.max_spread_pct:.0%}",
                 )
 
-        # Staleness
-        if quote.quote_ts_ms > 0 and sim_ts_ms > 0:
-            age_ms = sim_ts_ms - quote.quote_ts_ms
+        # Staleness — prefer recv_ts_ms (receipt time), fall back to
+        # provider timestamp.  Provider timestamps are often zero from
+        # Tastytrade/DXLink, so receipt time is the reliable reference.
+        freshness_ts = quote.recv_ts_ms if quote.recv_ts_ms > 0 else quote.quote_ts_ms
+        if freshness_ts > 0 and sim_ts_ms > 0:
+            age_ms = sim_ts_ms - freshness_ts
             if age_ms > self._cfg.max_stale_ms:
                 return _reject(
                     RejectReason.STALE_QUOTE,
-                    f"age={age_ms}ms > max={self._cfg.max_stale_ms}ms",
+                    f"age={age_ms}ms > max={self._cfg.max_stale_ms}ms (ts_source={'recv' if quote.recv_ts_ms > 0 else 'provider'})",
                 )
 
         # Liquidity (size checks)

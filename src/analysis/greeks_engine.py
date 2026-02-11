@@ -33,7 +33,7 @@ to ``"failed_illiquid"``.
 
 import math
 from dataclasses import dataclass, field
-from typing import Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple
 from scipy.stats import norm
 from scipy.optimize import brentq
 import logging
@@ -68,6 +68,12 @@ class Greeks:
 
         Backtesters should treat ``"derived"`` conservatively (wider bands,
         flag in reporting).
+    solver_converged : bool or None
+        True if IV solver converged, False if it failed, None if solver
+        was not used (provider IV or no solve attempted).
+    quote_quality_score : float
+        0.0-1.0 score reflecting input quote quality.  Based on spread
+        width, bid presence, and premium level.  0.0 = unusable.
     """
     delta: float
     gamma: float
@@ -76,6 +82,8 @@ class Greeks:
     rho: float
     source: str = "unknown"
     iv_used: Optional[float] = None  # IV that was actually used
+    solver_converged: Optional[bool] = None
+    quote_quality_score: float = 0.0
 
 
 @dataclass
@@ -173,8 +181,53 @@ class GreeksEngine:
             self.r = risk_free_rate if risk_free_rate is not None else self.DEFAULT_RISK_FREE_RATE
         self._max_spread_pct = max_spread_pct
         self._min_premium = min_premium
+
+        # Solver metrics counters
+        self._solve_attempts = 0
+        self._solve_successes = 0
+        self._solve_failures = 0
+        self._illiquid_rejections = 0
+
         logger.debug("Greeks Engine initialized with r=%.4f (european approximation)", self.r)
     
+    @staticmethod
+    def compute_quote_quality_score(
+        bid: float, ask: float,
+        *, max_spread_pct: float = 0.50, min_premium: float = 0.01,
+    ) -> float:
+        """Compute a 0.0-1.0 quote quality score.
+
+        Scoring:
+        - 0.0 if bid <= 0 (no market)
+        - 0.0 if mid < min_premium (near-zero premium)
+        - Penalized by spread width (wider = lower score)
+        - 1.0 for a tight, liquid quote
+        """
+        if bid <= 0:
+            return 0.0
+        mid = (bid + ask) / 2.0
+        if mid < min_premium:
+            return 0.0
+        spread = ask - bid
+        spread_pct = spread / mid if mid > 0 else 1.0
+        if spread_pct > max_spread_pct:
+            return round(max(0.0, 0.3 * (1.0 - spread_pct / max_spread_pct)), 4)
+        # Linear scale: 0% spread → 1.0, max_spread_pct → 0.5
+        return round(max(0.0, 1.0 - 0.5 * (spread_pct / max_spread_pct)), 4)
+
+    def solver_metrics(self) -> Dict[str, Any]:
+        """Return solver performance metrics."""
+        total = self._solve_attempts
+        return {
+            "solve_attempts": total,
+            "solve_successes": self._solve_successes,
+            "solve_failures": self._solve_failures,
+            "illiquid_rejections": self._illiquid_rejections,
+            "success_rate": round(self._solve_successes / max(1, total), 4),
+            "failure_rate": round(self._solve_failures / max(1, total), 4),
+            "illiquid_rate": round(self._illiquid_rejections / max(1, total), 4),
+        }
+
     def _d1(self, S: float, K: float, T: float, sigma: float) -> float:
         """Calculate d1 parameter."""
         if T <= 0 or sigma <= 0:
@@ -267,10 +320,13 @@ class GreeksEngine:
         (iv, source) where source is one of ``"derived"``,
         ``"failed_illiquid"``, or ``"failed_solve"``.
         """
+        self._solve_attempts += 1
+
         # Guard: illiquid quotes
         if bid is not None and ask is not None:
             ok, reason = self.is_quote_liquid(bid, ask)
             if not ok:
+                self._illiquid_rejections += 1
                 logger.debug(
                     "IV solve skipped (illiquid): %s  S=%.2f K=%.2f T=%.4f",
                     reason, S, K, T,
@@ -278,11 +334,13 @@ class GreeksEngine:
                 return None, "failed_illiquid"
 
         if T <= 0 or S <= 0 or market_price <= 0:
+            self._solve_failures += 1
             return None, "failed_solve"
 
         # Intrinsic check
         intrinsic = max(0.0, (S - K) if option_type == "call" else (K - S))
         if market_price < intrinsic - 1e-10:
+            self._solve_failures += 1
             return None, "failed_solve"
 
         def objective(sigma: float) -> float:
@@ -290,8 +348,10 @@ class GreeksEngine:
 
         try:
             iv = brentq(objective, sigma_low, sigma_high, xtol=tol, maxiter=max_iter)
+            self._solve_successes += 1
             return iv, "derived"
         except (ValueError, RuntimeError):
+            self._solve_failures += 1
             return None, "failed_solve"
 
     # ------------------------------------------------------------------
@@ -319,11 +379,18 @@ class GreeksEngine:
 
         This is the **recommended entry point** for the backtester.
         """
+        # Compute quote quality score if bid/ask available
+        quality = 0.0
+        if bid is not None and ask is not None:
+            quality = self.compute_quote_quality_score(bid, ask)
+
         # Path 1: provider-supplied IV
         if provider_iv is not None and provider_iv > 0:
             greeks = self.calculate_all_greeks(S, K, T, provider_iv, option_type)
             greeks.source = "provider"
             greeks.iv_used = provider_iv
+            greeks.solver_converged = None  # solver not used
+            greeks.quote_quality_score = quality
             return greeks
 
         # Path 2: derive IV from market mid
@@ -336,17 +403,23 @@ class GreeksEngine:
                 greeks = self.calculate_all_greeks(S, K, T, iv, option_type)
                 greeks.source = source   # "derived"
                 greeks.iv_used = iv
+                greeks.solver_converged = True
+                greeks.quote_quality_score = quality
                 return greeks
             # Failed solve — return zero Greeks with failure tag
             return Greeks(
                 delta=0.0, gamma=0.0, theta=0.0, vega=0.0, rho=0.0,
                 source=source, iv_used=None,
+                solver_converged=False,
+                quote_quality_score=quality,
             )
 
         # Path 3: nothing usable
         return Greeks(
             delta=0.0, gamma=0.0, theta=0.0, vega=0.0, rho=0.0,
             source="unknown", iv_used=None,
+            solver_converged=None,
+            quote_quality_score=0.0,
         )
 
     def calculate_delta(
