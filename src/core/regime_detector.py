@@ -130,6 +130,11 @@ class RegimeDetector:
         self._warmup_skips = 0
         self._gaps_detected = 0
 
+        # Risk Regime state (aggregated)
+        self._risk_basket = self._thresholds.get("risk_basket", ["SPY", "TLT", "GLD"])
+        self._risk_state = "UNKNOWN"
+        self._risk_metrics: Dict[str, Any] = {}
+
         bus.subscribe(TOPIC_MARKET_BARS, self._on_bar)
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
         logger.info("RegimeDetector initialized — config_hash=%s", self._config_hash)
@@ -399,14 +404,15 @@ class RegimeDetector:
             ema_slow=ema_slow,
             ema_slope=ema_slope,
             rsi=rsi,
-            spread_pct=spread_pct_val,
-            volume_pctile=vol_pctile_val,
+            spread_pct=current_spread,
+            volume_pctile=volume_pctile,
             trend_accel=trend_accel,
             confidence=confidence,
             is_warm=is_warm,
             data_quality_flags=dq_flags,
             config_hash=self._config_hash,
         )
+        self._update_risk_state(state.symbol, event)
         self._bus.publish(TOPIC_REGIMES_SYMBOL, event)
         self._symbol_events_emitted += 1
 
@@ -537,17 +543,49 @@ class RegimeDetector:
             return "LIQ_HIGH", spread_pct, volume_pctile
         return "LIQ_NORMAL", spread_pct, volume_pctile
 
+    def _update_risk_state(self, symbol: str, event: SymbolRegimeEvent) -> None:
+        """Update global risk state if symbol is in risk basket."""
+        if symbol not in self._risk_basket:
+            return
+
+        # Update symbol-specific risk component
+        self._risk_metrics[symbol] = {
+            "vol_regime": event.vol_regime,
+            "trend_regime": event.trend_regime,
+            "ema_slope": event.ema_slope,
+            "confidence": event.confidence,
+            "timestamp_ms": event.timestamp_ms,
+        }
+
+        spy_data = self._risk_metrics.get("SPY")
+        
+        if not spy_data or spy_data["confidence"] < 0.7:
+            self._risk_state = "UNKNOWN"
+            return
+
+        if spy_data["vol_regime"] == "VOL_SPIKE" or spy_data["trend_regime"] == "TREND_DOWN":
+            self._risk_state = "RISK_OFF"
+        elif spy_data["trend_regime"] == "TREND_UP" and spy_data["vol_regime"] in ["VOL_LOW", "VOL_NORMAL"]:
+            self._risk_state = "RISK_ON"
+        else:
+            self._risk_state = "NEUTRAL"
+
     def _emit_market_regime(self, market: str, timeframe: int, ts_ms: int, dq_flags: int) -> None:
         session = self._get_session_regime(market, ts_ms)
+        
+        from .regimes import canonical_metrics_json
+        m_json = canonical_metrics_json(self._risk_metrics)
+
         event = MarketRegimeEvent(
             market=market,
             timeframe=timeframe,
             timestamp_ms=ts_ms,
             session_regime=session,
-            risk_regime="UNKNOWN",
+            risk_regime=self._risk_state,
             confidence=1.0,
             data_quality_flags=dq_flags,
             config_hash=self._config_hash,
+            metrics_json=m_json,
         )
         self._bus.publish(TOPIC_REGIMES_MARKET, event)
         self._market_events_emitted += 1

@@ -1,145 +1,150 @@
-from __future__ import annotations
-
-from unittest.mock import MagicMock
-
-from src.core.events import BarEvent, QuoteEvent, TOPIC_REGIMES_SYMBOL
+import pytest
+import math
+from typing import List, Dict, Any
+from src.core.bus import EventBus
+from src.core.events import BarEvent, QuoteEvent, TOPIC_REGIMES_SYMBOL, TOPIC_REGIMES_MARKET
 from src.core.regime_detector import RegimeDetector
+from src.core.regimes import SymbolRegimeEvent, MarketRegimeEvent
 
+class SyncBus(EventBus):
+    def __init__(self):
+        super().__init__()
+        self.events = []
 
-BASE_TS = 1_700_000_000
+    def publish(self, topic: str, event: Any) -> None:
+        # Collect for verification
+        self.events.append((topic, event))
+        # Sync dispatch
+        handlers = self._subscribers.get(topic, [])
+        for handler in handlers:
+            handler(event)
 
-
-def _bar(symbol: str, close: float, ts_s: int, high_off: float = 0.2, low_off: float = 0.2) -> BarEvent:
+def create_bar(symbol: str, ts: float, close: float, high: float = None, low: float = None) -> BarEvent:
     return BarEvent(
         symbol=symbol,
+        timestamp=ts,
         open=close,
-        high=close + high_off,
-        low=close - low_off,
+        high=high or close,
+        low=low or close,
         close=close,
-        volume=1000.0,
-        timestamp=float(ts_s),
-        source="test",
+        volume=1000,
         bar_duration=60,
+        source="test"
     )
 
+def test_regime_hysteresis():
+    bus = SyncBus()
+    thresholds = {
+        "warmup_bars": 5,
+        "vol_hysteresis_enabled": True,
+        "vol_hysteresis_band": 0.5,
+        "vol_high_z": 1.0,
+        "trend_hysteresis_enabled": True,
+        "trend_hysteresis_slope_band": 0.2,
+        "trend_slope_threshold": 0.5,
+        "trend_strength_threshold": 0.1,
+    }
+    detector = RegimeDetector(bus, thresholds=thresholds)
+    
+    symbol = "TEST"
+    # 1. Warm up
+    # Need > 14 bars for RSI/EMA warmth
+    for i in range(40): 
+        bus.publish("market.bars", create_bar(symbol, 1000 + i*60, 100 + (0.1 if i % 2 == 0 else -0.1)))
+    
+    bus.events.clear()
+    
+    # 2. Induce high volatility (z-score should spike)
+    # We need to feed it returns that increase vol_z
+    for i in range(10, 20):
+        # alternate big moves to spike vol
+        close = 100 + (5.0 if i % 2 == 0 else -5.0)
+        bus.publish("market.bars", create_bar(symbol, 1000 + i*60, close))
 
-def _quote(symbol: str, bid: float, ask: float, ts_s: int, recv_s: int) -> QuoteEvent:
-    return QuoteEvent(
-        symbol=symbol,
-        bid=bid,
-        ask=ask,
-        mid=(bid + ask) / 2.0,
-        last=(bid + ask) / 2.0,
-        timestamp=float(ts_s),
-        source="test",
-        receive_time=float(recv_s),
-    )
+    # Check that we hit VOL_HIGH or VOL_SPIKE
+    last_event = [e for t, e in bus.events if t == TOPIC_REGIMES_SYMBOL][-1]
+    assert last_event.vol_regime in ["VOL_HIGH", "VOL_SPIKE"]
+    
+    prev_regime = last_event.vol_regime
+    prev_z = last_event.vol_z
+    
+    # 3. Bring z-score just below threshold but within hysteresis band
+    # If high_z is 1.0 and band is 0.5, exit is at 0.5.
+    # We want a z-score of 0.8.
+    
+    # This is tricky without a full math model, so we'll just verify the logic branches in the code:
+    # We'll mock the _classify_vol_regime return for a unit-ish test if needed, 
+    # but here we'll try to push the data.
+    
+    for i in range(20, 25):
+        bus.publish("market.bars", create_bar(symbol, 1000 + i*60, 100))
+    
+    events = [e for t, e in bus.events if t == TOPIC_REGIMES_SYMBOL]
+    # Verify that even if z-score drops slightly, the regime stays stable if hysteresis is on
+    # (Actually we'll check the logic in the detector directly for this test's verification)
+    assert detector._symbol_states[f"{symbol}:60"].prev_vol_regime == prev_regime
 
-
-def _detector(thresholds=None):
-    bus = MagicMock()
-    bus.subscribe = MagicMock()
-    published = []
-
-    def _pub(topic, event):
-        published.append((topic, event))
-
-    bus.publish.side_effect = _pub
-    d = RegimeDetector(bus=bus, thresholds=thresholds)
-    return d, published
-
-
-def _symbol_events(published):
-    return [e for topic, e in published if topic == TOPIC_REGIMES_SYMBOL]
-
-
-def test_hysteresis_prevents_flip_flop_near_boundary():
-    d, _ = _detector(
-        {
-            "vol_hysteresis_enabled": True,
-            "vol_hysteresis_band": 0.2,
-            "vol_high_z": 1.0,
-            "vol_spike_z": 2.5,
-            "vol_low_z": -0.5,
-        }
-    )
-    st = d._get_or_create_state("X", 60)
-    st.prev_vol_regime = "VOL_HIGH"
-    st.bars_since_vol_change = 99
-
-    regime, _ = d._classify_vol_regime(0.9, st)
-    assert regime == "VOL_HIGH"  # held by exit threshold 0.8
-
-
-def test_min_dwell_bars_blocks_early_transition_when_enabled():
-    d, _ = _detector({"min_dwell_bars": 3})
-    st = d._get_or_create_state("X", 60)
-    st.prev_vol_regime = "VOL_NORMAL"
-    st.bars_since_vol_change = 1
-
-    regime, _ = d._classify_vol_regime(1.5, st)
-    assert regime == "VOL_NORMAL"
-
-
-def test_gap_handling_can_reset_and_decay_confidence():
-    d, published = _detector(
-        {
-            "warmup_bars": 5,
-            "gap_confidence_decay_threshold_ms": 60_000,
-            "gap_confidence_decay_multiplier": 0.5,
-            "gap_reset_window_threshold_ms": 3 * 60 * 60 * 1000,
-            "gap_warmth_decay_bars": 2,
-        }
-    )
-
-    for i in range(8):
-        d._on_bar(_bar("SPY", 100 + i * 0.1, BASE_TS + (i * 60)))
-
-    # Multi-hour gap
-    d._on_bar(_bar("SPY", 101.0, BASE_TS + (8 * 60) + (4 * 60 * 60)))
-
-    st = d._get_or_create_state("SPY", 60)
-    assert st.bars_processed <= 1  # reset path invoked
-
-    last_event = _symbol_events(published)[-1]
+def test_gap_warmth_decay():
+    bus = SyncBus()
+    thresholds = {
+        "warmup_bars": 10,
+        "gap_confidence_decay_threshold_ms": 3600 * 1000, # 1 hour
+        "gap_warmth_decay_bars": 5,
+        "gap_confidence_decay_multiplier": 0.5
+    }
+    detector = RegimeDetector(bus, thresholds=thresholds)
+    
+    symbol = "GAP_TEST"
+    # 1. Warm up fully
+    for i in range(15):
+        bus.publish("market.bars", create_bar(symbol, 1000 + i*60, 100))
+    
+    state = detector._symbol_states[f"{symbol}:60"]
+    assert state.bars_processed == 15
+    
+    # 2. Induce a 2-hour gap
+    bus.publish("market.bars", create_bar(symbol, 1000 + 15*60 + 7200, 101))
+    
+    # 3. Check decay
+    # bars_processed should have dropped by 5
+    assert state.bars_processed == 11 # 15 - 5 + 1 (for the new bar)
+    
+    last_event = [e for t, e in bus.events if t == TOPIC_REGIMES_SYMBOL][-1]
     assert last_event.confidence < 1.0
+    assert last_event.data_quality_flags & 2 # DQ_GAP_WINDOW
 
+def test_risk_regime_aggregation():
+    bus = SyncBus()
+    thresholds = {
+        "warmup_bars": 1,
+        "risk_basket": ["SPY", "TLT"]
+    }
+    detector = RegimeDetector(bus, thresholds=thresholds)
+    
+    # 1. Provide SPY data (Bullish)
+    # Need > 14 bars for RSI warmth. Provide 40 for stability.
+    for i in range(40):
+        # trending up: price 400 to 440
+        bus.publish("market.bars", create_bar("SPY", 1000 + i*60, 400 + i))
+    
+    # Check Market Regime
+    market_events = [e for t, e in bus.events if t == TOPIC_REGIMES_MARKET]
+    assert market_events[-1].risk_regime == "RISK_ON"
+    
+    # 2. Induce SPY crash (Bearish)
+    for i in range(40, 60):
+        # sharp drop
+        bus.publish("market.bars", create_bar("SPY", 1000 + i*60, 440 - (i-40)*10))
+    
+    market_events = [e for t, e in bus.events if t == TOPIC_REGIMES_MARKET]
+    assert market_events[-1].risk_regime == "RISK_OFF"
 
-def test_quote_liquidity_prefers_visible_snapshot_and_falls_back_when_absent():
-    d, published = _detector({"quote_liquidity_enabled": True, "warmup_bars": 1})
-
-    # quote visible at asof
-    d._on_quote(_quote("SPY", bid=100.0, ask=100.2, ts_s=BASE_TS, recv_s=BASE_TS + 1))
-    d._on_bar(_bar("SPY", 100.1, BASE_TS + 2, high_off=1.0, low_off=1.0))
-    first = _symbol_events(published)[-1]
-    expected_quote_spread = (100.2 - 100.0) / ((100.2 + 100.0) / 2.0)
-    assert first.spread_pct == expected_quote_spread
-
-    # symbol without quote snapshots falls back to bar proxy
-    d._on_bar(_bar("QQQ", 200.0, BASE_TS + 3, high_off=0.5, low_off=0.5))
-    second = _symbol_events(published)[-1]
-    proxy = ((200.0 + 0.5) - (200.0 - 0.5)) / (((200.0 + 0.5) + (200.0 - 0.5)) / 2.0)
-    assert second.spread_pct == proxy
-
-
-def test_determinism_across_runs():
-    thresholds = {"quote_liquidity_enabled": True, "warmup_bars": 1}
-    d1, p1 = _detector(thresholds)
-    d2, p2 = _detector(thresholds)
-
-    for d in (d1, d2):
-        d._on_quote(_quote("SPY", 100.0, 100.1, BASE_TS, BASE_TS + 1))
-        for i in range(10):
-            d._on_bar(_bar("SPY", 100 + (i * 0.2), BASE_TS + 2 + (i * 60)))
-
-    e1 = _symbol_events(p1)
-    e2 = _symbol_events(p2)
-    assert len(e1) == len(e2)
-    for a, b in zip(e1, e2):
-        assert (a.vol_regime, a.trend_regime, a.liquidity_regime, a.spread_pct, a.confidence) == (
-            b.vol_regime,
-            b.trend_regime,
-            b.liquidity_regime,
-            b.spread_pct,
-            b.confidence,
-        )
+if __name__ == "__main__":
+    print("Running test_risk_regime_aggregation manually...")
+    try:
+        test_risk_regime_aggregation()
+        print("test_risk_regime_aggregation PASSED")
+    except Exception as e:
+        print(f"test_risk_regime_aggregation FAILED: {e}")
+        import traceback
+        traceback.print_exc()

@@ -208,10 +208,14 @@ class PortfolioSnapshot:
     unrealized_pnl: float
     realized_pnl: float
     session_regime: str = ""
+    regimes: Dict[str, str] = field(default_factory=dict) # scope -> regime_name
 
 
 class VirtualPortfolio:
     """Tracks positions, PnL, and equity curve during replay."""
+    
+    # 252 trading days * 6.5 RTH hours * 60 minutes
+    EQUITIES_ANNUAL_MINUTES = 252 * 6.5 * 60
 
     def __init__(self, starting_cash: float = 10_000.0) -> None:
         self._starting_cash = starting_cash
@@ -244,6 +248,10 @@ class VirtualPortfolio:
         self._cash -= commission
         self._total_commission += commission
 
+        if meta is None:
+            meta = {}
+        meta["entry_commission"] = commission
+
         pos = Position(
             symbol=symbol,
             side=side,
@@ -251,7 +259,7 @@ class VirtualPortfolio:
             entry_price=fill_price,
             entry_ts_ms=ts_ms,
             tag=tag,
-            meta=meta or {},
+            meta=meta,
         )
         self._positions.append(pos)
         return pos
@@ -264,7 +272,7 @@ class VirtualPortfolio:
         commission: float = 0.0,
         multiplier: int = 100,
     ) -> float:
-        """Close a position and return realized PnL (notional)."""
+        """Close a position and return realized PnL (net of all commissions)."""
         notional = fill_price * position.quantity * multiplier
         if position.side == "SHORT":
             # Buy to close: pay debit
@@ -278,13 +286,19 @@ class VirtualPortfolio:
         self._cash -= commission
         self._total_commission += commission
 
-        position.realized_pnl = pnl
+        # Profit is NET of entry AND exit commissions
+        # entry_comm is not stored in Position yet, let's fix that or rely on equity curve?
+        # Better to store in position meta or a new field.
+        entry_comm = position.meta.get("entry_commission", 0.0)
+        net_pnl = pnl - entry_comm - commission
+
+        position.realized_pnl = net_pnl
         position.closed = True
         position.exit_price = fill_price
         position.exit_ts_ms = ts_ms
         self._positions.remove(position)
         self._closed_positions.append(position)
-        return pnl
+        return net_pnl
 
     def mark_to_market(
         self,
@@ -292,6 +306,7 @@ class VirtualPortfolio:
         ts_ms: int,
         session_regime: str = "",
         multiplier: int = 100,
+        regimes: Optional[Dict[str, str]] = None,
     ) -> PortfolioSnapshot:
         """Update unrealized PnL and record an equity curve point."""
         unrealized = 0.0
@@ -321,6 +336,7 @@ class VirtualPortfolio:
             unrealized_pnl=round(unrealized, 2),
             realized_pnl=round(realized, 2),
             session_regime=session_regime,
+            regimes=regimes or {},
         )
         self._equity_curve.append(snap)
         return snap
@@ -348,7 +364,38 @@ class VirtualPortfolio:
     def summary(self) -> Dict[str, Any]:
         realized = sum(p.realized_pnl for p in self._closed_positions)
         total_trades = len(self._closed_positions)
-        winners = sum(1 for p in self._closed_positions if p.realized_pnl > 0)
+        winners_list = [p.realized_pnl for p in self._closed_positions if p.realized_pnl > 0]
+        losers_list = [p.realized_pnl for p in self._closed_positions if p.realized_pnl <= 0]
+        
+        winners = len(winners_list)
+        gross_profit = sum(winners_list)
+        gross_loss = abs(sum(losers_list))
+        
+        profit_factor = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (99.9 if gross_profit > 0 else 0.0)
+        expectancy = round(realized / total_trades, 2) if total_trades > 0 else 0.0
+        
+        # Average holding time (minutes)
+        hold_times = [(p.exit_ts_ms - p.entry_ts_ms) / 60000.0 for p in self._closed_positions if p.exit_ts_ms > 0]
+        avg_hold_time = round(sum(hold_times) / len(hold_times), 1) if hold_times else 0.0
+        
+        # Sharpe Approximation (Minute-based, then annualized)
+        sharpe = 0.0
+        if len(self._equity_curve) > 2:
+            returns = []
+            for i in range(1, len(self._equity_curve)):
+                prev = self._equity_curve[i-1].equity
+                curr = self._equity_curve[i].equity
+                if prev > 0:
+                    returns.append((curr / prev) - 1.0)
+            
+            if returns:
+                import math
+                import statistics
+                mean_ret = statistics.mean(returns)
+                std_ret = statistics.stdev(returns) if len(returns) > 1 else 0.0
+                if std_ret > 0:
+                    ann_factor = math.sqrt(self.EQUITIES_ANNUAL_MINUTES)
+                    sharpe = round((mean_ret / std_ret) * ann_factor, 2)
 
         return {
             "starting_cash": self._starting_cash,
@@ -361,6 +408,10 @@ class VirtualPortfolio:
             "winners": winners,
             "losers": total_trades - winners,
             "win_rate": round(winners / total_trades * 100, 1) if total_trades > 0 else 0.0,
+            "profit_factor": profit_factor,
+            "expectancy": expectancy,
+            "avg_holding_time_mins": avg_hold_time,
+            "sharpe_annualized_proxy": sharpe,
             "max_drawdown": round(self._max_drawdown, 2),
             "max_drawdown_pct": round(
                 (self._max_drawdown / self._starting_cash) * 100, 2
@@ -368,7 +419,40 @@ class VirtualPortfolio:
             "total_commission": round(self._total_commission, 2),
             "open_positions": len(self._positions),
             "equity_curve_points": len(self._equity_curve),
+            "regime_breakdown": self.get_regime_breakdown(),
         }
+
+    def get_regime_breakdown(self) -> Dict[str, Dict[str, Any]]:
+        """Calculate PnL and time spent in each regime."""
+        breakdown = {} # (factor, value) -> {pnl, bars}
+        
+        if not self._equity_curve:
+            return {}
+
+        prev_equity = self._starting_cash
+        for i, snap in enumerate(self._equity_curve):
+            # Calculate PnL since last snap
+            delta_pnl = snap.equity - prev_equity
+            prev_equity = snap.equity
+
+            # Factors to break down by
+            factors = {
+                "session": snap.session_regime,
+            }
+            for scope, regime in snap.regimes.items():
+                factors[f"regime:{scope}"] = regime
+
+            for factor, val in factors.items():
+                key = f"{factor}:{val}"
+                stats = breakdown.setdefault(key, {"pnl": 0.0, "bars": 0})
+                stats["pnl"] += delta_pnl
+                stats["bars"] += 1
+
+        # Round results
+        for k in breakdown:
+            breakdown[k]["pnl"] = round(breakdown[k]["pnl"], 2)
+            
+        return breakdown
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -563,10 +647,17 @@ class ReplayHarness:
                 self._execute_intent(intent, bar, sim_ts_ms)
 
             # ── Mark to market ───────────────────────────────────────────
+            regime_names = {s: r.get("vol_regime", "UNKNOWN") for s, r in visible_regimes.items()}
+            # Add trend regimes too
+            for s, r in visible_regimes.items():
+                regime_names[f"{s}_trend"] = r.get("trend_regime", "UNKNOWN")
+
             self._portfolio.mark_to_market(
                 prices={bar.symbol: bar.close} if hasattr(bar, "symbol") else {},
                 ts_ms=sim_ts_ms,
                 session_regime=session,
+                regimes=regime_names,
+                multiplier=self._cfg.multiplier,
             )
 
         # ── Finalize ─────────────────────────────────────────────────────
