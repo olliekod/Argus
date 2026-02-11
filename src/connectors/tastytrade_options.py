@@ -377,7 +377,7 @@ class TastytradeOptionsConnector:
             "last_latency_ms": self._last_latency_ms,
             "sequence_id": self._sequence_id,
             "authenticated": self._authenticated,
-            "health": "ok" if self._error_count < self._request_count * 0.3 else "degraded",
+            "health": "ok" if self._error_count < max(1, self._request_count) * 0.3 else "degraded",
         }
 
     def close(self) -> None:

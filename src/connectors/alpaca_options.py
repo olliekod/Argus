@@ -438,7 +438,7 @@ class AlpacaOptionsConnector:
             "last_request_ms": self._last_request_ms,
             "last_latency_ms": self._last_latency_ms,
             "sequence_id": self._sequence_id,
-            "health": "ok" if self._error_count < self._request_count * 0.1 else "degraded",
+            "health": "ok" if self._error_count < max(1, self._request_count) * 0.1 else "degraded",
         }
     
     async def close(self) -> None:
