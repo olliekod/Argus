@@ -53,6 +53,7 @@ from .connectors.deribit_client import DeribitClient
 from .connectors.yahoo_client import YahooFinanceClient
 from .connectors.alpaca_client import AlpacaDataClient
 from .connectors.alpaca_options import AlpacaOptionsConnector, AlpacaOptionsConfig
+from .connectors.tastytrade_options import TastytradeOptionsConnector, TastytradeOptionsConfig
 from .strategies.spread_generator import SpreadCandidateGenerator, SpreadGeneratorConfig
 from .connectors.polymarket_gamma import PolymarketGammaClient
 from .connectors.polymarket_clob import PolymarketCLOBClient
@@ -161,6 +162,7 @@ class ArgusOrchestrator:
             "coinglass",
             "coinbase",
             "ibit_options",
+            "tastytrade_options",
             "polymarket_gamma",
             "polymarket_clob",
         ]
@@ -186,6 +188,7 @@ class ArgusOrchestrator:
         self.yahoo_client: Optional[YahooFinanceClient] = None
         self.alpaca_client: Optional[AlpacaDataClient] = None
         self.alpaca_options: Optional[AlpacaOptionsConnector] = None
+        self.tastytrade_options: Optional[TastytradeOptionsConnector] = None
         self.spread_generator: Optional[SpreadCandidateGenerator] = None
         self.telegram: Optional[TelegramBot] = None
         
@@ -372,6 +375,7 @@ class ArgusOrchestrator:
             "coinglass": getattr(self, "coinglass_client", None),
             "coinbase": getattr(self, "coinbase_client", None),
             "ibit_options": getattr(self, "ibit_options_client", None),
+            "tastytrade_options": self.tastytrade_options,
             "polymarket_gamma": self.polymarket_gamma,
             "polymarket_clob": self.polymarket_clob,
         }
@@ -608,6 +612,63 @@ class ArgusOrchestrator:
                 self.logger.warning("Alpaca enabled but API keys not found in secrets.yaml")
         else:
             self.logger.info("Alpaca Data client disabled (set exchanges.alpaca.enabled=true to activate)")
+
+        # ── Tastytrade Options Snapshot Connector ────────────────────────
+        tt_cfg = self.config.get('tastytrade', {})
+        tt_sampling = tt_cfg.get('snapshot_sampling', {})
+        if tt_sampling.get('enabled', False):
+            tt_secrets = self.secrets.get('tastytrade', {})
+            tt_username = tt_secrets.get('username', '')
+            tt_password = tt_secrets.get('password', '')
+            if tt_username and tt_password and not tt_username.startswith('PASTE_'):
+                retry_cfg = tt_cfg.get('retries', {})
+                # Derive options symbols: intersection with alpaca options symbols if available
+                alpaca_opts_symbols = getattr(self, '_alpaca_options_symbols', [])
+                tt_underlyings = tt_cfg.get('underlyings', [])
+                if alpaca_opts_symbols:
+                    tt_options_symbols = [s for s in tt_underlyings if s in alpaca_opts_symbols]
+                    if not tt_options_symbols:
+                        tt_options_symbols = tt_underlyings[:4]
+                else:
+                    tt_options_symbols = tt_underlyings
+
+                tt_min_dte = getattr(self, '_alpaca_options_min_dte', 7)
+                tt_max_dte = getattr(self, '_alpaca_options_max_dte', 21)
+                tt_poll_interval = getattr(self, '_alpaca_options_poll_interval', 60)
+
+                try:
+                    self.tastytrade_options = TastytradeOptionsConnector(
+                        config=TastytradeOptionsConfig(
+                            username=tt_username,
+                            password=tt_password,
+                            environment=tt_cfg.get('environment', 'live'),
+                            timeout_seconds=tt_cfg.get('timeout_seconds', 20),
+                            max_attempts=retry_cfg.get('max_attempts', 3),
+                            backoff_seconds=retry_cfg.get('backoff_seconds', 1.0),
+                            backoff_multiplier=retry_cfg.get('backoff_multiplier', 2.0),
+                            symbols=tt_options_symbols,
+                            min_dte=tt_min_dte,
+                            max_dte=tt_max_dte,
+                            poll_interval_seconds=tt_poll_interval,
+                        )
+                    )
+                    self._tastytrade_options_symbols = tt_options_symbols
+                    self._tastytrade_options_poll_interval = tt_poll_interval
+                    self._tastytrade_options_min_dte = tt_min_dte
+                    self._tastytrade_options_max_dte = tt_max_dte
+                    self.logger.info(
+                        "Tastytrade Options snapshot connector configured for %s (poll=%ds, DTE=%d-%d)",
+                        tt_options_symbols, tt_poll_interval, tt_min_dte, tt_max_dte,
+                    )
+                except Exception as exc:
+                    self.logger.error(
+                        "Failed to initialize Tastytrade Options connector: %s", exc
+                    )
+                    self.tastytrade_options = None
+            else:
+                self.logger.info("Tastytrade Options disabled (credentials missing in secrets.yaml)")
+        else:
+            self.logger.info("Tastytrade snapshot sampling disabled (set tastytrade.snapshot_sampling.enabled=true)")
 
     async def _setup_polymarket(self) -> None:
         """Initialize Polymarket connectors (optional, fail-soft)."""
@@ -1298,30 +1359,38 @@ class ArgusOrchestrator:
     
     async def _poll_options_chains(self) -> None:
         """Poll Alpaca for options chain snapshots.
-        
+
         Publishes OptionChainSnapshotEvent to options.chains topic.
         SpreadCandidateGenerator is already subscribed via event bus.
+        Runs independently from Tastytrade polling.
         """
         if not self.alpaca_options:
             return
-        
+
         interval = getattr(self, '_alpaca_options_poll_interval', 60)
         symbols = getattr(self, '_alpaca_options_symbols', ['IBIT', 'BITO'])
         min_dte = getattr(self, '_alpaca_options_min_dte', 7)
         max_dte = getattr(self, '_alpaca_options_max_dte', 21)
-        
+
         # Rate-limit warning aggregation
         last_warning_ts = 0
         warning_count = 0
-        
+        consecutive_errors = 0
+
         while self._running:
             try:
+                # Check market hours — skip off-hours if configured
+                if self._mh_cfg.get('off_hours_disable_options_snapshots', False):
+                    if not self._is_us_market_open():
+                        await asyncio.sleep(interval)
+                        continue
+
                 for symbol in symbols:
                     # Get expirations in DTE range
                     expirations = await self.alpaca_options.get_expirations_in_range(
                         symbol, min_dte=min_dte, max_dte=max_dte
                     )
-                    
+
                     for exp_date, dte in expirations:
                         snapshot = await self.alpaca_options.build_chain_snapshot(
                             symbol, exp_date
@@ -1330,26 +1399,127 @@ class ArgusOrchestrator:
                             # Publish to event bus (TapeRecorder + SpreadGenerator subscribe)
                             self.event_bus.publish(TOPIC_OPTIONS_CHAINS, snapshot)
                             self.logger.debug(
-                                "Options chain: %s exp=%s DTE=%d puts=%d calls=%d",
+                                "Alpaca chain: %s exp=%s DTE=%d puts=%d calls=%d provider=%s",
                                 symbol, exp_date, dte,
                                 len(snapshot.puts), len(snapshot.calls),
+                                snapshot.provider,
                             )
                         else:
                             warning_count += 1
                             now = time.time()
                             if now - last_warning_ts > 60:
                                 self.logger.warning(
-                                    "Empty chain for %s exp=%s (suppressed %d similar)",
+                                    "Alpaca empty chain for %s exp=%s (suppressed %d similar)",
                                     symbol, exp_date, warning_count,
                                 )
                                 last_warning_ts = now
                                 warning_count = 0
-                            
+
+                consecutive_errors = 0
+
             except Exception as e:
-                self.logger.error("Options polling error: %s", e)
-            
+                consecutive_errors += 1
+                self.logger.error("Alpaca options polling error (consecutive=%d): %s", consecutive_errors, e)
+                if consecutive_errors >= 3:
+                    backoff = min(interval * consecutive_errors, 300)
+                    self.logger.warning(
+                        "Alpaca options backing off for %ds after %d consecutive errors",
+                        backoff, consecutive_errors,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
             await asyncio.sleep(interval)
-    
+
+    async def _poll_tastytrade_options_chains(self) -> None:
+        """Poll Tastytrade for options chain snapshots via REST.
+
+        Publishes OptionChainSnapshotEvents to options.chains topic.
+        Runs independently from Alpaca polling — if one fails the other continues.
+        """
+        if not self.tastytrade_options:
+            return
+
+        interval = getattr(self, '_tastytrade_options_poll_interval', 60)
+        symbols = getattr(self, '_tastytrade_options_symbols', [])
+        min_dte = getattr(self, '_tastytrade_options_min_dte', 7)
+        max_dte = getattr(self, '_tastytrade_options_max_dte', 21)
+
+        # Rate-limit warning aggregation
+        last_warning_ts = 0
+        warning_count = 0
+        consecutive_errors = 0
+
+        while self._running:
+            try:
+                # Check market hours — skip off-hours if configured
+                if self._mh_cfg.get('off_hours_disable_options_snapshots', False):
+                    if not self._is_us_market_open():
+                        await asyncio.sleep(interval)
+                        continue
+
+                for symbol in symbols:
+                    try:
+                        # Fetch underlying price from Alpaca if available (for ATM IV calc)
+                        underlying_price = 0.0
+                        if self.alpaca_options:
+                            try:
+                                price, _, _ = await self.alpaca_options.get_underlying_quote(symbol)
+                                underlying_price = price
+                            except Exception:
+                                pass  # Best-effort; Tastytrade snapshots work without it
+
+                        # Run sync REST call in thread to avoid blocking event loop
+                        snapshots = await asyncio.to_thread(
+                            self.tastytrade_options.build_snapshots_for_symbol,
+                            symbol,
+                            min_dte=min_dte,
+                            max_dte=max_dte,
+                            underlying_price=underlying_price,
+                        )
+                        for snapshot in snapshots:
+                            self.event_bus.publish(TOPIC_OPTIONS_CHAINS, snapshot)
+                            self.logger.debug(
+                                "Tastytrade chain: %s exp_ms=%d puts=%d calls=%d provider=%s",
+                                snapshot.symbol, snapshot.expiration_ms,
+                                len(snapshot.puts), len(snapshot.calls),
+                                snapshot.provider,
+                            )
+
+                        if not snapshots:
+                            warning_count += 1
+                            now = time.time()
+                            if now - last_warning_ts > 120:
+                                self.logger.warning(
+                                    "Tastytrade empty snapshots for %s (suppressed %d similar)",
+                                    symbol, warning_count,
+                                )
+                                last_warning_ts = now
+                                warning_count = 0
+
+                    except Exception as e:
+                        self.logger.error("Tastytrade polling error for %s: %s", symbol, e)
+
+                consecutive_errors = 0
+
+            except Exception as e:
+                consecutive_errors += 1
+                self.logger.error(
+                    "Tastytrade options polling loop error (consecutive=%d): %s",
+                    consecutive_errors, e,
+                )
+                # Back off if we're getting repeated failures
+                if consecutive_errors >= 3:
+                    backoff = min(interval * consecutive_errors, 300)
+                    self.logger.warning(
+                        "Tastytrade backing off for %ds after %d consecutive errors",
+                        backoff, consecutive_errors,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
+            await asyncio.sleep(interval)
+
     async def _get_current_spread_prices(self) -> Dict[str, Dict[str, float]]:
         """Get current spread prices for open positions to evaluate exits."""
         prices: Dict[str, Dict[str, float]] = {}
@@ -2385,6 +2555,10 @@ class ArgusOrchestrator:
         if self.alpaca_options:
             self._tasks.append(asyncio.create_task(self._poll_options_chains()))
 
+        # Tastytrade OPTIONS chain polling (runs in ALL modes, independent of Alpaca)
+        if self.tastytrade_options:
+            self._tasks.append(asyncio.create_task(self._poll_tastytrade_options_chains()))
+
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._health_check()))
         self._tasks.append(asyncio.create_task(self._run_db_maintenance()))
@@ -2615,6 +2789,10 @@ class ArgusOrchestrator:
             await self.deribit_client.close()
         if self.yahoo_client:
             await self.yahoo_client.close()
+        if self.alpaca_options:
+            await self.alpaca_options.close()
+        if self.tastytrade_options:
+            self.tastytrade_options.close()
 
         # Close database
         await self.db.close()

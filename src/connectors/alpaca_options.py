@@ -62,6 +62,7 @@ class AlpacaOptionsConfig:
     timeout_seconds: float = 30.0
     rate_limit_per_min: int = 200
     cache_ttl_seconds: int = 60
+    feed: str = "indicative"  # "indicative" | "opra" (requires subscription)
 
 
 class AlpacaOptionsConnector:
@@ -156,15 +157,28 @@ class AlpacaOptionsConnector:
         # We get this from the options chain snapshot
         data = await self._request(
             f"/v1beta1/options/snapshots/{symbol}",
-            {"feed": "indicative", "limit": 1000}
+            {"feed": self._config.feed, "limit": 1000}
         )
-        
+
+        if not data:
+            logger.warning(
+                "Expiration lookup failed for %s: empty API response (feed=%s)",
+                symbol, self._config.feed,
+            )
+            return []
+
         expirations = set()
         for snapshot in data.get("snapshots", {}).values():
             exp = snapshot.get("expiration_date")
             if exp:
                 expirations.add(exp)
-        
+
+        if not expirations:
+            logger.warning(
+                "Expiration lookup for %s returned no expirations (snapshots=%d, feed=%s)",
+                symbol, len(data.get("snapshots", {})), self._config.feed,
+            )
+
         result = sorted(expirations)
         self._set_cache(cache_key, result)
         return result
@@ -187,7 +201,7 @@ class AlpacaOptionsConnector:
         data = await self._request(
             f"/v1beta1/options/snapshots/{symbol}",
             {
-                "feed": "indicative",
+                "feed": self._config.feed,
                 "expiration_date": expiration,
                 "limit": 500,
             }
@@ -229,42 +243,64 @@ class AlpacaOptionsConnector:
             OptionChainSnapshotEvent or None if chain unavailable.
         """
         now_ms = _now_ms()
+        recv_ts_ms = now_ms
         expiration_ms = _date_to_ms(expiration)
-        
+
         # Get underlying quote
         underlying_price, underlying_bid, underlying_ask = await self.get_underlying_quote(symbol)
         if underlying_price <= 0:
-            logger.warning("No underlying price for %s", symbol)
+            logger.warning(
+                "No underlying price for %s — cannot build snapshot (provider=%s)",
+                symbol, self.PROVIDER,
+            )
             return None
-        
+
         # Get options chain
         raw_data = await self.get_chain_raw(symbol, expiration)
         snapshots = raw_data.get("snapshots", {})
-        
+
         if not snapshots:
-            logger.warning("Empty options chain for %s exp=%s", symbol, expiration)
+            logger.warning(
+                "Empty options chain for %s exp=%s (feed=%s, provider=%s)",
+                symbol, expiration, self._config.feed, self.PROVIDER,
+            )
             return None
-        
+
         puts: List[OptionQuoteEvent] = []
         calls: List[OptionQuoteEvent] = []
-        
+        skipped = 0
+        missing_greeks = 0
+
         for option_symbol, snap in snapshots.items():
             quote_data = snap.get("latestQuote", {})
             greeks = snap.get("greeks", {})
-            
+
+            if not quote_data:
+                logger.debug(
+                    "Snapshot for %s missing latestQuote field (provider=%s)",
+                    option_symbol, self.PROVIDER,
+                )
+                skipped += 1
+                continue
+
+            if not greeks:
+                missing_greeks += 1
+
             # Parse OCC option symbol for strike and type
             # Format: IBIT250221P00045000
             try:
                 strike, option_type = self._parse_occ_symbol(option_symbol)
             except ValueError:
+                logger.debug("Cannot parse OCC symbol: %s", option_symbol)
+                skipped += 1
                 continue
-            
+
             contract_id = _compute_contract_id(option_symbol)
-            
+
             bid = quote_data.get("bp", 0.0)
             ask = quote_data.get("ap", 0.0)
             mid = (bid + ask) / 2 if bid and ask else 0.0
-            
+
             quote = OptionQuoteEvent(
                 contract_id=contract_id,
                 symbol=symbol,
@@ -284,28 +320,46 @@ class AlpacaOptionsConnector:
                 vega=greeks.get("vega"),
                 timestamp_ms=now_ms,
                 source_ts_ms=quote_data.get("t", now_ms),
-                recv_ts_ms=now_ms,
+                recv_ts_ms=recv_ts_ms,
                 provider=self.PROVIDER,
                 sequence_id=self._next_sequence_id(),
             )
-            
+
             if option_type == "PUT":
                 puts.append(quote)
             else:
                 calls.append(quote)
-        
+
+        if skipped:
+            logger.debug(
+                "%s chain %s exp=%s: skipped %d contracts (missing quote or unparseable)",
+                self.PROVIDER, symbol, expiration, skipped,
+            )
+        if missing_greeks:
+            logger.debug(
+                "%s chain %s exp=%s: %d contracts missing greeks",
+                self.PROVIDER, symbol, expiration, missing_greeks,
+            )
+
         # Sort by strike for determinism
         puts.sort(key=lambda q: q.strike)
         calls.sort(key=lambda q: q.strike)
-        
+
+        if not puts and not calls:
+            logger.warning(
+                "Chain for %s exp=%s has no valid puts or calls after parsing (provider=%s)",
+                symbol, expiration, self.PROVIDER,
+            )
+            return None
+
         # Compute ATM IV (from put closest to underlying price)
         atm_iv = None
         if puts:
             atm_put = min(puts, key=lambda q: abs(q.strike - underlying_price))
             atm_iv = atm_put.iv
-        
+
         snapshot_id = compute_snapshot_id(symbol, expiration_ms, now_ms)
-        
+
         return OptionChainSnapshotEvent(
             symbol=symbol,
             expiration_ms=expiration_ms,
@@ -318,7 +372,7 @@ class AlpacaOptionsConnector:
             atm_iv=atm_iv,
             timestamp_ms=now_ms,
             source_ts_ms=now_ms,
-            recv_ts_ms=now_ms,
+            recv_ts_ms=recv_ts_ms,
             provider=self.PROVIDER,
             snapshot_id=snapshot_id,
             sequence_id=self._next_sequence_id(),
@@ -384,7 +438,7 @@ class AlpacaOptionsConnector:
             "last_request_ms": self._last_request_ms,
             "last_latency_ms": self._last_latency_ms,
             "sequence_id": self._sequence_id,
-            "health": "ok" if self._error_count < self._request_count * 0.1 else "degraded",
+            "health": "ok" if self._error_count < max(1, self._request_count) * 0.1 else "degraded",
         }
     
     async def close(self) -> None:
