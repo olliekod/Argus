@@ -15,7 +15,13 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Type, Optional, Generator
 
-from src.analysis.replay_harness import ReplayHarness, ReplayConfig, ReplayStrategy, ReplayResult
+from src.analysis.replay_harness import (
+    MarketDataSnapshot,
+    ReplayHarness,
+    ReplayConfig,
+    ReplayStrategy,
+    ReplayResult,
+)
 from src.analysis.execution_model import ExecutionModel, ExecutionConfig
 from src.core.outcome_engine import BarData
 
@@ -45,6 +51,25 @@ class ExperimentRunner:
             pack = json.load(f)
         return pack
 
+    @staticmethod
+    def _pack_snapshots_to_objects(snapshot_dicts: List[Dict[str, Any]]) -> List[MarketDataSnapshot]:
+        """Convert replay pack snapshot dicts to MarketDataSnapshot for ReplayHarness."""
+        out: List[MarketDataSnapshot] = []
+        for s in snapshot_dicts or []:
+            recv_ts = s.get("recv_ts_ms")
+            if recv_ts is None:
+                recv_ts = s.get("timestamp_ms", 0)
+            out.append(
+                MarketDataSnapshot(
+                    symbol=s.get("symbol", "SPY"),
+                    recv_ts_ms=recv_ts,
+                    underlying_price=float(s.get("underlying_price", 0.0)),
+                    atm_iv=s.get("atm_iv") if s.get("atm_iv") is not None else None,
+                    source=s.get("provider", ""),
+                )
+            )
+        return out
+
     def run(self, config: ExperimentConfig) -> ReplayResult:
         """Run a single experiment configuration."""
         # 1. Prepare data from packs
@@ -71,6 +96,8 @@ class ExperimentRunner:
             all_regimes.extend(pack.get("regimes", []))
             all_snapshots.extend(pack.get("snapshots", []))
 
+        snapshots_objs = self._pack_snapshots_to_objects(all_snapshots)
+
         # 2. Instantiate Strategy
         strategy = config.strategy_class(config.strategy_params)
         
@@ -84,7 +111,7 @@ class ExperimentRunner:
             strategy=strategy,
             execution_model=exec_model,
             regimes=all_regimes,
-            snapshots=all_snapshots,
+            snapshots=snapshots_objs,
             config=replay_cfg
         )
         
@@ -215,7 +242,8 @@ class ExperimentRunner:
         all_bars: List[BarData] = []
         all_outcomes: List[Dict[str, Any]] = []
         all_regimes: List[Dict[str, Any]] = []
-        
+        all_snapshots: List[Dict[str, Any]] = []
+
         for pack_path in config.replay_pack_paths:
             pack = self.load_pack(pack_path)
             for b in pack.get("bars", []):
@@ -224,22 +252,26 @@ class ExperimentRunner:
                 all_bars.append(bar)
             all_outcomes.extend(pack.get("outcomes", []))
             all_regimes.extend(pack.get("regimes", []))
+            all_snapshots.extend(pack.get("snapshots", []))
+
+        snapshots_objs = self._pack_snapshots_to_objects(all_snapshots)
 
         results = []
         for i, (train_bars, test_bars) in enumerate(self.split_walk_forward(all_bars, train_days, test_days)):
             print(f"Window {i+1}: Train {len(train_bars)} bars, Test {len(test_bars)} bars")
             # In a real system, we'd "train" (optimize) on train_bars
             # For now, we just run the strategy on test_bars to see how it performs in different periods
-            
-            # Setup harness for test window
+
+            # Setup harness for test window (harness gates outcomes/regimes/snapshots by time)
             strategy = config.strategy_class(config.strategy_params)
             exec_model = ExecutionModel(config.execution_config)
             harness = ReplayHarness(
                 bars=test_bars,
-                outcomes=all_outcomes, # Harness will filter by timestamp
+                outcomes=all_outcomes,
                 strategy=strategy,
                 execution_model=exec_model,
                 regimes=all_regimes,
+                snapshots=snapshots_objs,
                 config=ReplayConfig(starting_cash=config.starting_cash)
             )
             

@@ -154,9 +154,9 @@ circuit_breakers:
 # Data Retention
 # -----------------------------------------------------------------------------
 data_retention:
-  price_snapshots_days: 30
+  price_snapshots_days: 60
   detections_days: 180
-  logs_days: 30
+  logs_days: 60
   raw_ticks_crypto_days: 7     # crypto raw ticks kept 7 days
   raw_ticks_equity_days: 3     # equity ticks kept 3 days
   aggregated_bars_days: 180    # 1m bars kept 6 months
@@ -304,5 +304,5 @@ soak:
   # Tape recorder (determinism artifact capture)
   tape:
     enabled: true                        # Set true to activate
-    symbols: ["BTCUSDT", "ETHUSDT", "BTC-INDEX", "IBIT", "BITO"]  # Empty = capture all symbols
+    symbols: []  # Empty = capture all symbols
     maxlen: 100000                        # Max events in rolling buffer
