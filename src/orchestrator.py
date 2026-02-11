@@ -1359,30 +1359,38 @@ class ArgusOrchestrator:
     
     async def _poll_options_chains(self) -> None:
         """Poll Alpaca for options chain snapshots.
-        
+
         Publishes OptionChainSnapshotEvent to options.chains topic.
         SpreadCandidateGenerator is already subscribed via event bus.
+        Runs independently from Tastytrade polling.
         """
         if not self.alpaca_options:
             return
-        
+
         interval = getattr(self, '_alpaca_options_poll_interval', 60)
         symbols = getattr(self, '_alpaca_options_symbols', ['IBIT', 'BITO'])
         min_dte = getattr(self, '_alpaca_options_min_dte', 7)
         max_dte = getattr(self, '_alpaca_options_max_dte', 21)
-        
+
         # Rate-limit warning aggregation
         last_warning_ts = 0
         warning_count = 0
-        
+        consecutive_errors = 0
+
         while self._running:
             try:
+                # Check market hours — skip off-hours if configured
+                if self._mh_cfg.get('off_hours_disable_options_snapshots', False):
+                    if not self._is_us_market_open():
+                        await asyncio.sleep(interval)
+                        continue
+
                 for symbol in symbols:
                     # Get expirations in DTE range
                     expirations = await self.alpaca_options.get_expirations_in_range(
                         symbol, min_dte=min_dte, max_dte=max_dte
                     )
-                    
+
                     for exp_date, dte in expirations:
                         snapshot = await self.alpaca_options.build_chain_snapshot(
                             symbol, exp_date
@@ -1391,24 +1399,36 @@ class ArgusOrchestrator:
                             # Publish to event bus (TapeRecorder + SpreadGenerator subscribe)
                             self.event_bus.publish(TOPIC_OPTIONS_CHAINS, snapshot)
                             self.logger.debug(
-                                "Options chain: %s exp=%s DTE=%d puts=%d calls=%d",
+                                "Alpaca chain: %s exp=%s DTE=%d puts=%d calls=%d provider=%s",
                                 symbol, exp_date, dte,
                                 len(snapshot.puts), len(snapshot.calls),
+                                snapshot.provider,
                             )
                         else:
                             warning_count += 1
                             now = time.time()
                             if now - last_warning_ts > 60:
                                 self.logger.warning(
-                                    "Empty chain for %s exp=%s (suppressed %d similar)",
+                                    "Alpaca empty chain for %s exp=%s (suppressed %d similar)",
                                     symbol, exp_date, warning_count,
                                 )
                                 last_warning_ts = now
                                 warning_count = 0
-                            
+
+                consecutive_errors = 0
+
             except Exception as e:
-                self.logger.error("Options polling error: %s", e)
-            
+                consecutive_errors += 1
+                self.logger.error("Alpaca options polling error (consecutive=%d): %s", consecutive_errors, e)
+                if consecutive_errors >= 3:
+                    backoff = min(interval * consecutive_errors, 300)
+                    self.logger.warning(
+                        "Alpaca options backing off for %ds after %d consecutive errors",
+                        backoff, consecutive_errors,
+                    )
+                    await asyncio.sleep(backoff)
+                    continue
+
             await asyncio.sleep(interval)
 
     async def _poll_tastytrade_options_chains(self) -> None:
