@@ -460,6 +460,29 @@ class Database:
                 UNIQUE(event_type, scope, timeframe, timestamp, config_hash)
             )
         """)
+        # Safe migration: add columns if they don't exist yet (idempotent)
+        for col, col_type in [
+            ("event_type", "TEXT"),
+            ("scope", "TEXT"),
+            ("timeframe", "INTEGER"),
+            ("timestamp", "INTEGER"),
+            ("config_hash", "TEXT"),
+            ("vol_regime", "TEXT"),
+            ("trend_regime", "TEXT"),
+            ("liquidity_regime", "TEXT"),
+            ("session_regime", "TEXT"),
+            ("risk_regime", "TEXT"),
+            ("spread_pct", "REAL"),
+            ("volume_pctile", "REAL"),
+            ("confidence", "REAL"),
+            ("is_warm", "INTEGER"),
+        ]:
+            try:
+                await self._connection.execute(
+                    f"ALTER TABLE regimes ADD COLUMN {col} {col_type}"
+                )
+            except Exception: pass
+
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_regimes_lookup "
             "ON regimes(event_type, scope, timeframe, timestamp DESC)"
@@ -468,18 +491,6 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_regimes_scope_ts "
             "ON regimes(scope, timestamp)"
         )
-        # Safe migration: add columns if they don't exist yet (idempotent)
-        for col, col_type in [
-            ("liquidity_regime", "TEXT"),
-            ("spread_pct", "REAL"),
-            ("volume_pctile", "REAL"),
-        ]:
-            try:
-                await self._connection.execute(
-                    f"ALTER TABLE regimes ADD COLUMN {col} {col_type}"
-                )
-            except Exception:
-                pass  # Column already exists
 
         # Phase 3: Trading signals (from strategy modules)
         await self._connection.execute("""
@@ -586,6 +597,22 @@ class Database:
                 FOREIGN KEY (contract_id) REFERENCES option_contracts(contract_id)
             )
         """)
+        # Safe migration: add columns if they don't exist yet (idempotent)
+        for col, col_type in [
+            ("contract_id", "TEXT"),
+            ("symbol", "TEXT"),
+            ("strike", "REAL"),
+            ("expiration_ms", "INTEGER"),
+            ("option_type", "TEXT"),
+            ("timestamp_ms", "INTEGER"),
+            ("recv_ts_ms", "INTEGER"),
+        ]:
+            try:
+                await self._connection.execute(
+                    f"ALTER TABLE option_quotes ADD COLUMN {col} {col_type}"
+                )
+            except Exception: pass
+
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_oq_ts "
             "ON option_quotes(timestamp_ms)"
@@ -619,6 +646,20 @@ class Database:
                 UNIQUE(provider, symbol, timestamp_ms)
             )
         """)
+        # Safe migration: add columns if they don't exist yet (idempotent)
+        for col, col_type in [
+            ("symbol", "TEXT"),
+            ("expiration_ms", "INTEGER"),
+            ("timestamp_ms", "INTEGER"),
+            ("recv_ts_ms", "INTEGER"),
+            ("provider", "TEXT"),
+        ]:
+            try:
+                await self._connection.execute(
+                    f"ALTER TABLE option_chain_snapshots ADD COLUMN {col} {col_type}"
+                )
+            except Exception: pass
+
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_ocs_ts "
             "ON option_chain_snapshots(timestamp_ms)"
@@ -693,15 +734,6 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_sys_hb_comp_ts "
             "ON system_heartbeat(component, timestamp_ms)"
         )
-
-        # Safe migrations for options tables (idempotent)
-        for table in ["option_quotes", "option_chain_snapshots"]:
-            try:
-                await self._connection.execute(
-                    f"ALTER TABLE {table} ADD COLUMN recv_ts_ms INTEGER"
-                )
-            except Exception:
-                pass
 
         await self._connection.commit()
 

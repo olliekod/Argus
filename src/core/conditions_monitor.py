@@ -293,20 +293,24 @@ class ConditionsMonitor:
         old_score = self._last_score
         new_score = snapshot.score
         
-        # Check if we crossed an alert threshold
+        # Check for significant state changes
         should_alert = False
-        for threshold in self.ALERT_THRESHOLDS:
-            if (old_score < threshold <= new_score) or (old_score >= threshold > new_score):
-                should_alert = True
-                break
         
-        # Also alert on major label change
         if self._last_snapshot:
             old_label = self._last_snapshot.label
             new_label = snapshot.label
-            if old_label != new_label and new_label in ["warming", "prime", "cooling"]:
+            
+            # 1. Always alert on entering PRIME conditions
+            if new_label == "prime" and old_label != "prime":
                 should_alert = True
-        
+                
+            # 2. Alert on WARMING (but not if just oscillating prime<->warming)
+            elif new_label == "warming" and old_label in ["neutral", "cooling"]:
+                should_alert = True
+                
+            # 3. Suppress cooling/neutral alerts to reduce noise
+            # (User requested "High-Signal" only)
+            
         self._last_score = new_score
         
         if should_alert and self.alert_callback:

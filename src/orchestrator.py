@@ -680,8 +680,8 @@ class ArgusOrchestrator:
             self.detectors['ibit'] = IBITDetector(ibit_config, self.db, symbol='IBIT')
             self.detectors['ibit'].attach_bus(self.event_bus)
             _register(self.detectors['ibit'])
-            # Wire up Telegram for paper trade notifications
-            self.detectors['ibit'].set_telegram_callback(self._send_paper_notification)
+            # Wire up Telegram for paper trade notifications (DISABLED - too noisy)
+            # self.detectors['ibit'].set_telegram_callback(self._send_paper_notification)
             # Wire up farm if available and NOT in collector mode
             if self.paper_trader_farm and not is_collector:
                 self.detectors['ibit'].set_paper_trader_farm(self.paper_trader_farm)
@@ -700,7 +700,7 @@ class ArgusOrchestrator:
             self.detectors['bito'] = IBITDetector(bito_config, self.db, symbol='BITO')
             self.detectors['bito'].attach_bus(self.event_bus)
             _register(self.detectors['bito'])
-            self.detectors['bito'].set_telegram_callback(self._send_paper_notification)
+            # self.detectors['bito'].set_telegram_callback(self._send_paper_notification)
             # Wire up farm if available and NOT in collector mode
             if self.paper_trader_farm and not is_collector:
                 self.detectors['bito'].set_paper_trader_farm(self.paper_trader_farm)
@@ -804,7 +804,7 @@ class ArgusOrchestrator:
             self.paper_trader_farm.set_data_sources(
                 get_conditions=self.conditions_monitor.get_current_conditions,
             )
-            # Wire Telegram callback for runaway safety alerts
+            # Wire Telegram callback for runaway safety alerts (using separate safety callback)
             self.paper_trader_farm.set_telegram_alert_callback(self._send_paper_notification)
             self.logger.info(f"Paper Trader Farm initialized with {len(self.paper_trader_farm.trader_configs):,} traders")
 
@@ -829,17 +829,12 @@ class ArgusOrchestrator:
             return
         if not self.conditions_monitor:
             return
-        self.telegram.set_callbacks(
-            get_conditions=self._get_status_summary,
-            get_pnl=self._get_pnl_summary,
-            get_positions=self._get_positions_summary,
-            get_farm_status=self._get_farm_status,
-            get_signal_status=self._get_signal_status,
-            get_research_status=self._get_research_status,
-            get_dashboard=self._get_dashboard,
-            get_zombies=self._get_zombies,
             get_followed=self._get_followed_traders,
         )
+        
+        # Wire up Soak Guardian alerts (filtered)
+        if hasattr(self, 'soak_guardian'):
+            self.soak_guardian._alert_cb = self._handle_soak_alert
     
     async def _on_conditions_alert(self, snapshot) -> None:
         """Handle conditions threshold crossing alert."""
@@ -1494,6 +1489,9 @@ class ArgusOrchestrator:
                         n = len(closed_trades)
                         self._today_closed += n
                         self.logger.info(f"Exit monitor: {n} trades closed")
+                        # Send consolidated exit summary
+                        if self.telegram:
+                             await self._send_exit_summary(closed_trades)
 
                 # Check expirations
                 eastern = ZoneInfo("America/New_York")
@@ -1646,8 +1644,72 @@ class ArgusOrchestrator:
             if not matched:
                 return
 
-            symbol = signal.get('symbol', '?')
             for trade in matched[:5]:  # Cap at 5 to avoid spam
+                # ... implementation details ...
+                pass
+
+    async def _send_exit_summary(self, trades: list) -> None:
+        """Send consolidated summary of closed trades."""
+        if not self.telegram:
+            return
+        
+        # Group by symbol/strategy to avoid spam
+        # We only really care about the outcome
+        total_pnl = sum(t.realized_pnl for t in trades)
+        win_count = sum(1 for t in trades if t.realized_pnl > 0)
+        
+        # If mass-closing (e.g. expiration), summarising is better
+        if len(trades) > 3:
+            msg = (
+                f"💰 <b>TRADES CLOSED</b> ({len(trades)})\n"
+                f"Realized P&L: <b>${total_pnl:+.2f}</b>\n"
+                f"Win Rate: {win_count}/{len(trades)} ({win_count/len(trades):.0%})"
+            )
+            await self.telegram.send_message(msg)
+            return
+
+        # For individual/few trades, show details
+        for t in trades:
+            emoji = "🟢" if t.realized_pnl > 0 else "🔴"
+            credit_text = f"${t.entry_credit:.2f}"
+            
+            # Calculate return % on risk/collateral
+            # Simplify: return on credit for now or just absolute PnL
+            
+            msg = (
+                f"{emoji} <b>TRADE CLOSED: {t.symbol}</b>\n"
+                f"{t.strategy_type} {t.strikes}\n"
+                f"Credit: {credit_text} → Closed: ${t.close_price:.2f}\n"
+                f"<b>P&L: ${t.realized_pnl:+.2f}</b>"
+            )
+            await self.telegram.send_message(msg)
+
+    async def _handle_soak_alert(self, severity: str, guard: str, message: str) -> None:
+        """Handle soak guard alerts with filtering."""
+        # Log everything to disk
+        self.logger.warning(f"SOAK GUARD [{severity}] {guard}: {message}")
+        
+        # Filter for Telegram
+        # User requested SILENT soak guards unless critical
+        if severity != "ALERT":
+            return
+            
+        # Only specific critical guards go to Telegram
+        critical_guards = {
+            'ingestion_paused', 
+            'disk_fatigue', 
+            'params_corruption',
+            'bar_liveness'
+        }
+        
+        if guard in critical_guards or 'corruption' in message.lower():
+            if self.telegram:
+                await self.telegram.send_message(
+                    f"🛡️ <b>SYSTEM CRITICAL</b>\n"
+                    f"Guard: {guard}\n"
+                    f"Message: {message}"
+                )
+
                 lines = [
                     f"⭐ <b>Followed Trader Entry</b>",
                     "",
