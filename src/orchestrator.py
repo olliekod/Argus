@@ -2281,6 +2281,7 @@ class ArgusOrchestrator:
                     'liquidations': retention.get('price_snapshots_days', 30),
                     'options_iv': retention.get('detections_days', 180),
                     'detections': retention.get('detections_days', 180),
+                    'option_chain_snapshots': retention.get('option_chain_snapshots_days', 30),
                 }
                 await self.db.cleanup_old_data(retention_map)
 

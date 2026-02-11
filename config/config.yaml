@@ -73,7 +73,8 @@ exchanges:
     bar_timeframe: "1Min"
     options:
       enabled: true
-      symbols: ["IBIT", "BITO"]
+      # Underlyings for options chain snapshot polling (Alpaca). Include SPY/QQQ for replay packs.
+      symbols: ["IBIT", "BITO", "SPY", "QQQ"]
       poll_interval_seconds: 60  # 1 minute between chain polls (default)
       min_dte: 7
       max_dte: 21
@@ -160,6 +161,7 @@ data_retention:
   raw_ticks_crypto_days: 7     # crypto raw ticks kept 7 days
   raw_ticks_equity_days: 3     # equity ticks kept 3 days
   aggregated_bars_days: 180    # 1m bars kept 6 months
+  option_chain_snapshots_days: 30  # Alpaca option_chain_snapshots (used by replay packs). Pruned hourly by orchestrator; or run: python scripts/prune_option_chain_snapshots.py --days 30
 
 # -----------------------------------------------------------------------------
 # Health Monitoring
