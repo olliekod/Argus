@@ -829,6 +829,15 @@ class ArgusOrchestrator:
             return
         if not self.conditions_monitor:
             return
+        self.telegram.set_callbacks(
+            get_conditions=self._get_status_summary,
+            get_pnl=self._get_pnl_summary,
+            get_positions=self._get_positions_summary,
+            get_farm_status=self._get_farm_status,
+            get_signal_status=self._get_signal_status,
+            get_research_status=self._get_research_status,
+            get_dashboard=self._get_dashboard,
+            get_zombies=self._get_zombies,
             get_followed=self._get_followed_traders,
         )
         
@@ -1645,8 +1654,10 @@ class ArgusOrchestrator:
                 return
 
             for trade in matched[:5]:  # Cap at 5 to avoid spam
-                # ... implementation details ...
+                # This is a stub for future implementation
                 pass
+        except Exception as e:
+            self.logger.warning(f"Failed to alert followed trades: {e}")
 
     async def _send_exit_summary(self, trades: list) -> None:
         """Send consolidated summary of closed trades."""
@@ -1709,22 +1720,6 @@ class ArgusOrchestrator:
                     f"Guard: {guard}\n"
                     f"Message: {message}"
                 )
-
-                lines = [
-                    f"⭐ <b>Followed Trader Entry</b>",
-                    "",
-                    f"Trader: <b>{trade.trader_id}</b>",
-                    f"Symbol: {symbol}",
-                    f"Strategy: {trade.strategy}",
-                    f"Strikes: {trade.strikes}",
-                    f"Expiry: {trade.expiry}",
-                    f"Credit: ${trade.entry_credit:.2f}",
-                    "",
-                    f"<i>{datetime.now(ZoneInfo('America/New_York')).strftime('%H:%M:%S %Z')}</i>",
-                ]
-                await self.telegram.send_message("\n".join(lines))
-        except Exception as e:
-            self.logger.warning(f"Follow alert error: {e}")
 
     async def _run_uniformity_check(self) -> None:
         """Run uniformity check every N evaluations to detect convergence bugs."""

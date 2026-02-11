@@ -134,7 +134,7 @@ async def create_replay_pack(
                 "bar_duration": bar_duration,
                 "start_date": start_date,
                 "end_date": end_date,
-                "packed_at": datetime.now(timezone.utc).isoformat(),
+                "packed_at": datetime.utcnow().isoformat(),
                 "bar_count": len(bars_raw),
                 "outcome_count": len(outcomes),
                 "regime_count": len(all_regimes),
