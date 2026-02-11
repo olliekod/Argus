@@ -147,7 +147,7 @@ class OptionsChainAssembler:
             atm_iv=atm_iv,
             timestamp_ms=now_ms,
             source_ts_ms=source_ts_ms,
-            event_ts_ms=now_ms,
+            recv_ts_ms=now_ms,
             provider=provider,
             snapshot_id=snapshot_id,
             sequence_id=self._seq.next(),
@@ -236,7 +236,7 @@ class OptionsChainAssembler:
                 vega=raw.get("vega"),
                 timestamp_ms=timestamp_ms,
                 source_ts_ms=source_ts_ms,
-                event_ts_ms=timestamp_ms,
+                recv_ts_ms=timestamp_ms,
                 provider=provider,
                 sequence_id=self._seq.next(),
             )

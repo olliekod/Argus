@@ -9,10 +9,12 @@ def test_provider_benchmark_scorecard_shape():
     options = [
         {
             "provider": "tastytrade_dxlink",
-            "missing_quote_rate": 0.1,
-            "time_to_first_option_quote_ms": 500.0,
-            "stale_age_sec_p95": 1.0,
-            "spread_bps_p95": 40.0,
+            "missing_rate": 0.1,
+            "handshake_latency": 500.0,
+            "lag_p95": 1000.0,
+            "spread_p95": 40.0,
+            "total_events": 100,
+            "events_missing_ts": 5,
             "greeks_presence_rate": 0.0,
         }
     ]

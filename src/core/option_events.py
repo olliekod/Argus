@@ -96,7 +96,7 @@ class OptionQuoteEvent:
     # Timestamps (all int milliseconds UTC)
     timestamp_ms: int = 0          # Event logical time
     source_ts_ms: int = 0          # Provider timestamp
-    event_ts_ms: int = field(default_factory=_now_ms)  # Argus arrival time
+    recv_ts_ms: int = field(default_factory=_now_ms)  # Local arrival time
     
     provider: str = ""             # "alpaca" | "tradier"
     sequence_id: int = 0           # Monotonic for tape ordering
@@ -132,7 +132,7 @@ class OptionChainSnapshotEvent:
     # Timestamps
     timestamp_ms: int = 0                # Snapshot logical time
     source_ts_ms: int = 0                # Provider chain timestamp
-    event_ts_ms: int = field(default_factory=_now_ms)  # Argus arrival time
+    recv_ts_ms: int = field(default_factory=_now_ms)  # Local arrival time
     
     provider: str = ""
     snapshot_id: str = ""                # Deterministic: f"{symbol}_{expiration}_{timestamp_ms}"
@@ -207,7 +207,7 @@ def option_quote_to_dict(q: OptionQuoteEvent, sequence_id: int = 0) -> Dict[str,
         "vega": q.vega,
         "timestamp_ms": q.timestamp_ms,
         "source_ts_ms": q.source_ts_ms,
-        "event_ts_ms": q.event_ts_ms,
+        "recv_ts_ms": q.recv_ts_ms,
         "provider": q.provider,
         "sequence_id": sequence_id if sequence_id else q.sequence_id,
         "v": q.v,
@@ -235,7 +235,7 @@ def dict_to_option_quote(d: Dict[str, Any]) -> OptionQuoteEvent:
         vega=d.get("vega"),
         timestamp_ms=d.get("timestamp_ms", 0),
         source_ts_ms=d.get("source_ts_ms", 0),
-        event_ts_ms=d.get("event_ts_ms", 0),
+        recv_ts_ms=d.get("recv_ts_ms", 0),
         provider=d.get("provider", ""),
         sequence_id=d.get("sequence_id", 0),
         v=d.get("v", 1),
@@ -256,7 +256,7 @@ def option_chain_to_dict(s: OptionChainSnapshotEvent, sequence_id: int = 0) -> D
         "atm_iv": s.atm_iv,
         "timestamp_ms": s.timestamp_ms,
         "source_ts_ms": s.source_ts_ms,
-        "event_ts_ms": s.event_ts_ms,
+        "recv_ts_ms": s.recv_ts_ms,
         "provider": s.provider,
         "snapshot_id": s.snapshot_id,
         "sequence_id": sequence_id if sequence_id else s.sequence_id,
@@ -283,7 +283,7 @@ def dict_to_option_chain(d: Dict[str, Any]) -> OptionChainSnapshotEvent:
         atm_iv=d.get("atm_iv"),
         timestamp_ms=d.get("timestamp_ms", 0),
         source_ts_ms=d.get("source_ts_ms", 0),
-        event_ts_ms=d.get("event_ts_ms", 0),
+        recv_ts_ms=d.get("recv_ts_ms", 0),
         provider=d.get("provider", ""),
         snapshot_id=d.get("snapshot_id", ""),
         sequence_id=d.get("sequence_id", 0),

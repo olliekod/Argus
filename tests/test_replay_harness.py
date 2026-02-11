@@ -36,7 +36,7 @@ class NullStrategy(ReplayStrategy):
     def strategy_id(self) -> str:
         return "NULL_STRATEGY"
 
-    def on_bar(self, bar, sim_ts_ms, session_regime, visible_outcomes):
+    def on_bar(self, bar, sim_ts_ms, session_regime, visible_outcomes, **kwargs):
         pass
 
     def generate_intents(self, sim_ts_ms):
@@ -55,7 +55,7 @@ class BuyOnSecondBarStrategy(ReplayStrategy):
     def strategy_id(self) -> str:
         return "BUY_ON_SECOND_BAR"
 
-    def on_bar(self, bar, sim_ts_ms, session_regime, visible_outcomes):
+    def on_bar(self, bar, sim_ts_ms, session_regime, visible_outcomes, **kwargs):
         self._bar_count += 1
 
     def generate_intents(self, sim_ts_ms):
@@ -93,7 +93,7 @@ class OutcomeLeakDetector(ReplayStrategy):
     def strategy_id(self) -> str:
         return "LEAK_DETECTOR"
 
-    def on_bar(self, bar, sim_ts_ms, session_regime, visible_outcomes):
+    def on_bar(self, bar, sim_ts_ms, session_regime, visible_outcomes, **kwargs):
         self._observations.append({
             "bar_ts_ms": bar.timestamp_ms,
             "sim_ts_ms": sim_ts_ms,
@@ -436,7 +436,7 @@ class TestReplayEndToEnd:
             @property
             def strategy_id(self):
                 return "ORDER_TRACKER"
-            def on_bar(self, bar, sim_ts_ms, session_regime, visible_outcomes):
+            def on_bar(self, bar, sim_ts_ms, session_regime, visible_outcomes, **kwargs):
                 seen_ts.append(bar.timestamp_ms)
             def generate_intents(self, sim_ts_ms):
                 return []

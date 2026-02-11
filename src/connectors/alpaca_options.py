@@ -284,7 +284,7 @@ class AlpacaOptionsConnector:
                 vega=greeks.get("vega"),
                 timestamp_ms=now_ms,
                 source_ts_ms=quote_data.get("t", now_ms),
-                event_ts_ms=now_ms,
+                recv_ts_ms=now_ms,
                 provider=self.PROVIDER,
                 sequence_id=self._next_sequence_id(),
             )
@@ -318,7 +318,7 @@ class AlpacaOptionsConnector:
             atm_iv=atm_iv,
             timestamp_ms=now_ms,
             source_ts_ms=now_ms,
-            event_ts_ms=now_ms,
+            recv_ts_ms=now_ms,
             provider=self.PROVIDER,
             snapshot_id=snapshot_id,
             sequence_id=self._next_sequence_id(),

@@ -2,19 +2,23 @@
 Deterministic Replay Harness
 =============================
 
-Replays persisted ``market_bars`` and ``bar_outcomes`` from the database
-in strict chronological order, advancing a virtual clock bar-by-bar.
+Replays persisted ``market_bars``, ``bar_outcomes``, and ``regimes``
+from the database in strict chronological order, advancing a virtual
+clock bar-by-bar.
 
-Lookahead barrier (the "Time Guard")
--------------------------------------
-The **invariant**: a strategy must never observe an outcome whose
-``window_end_ms`` is greater than the current simulation time.
+Lookahead barriers (the "Time Guard")
+--------------------------------------
+The **invariant**: a strategy must never observe data it could not
+have seen in real time.
+
+- **Outcomes**: only visible when ``sim_time >= outcome.window_end_ms``.
+- **Regimes**: only visible when ``sim_time >= regime.timestamp_ms``.
+- **Snapshots**: only visible when ``sim_time >= snapshot.recv_ts_ms``.
 
 This is enforced structurally:
-1. Bars are yielded in ascending timestamp order.
-2. Outcomes are only made available when
-   ``sim_time >= outcome.window_end_ms``.
-3. The harness never calls ``strategy.evaluate()`` with data it
+1. All data streams are sorted by their release timestamp.
+2. Cursors advance monotonically and never look back.
+3. The harness never calls ``strategy.on_bar()`` with data it
    could not have observed at that point in real time.
 
 Replay loop
@@ -79,6 +83,8 @@ class MarketDataSnapshot:
     recv_ts_ms: int           # local receipt time (epoch ms)
     bid: float = 0.0
     ask: float = 0.0
+    underlying_price: float = 0.0
+    atm_iv: Optional[float] = None
     bid_size: int = 0
     ask_size: int = 0
     quote_ts_ms: int = 0      # provider timestamp (may be 0)
@@ -135,11 +141,17 @@ class ReplayStrategy(ABC):
         sim_ts_ms: int,
         session_regime: str,
         visible_outcomes: Dict[int, OutcomeResult],
+        *,
+        visible_regimes: Optional[Dict[str, Dict[str, Any]]] = None,
+        visible_snapshots: Optional[List[Any]] = None,
     ) -> None:
         """Feed one bar to the strategy.
 
         ``visible_outcomes`` only contains outcomes whose
         ``window_end_ms <= sim_ts_ms`` (the lookahead barrier).
+
+        ``visible_regimes`` maps ``scope`` (symbol or market name) to
+        the latest regime dict whose ``timestamp_ms <= sim_ts_ms``.
         """
         ...
 
@@ -386,12 +398,14 @@ class ReplayResult:
     bars_replayed: int
     outcomes_used: int
     session_distribution: Dict[str, int]
+    regimes_loaded: int = 0
 
     def summary(self) -> Dict[str, Any]:
         return {
             "strategy_id": self.strategy_id,
             "bars_replayed": self.bars_replayed,
             "outcomes_used": self.outcomes_used,
+            "regimes_loaded": self.regimes_loaded,
             "portfolio": self.portfolio_summary,
             "execution": self.execution_summary,
             "sessions": self.session_distribution,
@@ -424,6 +438,7 @@ class ReplayHarness:
         execution_model: Any,  # ExecutionModel — avoid circular import
         config: Optional[ReplayConfig] = None,
         snapshots: Optional[List[MarketDataSnapshot]] = None,
+        regimes: Optional[List[Dict[str, Any]]] = None,
     ) -> None:
         self._bars = sorted(bars, key=lambda b: b.timestamp_ms)
         self._cfg = config or ReplayConfig()
@@ -449,6 +464,12 @@ class ReplayHarness:
             snapshots or [], key=lambda s: s.recv_ts_ms
         )
 
+        # Regimes sorted by timestamp_ms for lookahead barrier
+        self._regimes_sorted: List[Dict[str, Any]] = sorted(
+            regimes or [],
+            key=lambda r: r.get("timestamp_ms", 0),
+        )
+
         self._session_counts: Dict[str, int] = {}
 
     def run(self) -> ReplayResult:
@@ -457,21 +478,28 @@ class ReplayHarness:
         This is the core of the backtester.  It enforces:
         1. Bars are processed in strict chronological order.
         2. Outcomes are only visible when ``sim_time >= window_end_ms``.
-        3. Market data snapshots are only visible when
+        3. Regimes are only visible when ``sim_time >= regime.timestamp_ms``.
+        4. Market data snapshots are only visible when
            ``sim_time >= snapshot.recv_ts_ms`` (data availability barrier).
-        4. Strategy only sees data it could have observed at that point.
+        5. Strategy only sees data it could have observed at that point.
         """
         bar_duration_ms = self._cfg.bar_duration_seconds * 1000
         visible_outcomes: Dict[int, OutcomeResult] = {}
         visible_snapshots: List[MarketDataSnapshot] = []
+        # Latest regime per scope (symbol or market) — only includes
+        # regimes whose timestamp_ms <= sim_ts_ms.
+        visible_regimes: Dict[str, Dict[str, Any]] = {}
         outcome_cursor = 0  # pointer into _outcomes_sorted
         snapshot_cursor = 0  # pointer into _snapshots_sorted
+        regime_cursor = 0    # pointer into _regimes_sorted
         outcomes_used = 0
 
         logger.info(
-            "Replay starting: %d bars, %d outcomes, %d snapshots, strategy=%s",
+            "Replay starting: %d bars, %d outcomes, %d regimes, "
+            "%d snapshots, strategy=%s",
             len(self._bars), len(self._outcomes_sorted),
-            len(self._snapshots_sorted), self._strategy.strategy_id,
+            len(self._regimes_sorted), len(self._snapshots_sorted),
+            self._strategy.strategy_id,
         )
 
         for bar in self._bars:
@@ -489,6 +517,17 @@ class ReplayHarness:
                 outcome_cursor += 1
                 outcomes_used += 1
 
+            # ── Regime Barrier: release regimes whose timestamp has passed ──
+            while regime_cursor < len(self._regimes_sorted):
+                regime = self._regimes_sorted[regime_cursor]
+                rts = regime.get("timestamp_ms", 0)
+                if rts > sim_ts_ms:
+                    break  # This regime is still in the future
+                # Keep only the latest per scope (overwrites older)
+                scope = regime.get("scope", "")
+                visible_regimes[scope] = regime
+                regime_cursor += 1
+
             # ── Data Availability Barrier: release snapshots received by now ──
             while snapshot_cursor < len(self._snapshots_sorted):
                 snap = self._snapshots_sorted[snapshot_cursor]
@@ -502,20 +541,21 @@ class ReplayHarness:
             self._session_counts[session] = self._session_counts.get(session, 0) + 1
 
             # ── Strategy evaluation ──────────────────────────────────────
-            # Pass visible_snapshots only if there are snapshots — this
-            # maintains backward compat with old strategies that don't
-            # accept the parameter.
-            if self._snapshots_sorted:
-                try:
-                    self._strategy.on_bar(
-                        bar, sim_ts_ms, session, visible_outcomes,
-                        visible_snapshots=list(visible_snapshots),
-                    )
-                except TypeError:
-                    # Old strategy doesn't accept visible_snapshots
+            # Pass regimes and snapshots as keyword args.  If the strategy
+            # is an old-style implementation without **kwargs, fall back
+            # gracefully (backward compatible).
+            try:
+                self._strategy.on_bar(
+                    bar, sim_ts_ms, session, visible_outcomes,
+                    visible_regimes=dict(visible_regimes),
+                    visible_snapshots=list(visible_snapshots),
+                )
+            except TypeError as exc:
+                # Only fall back if the error is about unexpected kwargs
+                if "unexpected keyword argument" in str(exc):
                     self._strategy.on_bar(bar, sim_ts_ms, session, visible_outcomes)
-            else:
-                self._strategy.on_bar(bar, sim_ts_ms, session, visible_outcomes)
+                else:
+                    raise
             intents = self._strategy.generate_intents(sim_ts_ms)
 
             # ── Execution ────────────────────────────────────────────────
@@ -541,6 +581,7 @@ class ReplayHarness:
             bars_replayed=len(self._bars),
             outcomes_used=outcomes_used,
             session_distribution=dict(self._session_counts),
+            regimes_loaded=len(self._regimes_sorted),
         )
 
         logger.info(
@@ -670,6 +711,41 @@ class ReplayHarness:
 # Helper: load bars + outcomes from DB (async → sync bridge)
 # ═══════════════════════════════════════════════════════════════════════════
 
+def get_latest_regime(
+    regimes: List[Dict[str, Any]],
+    scope: str,
+    asof_ms: int,
+) -> Optional[Dict[str, Any]]:
+    """Return the most recent regime for *scope* at or before *asof_ms*.
+
+    Parameters
+    ----------
+    regimes : list of dict
+        Regime rows, each with ``scope`` and ``timestamp_ms`` keys.
+        Must be sorted ascending by ``timestamp_ms`` (as returned by
+        ``Database.get_regimes``).
+    scope : str
+        Symbol (e.g. ``"SPY"``) or market (e.g. ``"EQUITIES"``).
+    asof_ms : int
+        The simulation time.  Only regimes with
+        ``timestamp_ms <= asof_ms`` are considered.
+
+    Returns
+    -------
+    dict or None
+        The latest matching regime, or ``None`` if no regime existed
+        at that point in time.
+    """
+    result: Optional[Dict[str, Any]] = None
+    for r in regimes:
+        if r.get("scope") != scope:
+            continue
+        if r.get("timestamp_ms", 0) > asof_ms:
+            break  # sorted ascending → all remaining are later
+        result = r
+    return result
+
+
 async def load_replay_data(
     db: Any,
     provider: str,
@@ -678,10 +754,14 @@ async def load_replay_data(
     start_ms: int,
     end_ms: int,
     horizons: Optional[List[int]] = None,
+    *,
+    load_regimes: bool = False,
+    load_snapshots: bool = False,
 ) -> tuple:
-    """Load bars and outcomes from the database for replay.
+    """Load bars, outcomes, and optionally regimes/snapshots from the database.
 
-    Returns ``(bars: List[BarData], outcomes: List[dict])``.
+    Returns:
+        (bars, outcomes, [regimes], [snapshots]) depending on flags.
     """
     from src.core.outcome_engine import BarData, _timestamp_to_ms
 
@@ -720,4 +800,41 @@ async def load_replay_data(
         limit=500_000,
     )
 
-    return bars, outcomes
+    regimes = []
+    if load_regimes:
+        regimes = await db.get_regimes(
+            scope=symbol,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+
+    snapshots = []
+    if load_snapshots:
+        # Load chain snapshots with receipt time
+        snaps_raw = await db.get_option_chain_snapshots(
+            symbol=symbol,
+            start_ms=start_ms,
+            end_ms=end_ms,
+        )
+        for s in snaps_raw:
+            # Fallback to timestamp_ms if recv_ts_ms is NULL (for old data)
+            recv_ts = s.get("recv_ts_ms")
+            if recv_ts is None:
+                recv_ts = s.get("timestamp_ms", 0)
+                
+            snapshots.append(MarketDataSnapshot(
+                symbol=s["symbol"],
+                recv_ts_ms=recv_ts,
+                underlying_price=s["underlying_price"],
+                atm_iv=s.get("atm_iv"),
+                quote_ts_ms=s.get("source_ts_ms", 0),
+                source=s.get("provider", ""),
+            ))
+
+    # Dynamic return based on flags
+    ret = [bars, outcomes]
+    if load_regimes:
+        ret.append(regimes)
+    if load_snapshots:
+        ret.append(snapshots)
+    return tuple(ret)

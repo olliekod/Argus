@@ -56,6 +56,8 @@ from .events import (
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_METRICS,
     TOPIC_OPTIONS_CHAINS,
+    TOPIC_REGIMES_SYMBOL,
+    TOPIC_REGIMES_MARKET,
     TOPIC_SIGNALS,
     TOPIC_SIGNALS_RAW,
     TOPIC_SYSTEM_HEARTBEAT,
@@ -63,6 +65,7 @@ from .events import (
 )
 from .liquid_etf_universe import LIQUID_ETF_UNIVERSE
 from .option_events import OptionChainSnapshotEvent, option_chain_to_dict
+from .regimes import SymbolRegimeEvent, MarketRegimeEvent
 from .signals import SignalEvent as Phase3SignalEvent, normalize_snapshot
 
 logger = logging.getLogger("argus.persistence")
@@ -274,6 +277,9 @@ class PersistenceManager:
         bus.subscribe(TOPIC_SYSTEM_COMPONENT_HEARTBEAT, self._on_component_heartbeat)
         # Phase 3B: Options chain snapshots (idempotent upsert)
         bus.subscribe(TOPIC_OPTIONS_CHAINS, self._on_option_chain)
+        # Phase 4B: Regime events (symbol + market)
+        bus.subscribe(TOPIC_REGIMES_SYMBOL, self._on_symbol_regime)
+        bus.subscribe(TOPIC_REGIMES_MARKET, self._on_market_regime)
 
         logger.info("PersistenceManager initialised (bar_buffer_max=%d)", self._bar_buffer_max)
 
@@ -739,12 +745,72 @@ class PersistenceManager:
                 atm_iv=event.atm_iv,
                 timestamp_ms=event.timestamp_ms,
                 source_ts_ms=event.source_ts_ms,
+                recv_ts_ms=event.recv_ts_ms,  # Local arrival time
                 provider=event.provider,
                 quotes_json=quotes_json,
             ),
             self._loop,
         )
         # Fire-and-forget (errors logged in db method)
+        future.add_done_callback(lambda f: f.exception() if f.exception() else None)
+
+    def _on_symbol_regime(self, event: SymbolRegimeEvent) -> None:
+        """Persist a symbol regime event via fire-and-forget async write.
+
+        Extracts all fields from the event — including the new liquidity
+        fields (``liquidity_regime``, ``spread_pct``, ``volume_pctile``) —
+        and packs remaining numeric metrics into ``metrics_json``.
+        """
+        if not self._running:
+            return
+        metrics = {
+            "atr": event.atr,
+            "atr_pct": event.atr_pct,
+            "vol_z": event.vol_z,
+            "ema_fast": event.ema_fast,
+            "ema_slow": event.ema_slow,
+            "ema_slope": event.ema_slope,
+            "rsi": event.rsi,
+        }
+        future = asyncio.run_coroutine_threadsafe(
+            self._db.write_regime(
+                event_type="symbol",
+                scope=event.symbol,
+                timeframe=event.timeframe,
+                timestamp_ms=event.timestamp_ms,
+                config_hash=event.config_hash,
+                vol_regime=event.vol_regime,
+                trend_regime=event.trend_regime,
+                liquidity_regime=event.liquidity_regime,
+                spread_pct=event.spread_pct,
+                volume_pctile=event.volume_pctile,
+                confidence=event.confidence,
+                is_warm=event.is_warm,
+                data_quality_flags=event.data_quality_flags,
+                metrics_json=json.dumps(metrics, sort_keys=True),
+            ),
+            self._loop,
+        )
+        future.add_done_callback(lambda f: f.exception() if f.exception() else None)
+
+    def _on_market_regime(self, event: MarketRegimeEvent) -> None:
+        """Persist a market regime event via fire-and-forget async write."""
+        if not self._running:
+            return
+        future = asyncio.run_coroutine_threadsafe(
+            self._db.write_regime(
+                event_type="market",
+                scope=event.market,
+                timeframe=event.timeframe,
+                timestamp_ms=event.timestamp_ms,
+                config_hash=event.config_hash,
+                session_regime=event.session_regime,
+                risk_regime=event.risk_regime,
+                confidence=event.confidence,
+                data_quality_flags=event.data_quality_flags,
+            ),
+            self._loop,
+        )
         future.add_done_callback(lambda f: f.exception() if f.exception() else None)
 
     # ── flush logic ─────────────────────────────────────────

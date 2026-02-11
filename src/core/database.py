@@ -447,8 +447,11 @@ class Database:
                 config_hash TEXT NOT NULL,
                 vol_regime TEXT,
                 trend_regime TEXT,
+                liquidity_regime TEXT,
                 session_regime TEXT,
                 risk_regime TEXT,
+                spread_pct REAL,
+                volume_pctile REAL,
                 confidence REAL,
                 is_warm INTEGER,
                 data_quality_flags INTEGER,
@@ -461,6 +464,22 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_regimes_lookup "
             "ON regimes(event_type, scope, timeframe, timestamp DESC)"
         )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_regimes_scope_ts "
+            "ON regimes(scope, timestamp)"
+        )
+        # Safe migration: add columns if they don't exist yet (idempotent)
+        for col, col_type in [
+            ("liquidity_regime", "TEXT"),
+            ("spread_pct", "REAL"),
+            ("volume_pctile", "REAL"),
+        ]:
+            try:
+                await self._connection.execute(
+                    f"ALTER TABLE regimes ADD COLUMN {col} {col_type}"
+                )
+            except Exception:
+                pass  # Column already exists
 
         # Phase 3: Trading signals (from strategy modules)
         await self._connection.execute("""
@@ -562,6 +581,7 @@ class Database:
                 vega REAL,
                 timestamp_ms INTEGER NOT NULL,
                 source_ts_ms INTEGER,
+                recv_ts_ms INTEGER,
                 provider TEXT,
                 FOREIGN KEY (contract_id) REFERENCES option_contracts(contract_id)
             )
@@ -569,6 +589,10 @@ class Database:
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_oq_ts "
             "ON option_quotes(timestamp_ms)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_oq_recv_ts "
+            "ON option_quotes(recv_ts_ms)"
         )
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_oq_symbol_exp "
@@ -589,6 +613,7 @@ class Database:
                 atm_iv REAL,
                 timestamp_ms INTEGER NOT NULL,
                 source_ts_ms INTEGER,
+                recv_ts_ms INTEGER,
                 provider TEXT NOT NULL,
                 quotes_json TEXT NOT NULL,
                 UNIQUE(provider, symbol, timestamp_ms)
@@ -597,6 +622,14 @@ class Database:
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_ocs_ts "
             "ON option_chain_snapshots(timestamp_ms)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocs_recv_ts "
+            "ON option_chain_snapshots(recv_ts_ms)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocs_symbol_recv "
+            "ON option_chain_snapshots(symbol, recv_ts_ms)"
         )
 
         # Phase 4A.1: Bar outcomes (backtest ground truth)
@@ -661,6 +694,15 @@ class Database:
             "ON system_heartbeat(component, timestamp_ms)"
         )
 
+        # Safe migrations for options tables (idempotent)
+        for table in ["option_quotes", "option_chain_snapshots"]:
+            try:
+                await self._connection.execute(
+                    f"ALTER TABLE {table} ADD COLUMN recv_ts_ms INTEGER"
+                )
+            except Exception:
+                pass
+
         await self._connection.commit()
 
         logger.debug("Database tables created/verified")
@@ -717,6 +759,7 @@ class Database:
         atm_iv: float | None,
         timestamp_ms: int,
         source_ts_ms: int | None,
+        recv_ts_ms: int | None,
         provider: str,
         quotes_json: str,
     ) -> bool:
@@ -732,12 +775,14 @@ class Database:
             await self._connection.execute("""
                 INSERT INTO option_chain_snapshots (
                     snapshot_id, symbol, expiration_ms, underlying_price,
-                    n_strikes, atm_iv, timestamp_ms, source_ts_ms, provider, quotes_json
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    n_strikes, atm_iv, timestamp_ms, source_ts_ms, recv_ts_ms,
+                    provider, quotes_json
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(provider, symbol, timestamp_ms) DO NOTHING
             """, (
                 snapshot_id, symbol, expiration_ms, underlying_price,
-                n_strikes, atm_iv, timestamp_ms, source_ts_ms, provider, quotes_json,
+                n_strikes, atm_iv, timestamp_ms, source_ts_ms, recv_ts_ms,
+                provider, quotes_json,
             ))
             await self._connection.commit()
             return True
@@ -1557,8 +1602,11 @@ class Database:
         config_hash: str,
         vol_regime: Optional[str] = None,
         trend_regime: Optional[str] = None,
+        liquidity_regime: Optional[str] = None,
         session_regime: Optional[str] = None,
         risk_regime: Optional[str] = None,
+        spread_pct: Optional[float] = None,
+        volume_pctile: Optional[float] = None,
         confidence: float = 0.0,
         is_warm: bool = False,
         data_quality_flags: int = 0,
@@ -1566,21 +1614,128 @@ class Database:
     ) -> None:
         """
         Upsert a regime event.
-        
+
         Uses INSERT OR REPLACE for idempotency.
+        All new fields (liquidity_regime, spread_pct, volume_pctile) are
+        optional and default to NULL for backward compatibility.
         """
         await self._connection.execute("""
             INSERT OR REPLACE INTO regimes (
                 event_type, scope, timeframe, timestamp, config_hash,
-                vol_regime, trend_regime, session_regime, risk_regime,
+                vol_regime, trend_regime, liquidity_regime,
+                session_regime, risk_regime,
+                spread_pct, volume_pctile,
                 confidence, is_warm, data_quality_flags, metrics_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             event_type, scope, timeframe, timestamp_ms, config_hash,
-            vol_regime, trend_regime, session_regime, risk_regime,
+            vol_regime, trend_regime, liquidity_regime,
+            session_regime, risk_regime,
+            spread_pct, volume_pctile,
             confidence, 1 if is_warm else 0, data_quality_flags, metrics_json,
         ))
         await self._connection.commit()
+
+    async def get_regimes(
+        self,
+        scope: str,
+        *,
+        event_type: Optional[str] = None,
+        start_ms: Optional[int] = None,
+        end_ms: Optional[int] = None,
+        limit: int = 100_000,
+    ) -> List[Dict[str, Any]]:
+        """
+        Load regime rows for a given scope (symbol or market).
+
+        Parameters
+        ----------
+        scope : str
+            Symbol (e.g. "SPY") or market (e.g. "EQUITIES").
+        event_type : str, optional
+            Filter by "symbol" or "market". If None, returns both.
+        start_ms / end_ms : int, optional
+            Epoch-ms range filter on ``timestamp``.
+        limit : int
+            Max rows returned (default 100k).
+
+        Returns
+        -------
+        List[Dict[str, Any]]
+            Rows ordered by timestamp ascending, each with ``timestamp_ms``
+            normalised from the DB ``timestamp`` column.
+        """
+        clauses = ["scope = ?"]
+        params: list = [scope]
+        if event_type is not None:
+            clauses.append("event_type = ?")
+            params.append(event_type)
+        if start_ms is not None:
+            clauses.append("timestamp >= ?")
+            params.append(start_ms)
+        if end_ms is not None:
+            clauses.append("timestamp <= ?")
+            params.append(end_ms)
+        where = " AND ".join(clauses)
+        params.append(limit)
+
+        cursor = await self._connection.execute(
+            f"SELECT * FROM regimes WHERE {where} ORDER BY timestamp ASC LIMIT ?",
+            params,
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        results = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            # Normalise the column name for consumers
+            d["timestamp_ms"] = d.pop("timestamp", d.get("timestamp_ms", 0))
+            results.append(d)
+        return results
+
+    async def get_latest_regime(
+        self,
+        scope: str,
+        asof_ms: int,
+        event_type: str = "symbol",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Return the most recent regime for *scope* at or before *asof_ms*.
+
+        This is the primary helper for replay: it answers
+        "what regime was in effect for SPY at simulation time T?"
+        """
+        cursor = await self._connection.execute(
+            """SELECT * FROM regimes
+               WHERE scope = ? AND event_type = ? AND timestamp <= ?
+               ORDER BY timestamp DESC LIMIT 1""",
+            (scope, event_type, asof_ms),
+        )
+        row = await cursor.fetchone()
+        if row is None:
+            return None
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        d = dict(zip(cols, row))
+        d["timestamp_ms"] = d.pop("timestamp", d.get("timestamp_ms", 0))
+        return d
+
+    async def get_option_chain_snapshots(
+        self,
+        symbol: str,
+        start_ms: int,
+        end_ms: int,
+        limit: int = 100_000,
+    ) -> List[Dict[str, Any]]:
+        """Load option chain snapshot rows for replay."""
+        cursor = await self._connection.execute(
+            """SELECT * FROM option_chain_snapshots
+               WHERE symbol = ? AND timestamp_ms >= ? AND timestamp_ms <= ?
+               ORDER BY timestamp_ms ASC LIMIT ?""",
+            (symbol, start_ms, end_ms, limit),
+        )
+        rows = await cursor.fetchall()
+        cols = [d[0] for d in cursor.description] if cursor.description else []
+        return [dict(zip(cols, row)) for row in rows]
 
     async def get_recent_bars(
         self,
@@ -1796,6 +1951,7 @@ class Database:
         bid: float,
         ask: float,
         timestamp_ms: int,
+        recv_ts_ms: int | None = None,
         last: float = 0.0,
         mid: float = 0.0,
         volume: int = 0,
@@ -1814,13 +1970,13 @@ class Database:
                 contract_id, symbol, strike, expiration_ms, option_type,
                 bid, ask, last, mid, volume, open_interest,
                 iv, delta, gamma, theta, vega,
-                timestamp_ms, source_ts_ms, provider
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                timestamp_ms, source_ts_ms, recv_ts_ms, provider
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             contract_id, symbol, strike, expiration_ms, option_type,
             bid, ask, last, mid, volume, open_interest,
             iv, delta, gamma, theta, vega,
-            timestamp_ms, source_ts_ms, provider
+            timestamp_ms, source_ts_ms, recv_ts_ms, provider
         ))
         await self._connection.commit()
 

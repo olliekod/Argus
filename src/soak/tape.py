@@ -547,7 +547,7 @@ class TapeRecorder:
             seq_id = self._get_next_sequence_id()
             d = option_chain_to_dict(event)
             d["sequence_id"] = seq_id
-            d["event_ts"] = event.timestamp_ms
+            d["event_ts"] = event.recv_ts_ms
             d["provider"] = event.provider
             d["event_type"] = "option_chain"
             was_full = len(self._tape) == self._tape.maxlen
