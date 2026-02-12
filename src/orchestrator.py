@@ -54,6 +54,8 @@ from .connectors.yahoo_client import YahooFinanceClient
 from .connectors.alpaca_client import AlpacaDataClient
 from .connectors.alpaca_options import AlpacaOptionsConnector, AlpacaOptionsConfig
 from .connectors.tastytrade_options import TastytradeOptionsConnector, TastytradeOptionsConfig
+from .connectors.public_client import PublicAPIClient, PublicAPIConfig
+from .connectors.public_options import PublicOptionsConnector, PublicOptionsConfig
 from .connectors.tastytrade_streamer import TastytradeStreamer
 from .core.greeks_cache import GreeksCache, enrich_snapshot_iv
 from .strategies.spread_generator import SpreadCandidateGenerator, SpreadGeneratorConfig
@@ -169,6 +171,7 @@ class ArgusOrchestrator:
             "coinbase",
             "ibit_options",
             "tastytrade_options",
+            "public_options",
             "polymarket_gamma",
             "polymarket_clob",
         ]
@@ -195,6 +198,7 @@ class ArgusOrchestrator:
         self.alpaca_client: Optional[AlpacaDataClient] = None
         self.alpaca_options: Optional[AlpacaOptionsConnector] = None
         self.tastytrade_options: Optional[TastytradeOptionsConnector] = None
+        self.public_options: Optional[PublicOptionsConnector] = None
         self.spread_generator: Optional[SpreadCandidateGenerator] = None
         self._greeks_cache: GreeksCache = GreeksCache()
         self._dxlink_streamer: Optional[TastytradeStreamer] = None
@@ -384,6 +388,7 @@ class ArgusOrchestrator:
             "coinbase": getattr(self, "coinbase_client", None),
             "ibit_options": getattr(self, "ibit_options_client", None),
             "tastytrade_options": self.tastytrade_options,
+            "public_options": self.public_options,
             "polymarket_gamma": self.polymarket_gamma,
             "polymarket_clob": self.polymarket_clob,
         }
@@ -691,6 +696,60 @@ class ArgusOrchestrator:
                 )
         else:
             self.logger.info("Tastytrade snapshot sampling disabled (set tastytrade.snapshot_sampling.enabled=true)")
+
+        # ── Public.com Options Snapshot Connector (hybrid chain structure + Public greeks) ──
+        public_opts_cfg = self.config.get('public_options', {})
+        if public_opts_cfg.get('enabled', False):
+            public_secret_cfg = self.secrets.get('public', {})
+            public_api_secret = public_secret_cfg.get('api_secret', '')
+            public_cfg = self.config.get('public', {})
+            public_account_id = str(
+                public_secret_cfg.get('account_id')
+                or public_cfg.get('account_id')
+                or ''
+            )
+
+            if not public_api_secret or str(public_api_secret).startswith('PASTE_'):
+                raise ValueError("public_options.enabled=true requires secrets.public.api_secret")
+
+            if not self.alpaca_options:
+                self.logger.warning(
+                    "Public options enabled but Alpaca options structure connector is unavailable; "
+                    "set exchanges.alpaca.options.enabled=true"
+                )
+            else:
+                self._public_options_symbols = public_opts_cfg.get('symbols', _DEFAULT_OPTIONS_SYMBOLS)
+                self._public_options_poll_interval = int(public_opts_cfg.get('poll_interval_seconds', 60))
+                self._public_options_min_dte = int(public_opts_cfg.get('min_dte', 7))
+                self._public_options_max_dte = int(public_opts_cfg.get('max_dte', 21))
+
+                public_client = PublicAPIClient(
+                    PublicAPIConfig(
+                        api_secret=public_api_secret,
+                        account_id=public_account_id,
+                        base_url=public_cfg.get('base_url', 'https://api.public.com'),
+                        timeout_seconds=float(public_cfg.get('timeout_seconds', 20.0)),
+                    )
+                )
+                self.public_options = PublicOptionsConnector(
+                    client=public_client,
+                    structure_connector=self.alpaca_options,
+                    config=PublicOptionsConfig(
+                        symbols=self._public_options_symbols,
+                        poll_interval_seconds=self._public_options_poll_interval,
+                        min_dte=self._public_options_min_dte,
+                        max_dte=self._public_options_max_dte,
+                    ),
+                )
+                self.logger.info(
+                    "Public options snapshot connector configured for %s (poll=%ds, DTE=%d-%d)",
+                    self._public_options_symbols,
+                    self._public_options_poll_interval,
+                    self._public_options_min_dte,
+                    self._public_options_max_dte,
+                )
+        else:
+            self.logger.info("Public options snapshots disabled (set public_options.enabled=true)")
 
     async def _setup_polymarket(self) -> None:
         """Initialize Polymarket connectors (optional, fail-soft)."""
@@ -1612,6 +1671,59 @@ class ArgusOrchestrator:
                         "Tastytrade backing off for %ds after %d consecutive errors",
                         backoff, consecutive_errors,
                     )
+                    await asyncio.sleep(backoff)
+                    continue
+
+            await asyncio.sleep(interval)
+
+    async def _poll_public_options_chains(self) -> None:
+        """Poll Public.com Greeks and publish options chain snapshots."""
+        if not self.public_options:
+            return
+
+        interval = getattr(self, '_public_options_poll_interval', 60)
+        symbols = getattr(self, '_public_options_symbols', _DEFAULT_OPTIONS_SYMBOLS)
+        min_dte = getattr(self, '_public_options_min_dte', 7)
+        max_dte = getattr(self, '_public_options_max_dte', 21)
+        consecutive_errors = 0
+
+        while self._running:
+            try:
+                if self._mh_cfg.get('off_hours_disable_options_snapshots', False):
+                    if not self._is_us_market_open():
+                        await asyncio.sleep(interval)
+                        continue
+
+                for symbol in symbols:
+                    try:
+                        snapshots = await self.public_options.build_snapshots_for_symbol(
+                            symbol,
+                            min_dte=min_dte,
+                            max_dte=max_dte,
+                        )
+                        for snapshot in snapshots:
+                            self.event_bus.publish(TOPIC_OPTIONS_CHAINS, snapshot)
+                            self.logger.debug(
+                                "Public chain: %s exp_ms=%d puts=%d calls=%d atm_iv=%s",
+                                snapshot.symbol,
+                                snapshot.expiration_ms,
+                                len(snapshot.puts),
+                                len(snapshot.calls),
+                                snapshot.atm_iv,
+                            )
+                    except Exception as exc:
+                        self.logger.error("Public options polling error for %s: %s", symbol, exc)
+
+                consecutive_errors = 0
+            except Exception as exc:
+                consecutive_errors += 1
+                self.logger.error(
+                    "Public options polling loop error (consecutive=%d): %s",
+                    consecutive_errors,
+                    exc,
+                )
+                if consecutive_errors >= 3:
+                    backoff = min(interval * consecutive_errors, 300)
                     await asyncio.sleep(backoff)
                     continue
 
@@ -2709,6 +2821,10 @@ class ArgusOrchestrator:
             self._tasks.append(asyncio.create_task(self._start_dxlink_greeks_streamer()))
             self._tasks.append(asyncio.create_task(self._log_iv_status()))
 
+        # Public OPTIONS chain polling (provider=public; snapshots already contain IV from Public greeks)
+        if self.public_options:
+            self._tasks.append(asyncio.create_task(self._poll_public_options_chains()))
+
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._health_check()))
         self._tasks.append(asyncio.create_task(self._run_db_maintenance()))
@@ -2945,6 +3061,8 @@ class ArgusOrchestrator:
             await self.alpaca_options.close()
         if self.tastytrade_options:
             self.tastytrade_options.close()
+        if self.public_options:
+            await self.public_options.close()
 
         # Close database
         await self.db.close()

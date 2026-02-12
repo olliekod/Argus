@@ -11,7 +11,7 @@ is enforced across replay packs, experiments, and strategies.
 | 1-min OHLCV Bars | **Alpaca** | Market Data API v2 |
 | Bar Outcomes (forward returns) | Derived from **Alpaca** bars | OutcomeEngine consumes bars_primary |
 | Regimes | Computed from **Alpaca** bars | Optionally quote-aware if quote data exists |
-| Options Chain Snapshots (IV/surface) | **Tastytrade** REST | Authoritative IV source |
+| Options Chain Snapshots (IV/surface) | **Tastytrade** REST or **Public.com** REST | Authoritative IV source |
 | Options Real-Time Quotes + Greeks | **Tastytrade** DXLink | Live mode only |
 | Options Snapshots (structural) | Alpaca *(secondary)* | Cross-check only; **no IV/greeks** |
 | Bars (backfill/sanity) | Yahoo *(secondary)* | Optional cross-validation |
@@ -25,7 +25,7 @@ The canonical policy lives in `config/config.yaml` under the
 data_sources:
   bars_primary: alpaca
   outcomes_from: bars_primary
-  options_snapshots_primary: tastytrade
+  options_snapshots_primary: tastytrade  # or public
   options_snapshots_secondary:
     - alpaca
   options_stream_primary: tastytrade_dxlink
@@ -67,6 +67,17 @@ config key is always `bars_primary`.
   expiry dates, `atm_iv` (at-the-money implied volatility), and
   any surface fields the Tastytrade API returns.
 - **This is the authoritative IV source** for all strategies.
+
+
+### Alternate Primary: Public.com REST
+
+- **Config key:** `options_snapshots_primary: public`
+- **What it provides:** Batch IV/Greeks (`impliedVolatility`, delta, gamma, theta, vega, rho)
+  via Public.com REST by OSI symbol.
+- **Integration mode:** Current v1 uses hybrid structure sourcing
+  (Alpaca chain structure + Public Greeks) and emits provider=`public` snapshots.
+- **Replay impact:** Replay packs and harness include these snapshots automatically
+  because they are read from `option_chain_snapshots` without provider-specific schema.
 
 ### Secondary: Alpaca (structural cross-check)
 
