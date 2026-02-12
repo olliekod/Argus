@@ -17,8 +17,11 @@ by default.
 """
 
 import argparse
+import json
 import sys
 from pathlib import Path
+
+import yaml
 
 # Ensure repo root is on sys.path so ``src`` imports work
 _REPO = Path(__file__).resolve().parent.parent
@@ -48,9 +51,28 @@ def main() -> None:
         default=False,
         help="Suppress console summary table",
     )
+    parser.add_argument(
+        "--kill-thresholds",
+        default=None,
+        help="JSON string or YAML file path with kill thresholds",
+    )
+    parser.add_argument(
+        "--output-killed",
+        default=None,
+        help="Optional output path for killed strategy list",
+    )
     args = parser.parse_args()
 
-    evaluator = StrategyEvaluator(input_dir=args.input)
+    kill_thresholds = None
+    if args.kill_thresholds:
+        candidate = Path(args.kill_thresholds)
+        if candidate.exists():
+            with open(candidate, "r") as f:
+                kill_thresholds = yaml.safe_load(f)
+        else:
+            kill_thresholds = json.loads(args.kill_thresholds)
+
+    evaluator = StrategyEvaluator(input_dir=args.input, kill_thresholds=kill_thresholds)
     count = evaluator.load_experiments()
 
     if count == 0:
@@ -62,6 +84,16 @@ def main() -> None:
 
     if not args.quiet:
         evaluator.print_summary()
+
+    if args.output_killed:
+        killed_out = {
+            "killed_count": len(evaluator.killed),
+            "killed": evaluator.killed,
+        }
+        Path(args.output_killed).parent.mkdir(parents=True, exist_ok=True)
+        with open(args.output_killed, "w") as f:
+            json.dump(killed_out, f, indent=2)
+        print(f"Killed list written to: {args.output_killed}")
 
     print(f"\nRankings written to: {out_path}")
     print(f"Evaluated {count} experiments.")

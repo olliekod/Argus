@@ -181,7 +181,13 @@ class ExperimentRunner:
             "secondary_options_included": secondary_included,
         }
 
-    def _save_result(self, config: ExperimentConfig, result: ReplayResult):
+    def _save_result(
+        self,
+        config: ExperimentConfig,
+        result: ReplayResult,
+        run_id_salt: str = "",
+        manifest_overrides: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """Persist result to JSON artifact with rich manifest."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -218,14 +224,13 @@ class ExperimentRunner:
 
         # 4. Deterministic Run ID
         # Strategy + Sorted Params + Sorted Pack Paths
-        input_data = f"{result.strategy_id}_{json.dumps(config.strategy_params, sort_keys=True)}_{sorted(config.replay_pack_paths)}"
+        input_data = f"{result.strategy_id}_{json.dumps(config.strategy_params, sort_keys=True)}_{sorted(config.replay_pack_paths)}_{run_id_salt}"
         run_id = hashlib.md5(input_data.encode()).hexdigest()[:8]
         filename = f"{result.strategy_id}_{config.tag}_{run_id}.json"
 
         output_file = self.output_dir / filename
 
-        artifact = {
-            "manifest": {
+        manifest = {
                 "run_id": run_id,
                 "strategy_class": config.strategy_class.__name__,
                 "strategy_params": config.strategy_params,
@@ -240,7 +245,12 @@ class ExperimentRunner:
                     "python_version": f"{datetime.now().year}.{datetime.now().month}", # Or sys.version
                     "timestamp": timestamp
                 }
-            },
+            }
+        if manifest_overrides:
+            manifest.update(manifest_overrides)
+
+        artifact = {
+            "manifest": manifest,
             "result": result.summary()
         }
 
@@ -285,8 +295,24 @@ class ExperimentRunner:
             
             current_idx += step_days
 
+    def _bar_range(self, bars: List[BarData]) -> tuple[int, int]:
+        if not bars:
+            return (0, 0)
+        timestamps = [b.timestamp_ms for b in bars]
+        return (min(timestamps), max(timestamps))
+
+    def _filter_dicts_by_time(self, records: List[Dict[str, Any]], start_ms: int, end_ms: int, ts_key: str = "timestamp_ms") -> List[Dict[str, Any]]:
+        out: List[Dict[str, Any]] = []
+        for rec in records:
+            ts = rec.get(ts_key)
+            if ts is None:
+                continue
+            if start_ms <= int(ts) <= end_ms:
+                out.append(rec)
+        return out
+
     def run_walk_forward(self, config: ExperimentConfig, 
-                         train_days: int, test_days: int) -> List[Dict[str, Any]]:
+                         train_days: int, test_days: int, persist_windows: bool = True) -> List[Dict[str, Any]]:
         """Run rolling walk-forward evaluation."""
         # 1. Load all data
         all_bars: List[BarData] = []
@@ -297,8 +323,9 @@ class ExperimentRunner:
         for pack_path in config.replay_pack_paths:
             pack = self.load_pack(pack_path)
             for b in pack.get("bars", []):
-                bar = BarData(timestamp_ms=b["timestamp_ms"], open=b["open"], high=b["high"], low=b["low"], close=b["close"])
-                if "symbol" in b: object.__setattr__(bar, 'symbol', b["symbol"])
+                bar = BarData(timestamp_ms=b["timestamp_ms"], open=b["open"], high=b["high"], low=b["low"], close=b["close"], volume=b.get("volume", 0))
+                if "symbol" in b:
+                    object.__setattr__(bar, 'symbol', b["symbol"])
                 all_bars.append(bar)
             all_outcomes.extend(pack.get("outcomes", []))
             all_regimes.extend(pack.get("regimes", []))
@@ -309,28 +336,53 @@ class ExperimentRunner:
         results = []
         for i, (train_bars, test_bars) in enumerate(self.split_walk_forward(all_bars, train_days, test_days)):
             print(f"Window {i+1}: Train {len(train_bars)} bars, Test {len(test_bars)} bars")
-            # In a real system, we'd "train" (optimize) on train_bars
-            # For now, we just run the strategy on test_bars to see how it performs in different periods
 
-            # Setup harness for test window (harness gates outcomes/regimes/snapshots by time)
+            start_ms, end_ms = self._bar_range(test_bars)
+            window_outcomes = self._filter_dicts_by_time(all_outcomes, start_ms, end_ms, ts_key="timestamp_ms")
+            window_regimes = self._filter_dicts_by_time(all_regimes, start_ms, end_ms, ts_key="timestamp_ms")
+            window_snapshots_dicts = self._filter_dicts_by_time(all_snapshots, start_ms, end_ms, ts_key="recv_ts_ms")
+            window_snapshots = self._pack_snapshots_to_objects(window_snapshots_dicts)
+
             strategy = config.strategy_class(config.strategy_params)
             exec_model = ExecutionModel(config.execution_config)
             harness = ReplayHarness(
                 bars=test_bars,
-                outcomes=all_outcomes,
+                outcomes=window_outcomes,
                 strategy=strategy,
                 execution_model=exec_model,
-                regimes=all_regimes,
-                snapshots=snapshots_objs,
+                regimes=window_regimes,
+                snapshots=window_snapshots if window_snapshots else snapshots_objs,
                 config=ReplayConfig(starting_cash=config.starting_cash)
             )
-            
+
             res = harness.run()
+
+            if persist_windows:
+                manifest_overrides = {
+                    "walk_forward": {
+                        "enabled": True,
+                        "window_index": i,
+                        "train_days": train_days,
+                        "test_days": test_days,
+                        "train_bars": len(train_bars),
+                        "test_bars": len(test_bars),
+                        "window_start_ms": start_ms,
+                        "window_end_ms": end_ms,
+                    }
+                }
+                self._save_result(
+                    config=config,
+                    result=res,
+                    run_id_salt=f"wf_window_{i}",
+                    manifest_overrides=manifest_overrides,
+                )
+
             results.append({
                 "window": i,
                 "pnl": res.portfolio_summary["total_realized_pnl"],
                 "sharpe": res.portfolio_summary["sharpe_annualized_proxy"],
-                "win_rate": res.portfolio_summary["win_rate"]
+                "win_rate": res.portfolio_summary["win_rate"],
+                "run_summary": res.summary(),
             })
-            
+
         return results
