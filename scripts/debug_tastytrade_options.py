@@ -23,11 +23,7 @@ if str(REPO_ROOT) not in sys.path:
 from src.core.config import ConfigurationError, load_config, load_secrets
 from src.core.options_normalize import normalize_tastytrade_nested_chain
 from src.core.option_events import option_chain_to_dict
-from src.connectors.tastytrade_rest import (
-    RetryConfig,
-    TastytradeError,
-    TastytradeRestClient,
-)
+from src.connectors.tastytrade_rest import TastytradeError
 from src.connectors.tastytrade_options import (
     TastytradeOptionsConnector,
     TastytradeOptionsConfig,
@@ -55,11 +51,11 @@ def main() -> int:
         print(f"Config error: {exc}")
         return 1
 
-    tasty_secrets = secrets.get("tastytrade", {})
-    username = tasty_secrets.get("username", "")
-    password = tasty_secrets.get("password", "")
-    if _is_placeholder(username) or _is_placeholder(password):
-        print("Tastytrade credentials missing; update config/secrets.yaml.")
+    try:
+        from scripts.tastytrade_health_audit import get_tastytrade_rest_client
+        client = get_tastytrade_rest_client(config, secrets)
+    except Exception as e:
+        print(f"Tastytrade credentials missing or auth failed: {e}")
         return 1
 
     tt_config = config.get("tastytrade", {})
@@ -76,27 +72,6 @@ def main() -> int:
     # Step 1: Fetch raw nested chain
     print("[1/4] Fetching nested chain...")
     start = time.time()
-
-    client = TastytradeRestClient(
-        username=username,
-        password=password,
-        environment=tt_config.get("environment", "live"),
-        timeout_seconds=tt_config.get("timeout_seconds", 20),
-        retries=RetryConfig(
-            max_attempts=retry_cfg.get("max_attempts", 3),
-            backoff_seconds=retry_cfg.get("backoff_seconds", 1.0),
-            backoff_multiplier=retry_cfg.get("backoff_multiplier", 2.0),
-        ),
-    )
-
-    try:
-        client.login()
-        print(f"  Login OK ({time.time() - start:.2f}s)")
-    except TastytradeError as exc:
-        print(f"  Login FAILED: {exc}")
-        client.close()
-        return 1
-
     try:
         raw = client.get_nested_option_chains(args.symbol)
         elapsed = time.time() - start
@@ -105,6 +80,8 @@ def main() -> int:
         print(f"  Fetch FAILED: {exc}")
         client.close()
         return 1
+
+    client.close()
 
     # Step 2: Normalize
     print("\n[2/4] Normalizing chain...")
@@ -129,21 +106,26 @@ def main() -> int:
         for c in normalized[:5]:
             print(f"    {c['right']} {c.get('expiry', '?')} ${c.get('strike', '?')} — {c.get('option_symbol', '?')}")
 
-    # Step 3: Build snapshots via connector
+    # Step 3: Build snapshots via connector (prefer OAuth when configured)
     print("\n[3/4] Building snapshots via TastytradeOptionsConnector...")
-    connector = TastytradeOptionsConnector(
-        config=TastytradeOptionsConfig(
-            username=username,
-            password=password,
-            environment=tt_config.get("environment", "live"),
-            timeout_seconds=tt_config.get("timeout_seconds", 20),
-            max_attempts=retry_cfg.get("max_attempts", 3),
-            backoff_seconds=retry_cfg.get("backoff_seconds", 1.0),
-            backoff_multiplier=retry_cfg.get("backoff_multiplier", 2.0),
-            min_dte=args.min_dte,
-            max_dte=args.max_dte,
-        )
+    tasty_secrets = secrets.get("tastytrade", {})
+    oauth_cfg = secrets.get("tastytrade_oauth2", {}) or {}
+    use_oauth = not _is_placeholder(oauth_cfg.get("client_id") or "") and not _is_placeholder(oauth_cfg.get("client_secret") or "") and not _is_placeholder(oauth_cfg.get("refresh_token") or "")
+    opts_config = TastytradeOptionsConfig(
+        username=tasty_secrets.get("username", ""),
+        password=tasty_secrets.get("password", ""),
+        oauth_client_id=oauth_cfg.get("client_id", ""),
+        oauth_client_secret=oauth_cfg.get("client_secret", ""),
+        oauth_refresh_token=oauth_cfg.get("refresh_token", ""),
+        environment=tt_config.get("environment", "live"),
+        timeout_seconds=tt_config.get("timeout_seconds", 20),
+        max_attempts=retry_cfg.get("max_attempts", 3),
+        backoff_seconds=retry_cfg.get("backoff_seconds", 1.0),
+        backoff_multiplier=retry_cfg.get("backoff_multiplier", 2.0),
+        min_dte=args.min_dte,
+        max_dte=args.max_dte,
     )
+    connector = TastytradeOptionsConnector(config=opts_config)
 
     try:
         snapshots = connector.build_snapshots_for_symbol(
@@ -154,7 +136,6 @@ def main() -> int:
     except Exception as exc:
         print(f"  Build FAILED: {exc}")
         connector.close()
-        client.close()
         return 1
 
     print(f"  Snapshots built: {len(snapshots)}")

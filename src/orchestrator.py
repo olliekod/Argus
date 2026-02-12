@@ -73,6 +73,10 @@ from .soak.guards import SoakGuardian
 from .soak.tape import TapeRecorder
 from .soak.resource_monitor import ResourceMonitor
 from .soak.summary import build_soak_summary
+from .core.liquid_etf_universe import get_liquid_etf_universe
+
+# Default options/IV underlyings: IBIT + liquid ETF universe (no BITO)
+_DEFAULT_OPTIONS_SYMBOLS = sorted({"IBIT"} | set(get_liquid_etf_universe()))
 
 
 class CollectorModeViolation(RuntimeError):
@@ -584,7 +588,7 @@ class ArgusOrchestrator:
                             cache_ttl_seconds=int(options_cfg.get('poll_interval_seconds', 60)),
                         )
                     )
-                    self._alpaca_options_symbols = options_cfg.get('symbols', ['IBIT', 'BITO'])
+                    self._alpaca_options_symbols = options_cfg.get('symbols', _DEFAULT_OPTIONS_SYMBOLS)
                     self._alpaca_options_poll_interval = int(options_cfg.get('poll_interval_seconds', 60))
                     self._alpaca_options_min_dte = int(options_cfg.get('min_dte', 7))
                     self._alpaca_options_max_dte = int(options_cfg.get('max_dte', 21))
@@ -1389,7 +1393,7 @@ class ArgusOrchestrator:
             return
 
         interval = getattr(self, '_alpaca_options_poll_interval', 60)
-        symbols = getattr(self, '_alpaca_options_symbols', ['IBIT', 'BITO'])
+        symbols = getattr(self, '_alpaca_options_symbols', _DEFAULT_OPTIONS_SYMBOLS)
         min_dte = getattr(self, '_alpaca_options_min_dte', 7)
         max_dte = getattr(self, '_alpaca_options_max_dte', 21)
 
@@ -1464,7 +1468,8 @@ class ArgusOrchestrator:
         if not self.tastytrade_options:
             return
 
-        symbols = getattr(self, '_tastytrade_options_symbols', [])
+        # Use option-level symbols for Greeks (underlyings alone do not receive Greeks from DXLink)
+        symbols = getattr(self, "_dxlink_greeks_symbols", None) or getattr(self, "_tastytrade_options_symbols", [])
         if not symbols:
             return
 
@@ -2025,6 +2030,34 @@ class ArgusOrchestrator:
                 await self.telegram.send_message(msg)
         except Exception as e:
             self.logger.warning(f"Uniformity check error: {e}")
+
+    async def _log_iv_status(self) -> None:
+        """Log whether we are receiving IV from DXLink (Greeks cache) every 60s."""
+        interval = 60
+        stale_seconds = 300  # consider "stale" if no update in 5 min
+        while self._running:
+            await asyncio.sleep(interval)
+            if not self._greeks_cache:
+                continue
+            try:
+                n = self._greeks_cache.size
+                last_ms = self._greeks_cache.last_update_ms
+                now_ms = int(time.time() * 1000)
+                age_s = (now_ms - last_ms) / 1000.0 if last_ms else float("inf")
+                if n == 0:
+                    self.logger.info("IV: not receiving (Greeks cache empty)")
+                elif age_s > stale_seconds:
+                    self.logger.info(
+                        "IV: stale (%d symbols, last update %.0fs ago)",
+                        n, age_s,
+                    )
+                else:
+                    self.logger.info(
+                        "IV: receiving (%d symbols from DXLink, last %.0fs ago)",
+                        n, age_s,
+                    )
+            except Exception as e:
+                self.logger.debug("IV status check failed: %s", e)
 
     async def _health_check(self) -> None:
         """Periodic health check (5 min) and 60-second heartbeat summary."""
@@ -2650,8 +2683,31 @@ class ArgusOrchestrator:
         # Tastytrade OPTIONS chain polling (runs in ALL modes, independent of Alpaca)
         if self.tastytrade_options:
             self._tasks.append(asyncio.create_task(self._poll_tastytrade_options_chains()))
+            # DXLink Greeks require option-level symbols (not underlyings); fetch once at start
+            try:
+                dxlink_symbols = await asyncio.to_thread(
+                    self.tastytrade_options.get_dxlink_option_symbols,
+                    getattr(self, "_tastytrade_options_symbols", []),
+                    getattr(self, "_tastytrade_options_min_dte", 7),
+                    getattr(self, "_tastytrade_options_max_dte", 21),
+                    80,
+                )
+                self._dxlink_greeks_symbols = dxlink_symbols if dxlink_symbols else getattr(self, "_tastytrade_options_symbols", [])
+                if dxlink_symbols:
+                    self.logger.info(
+                        "DXLink Greeks will subscribe to %d option symbols (IV enrichment)",
+                        len(dxlink_symbols),
+                    )
+                else:
+                    self.logger.warning(
+                        "DXLink Greeks: no option symbols from chain fetch; subscribing to underlyings only (Greeks may be empty)"
+                    )
+            except Exception as exc:
+                self.logger.warning("DXLink option symbol fetch failed, using underlyings: %s", exc)
+                self._dxlink_greeks_symbols = getattr(self, "_tastytrade_options_symbols", [])
             # DXLink Greeks streamer populates _greeks_cache for IV enrichment
             self._tasks.append(asyncio.create_task(self._start_dxlink_greeks_streamer()))
+            self._tasks.append(asyncio.create_task(self._log_iv_status()))
 
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._health_check()))

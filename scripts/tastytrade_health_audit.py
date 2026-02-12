@@ -104,6 +104,7 @@ def audit_nested_chain(raw: dict[str, Any]) -> dict[str, Any]:
 
 
 def _load_tasty_client(config: dict[str, Any], secrets: dict[str, Any]) -> TastytradeRestClient:
+    """Create TastytradeRestClient with session (username/password). Caller must call login()."""
     tasty_secrets = secrets.get("tastytrade", {})
     username = tasty_secrets.get("username", "")
     password = tasty_secrets.get("password", "")
@@ -123,6 +124,36 @@ def _load_tasty_client(config: dict[str, Any], secrets: dict[str, Any]) -> Tasty
             backoff_multiplier=retry_cfg.get("backoff_multiplier", 2.0),
         ),
     )
+    return client
+
+
+def get_tastytrade_rest_client(config: dict[str, Any], secrets: dict[str, Any]) -> TastytradeRestClient:
+    """Return an authenticated TastytradeRestClient. Prefers OAuth when configured (session auth is deprecated)."""
+    oauth_cfg = secrets.get("tastytrade_oauth2", {}) or {}
+    cid = oauth_cfg.get("client_id", "")
+    csec = oauth_cfg.get("client_secret", "")
+    ref = oauth_cfg.get("refresh_token", "")
+    if not _is_placeholder(cid) and not _is_placeholder(csec) and not _is_placeholder(ref):
+        try:
+            oauth = TastytradeOAuthClient(client_id=cid, client_secret=csec, refresh_token=ref)
+            token = oauth.refresh_access_token().access_token
+            tt_config = config.get("tastytrade", {})
+            retry_cfg = tt_config.get("retries", {})
+            client = TastytradeRestClient(
+                environment=tt_config.get("environment", "live"),
+                timeout_seconds=tt_config.get("timeout_seconds", 20),
+                retries=RetryConfig(
+                    max_attempts=retry_cfg.get("max_attempts", 3),
+                    backoff_seconds=retry_cfg.get("backoff_seconds", 1.0),
+                    backoff_multiplier=retry_cfg.get("backoff_multiplier", 2.0),
+                ),
+                oauth_access_token=token,
+            )
+            return client
+        except Exception:
+            pass
+    client = _load_tasty_client(config, secrets)
+    client.login()
     return client
 
 

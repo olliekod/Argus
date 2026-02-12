@@ -134,14 +134,8 @@ async def _options_rows(config: dict[str, Any], secrets: dict[str, Any], duratio
     rows: list[dict[str, Any]] = []
     skips: list[str] = []
     try:
-        from scripts.tastytrade_health_audit import TastytradeRestClient # Local import to avoid circularity if any
-        creds = secrets.get("tastytrade", {})
-        client = TastytradeRestClient(
-            username=creds.get("username", ""),
-            password=creds.get("password", ""),
-            environment=config.get("tastytrade", {}).get("environment", "live")
-        )
-        client.login()
+        from scripts.tastytrade_health_audit import get_tastytrade_rest_client
+        client = get_tastytrade_rest_client(config, secrets)
         oauth = audit_oauth(secrets)
     except Exception as exc:
         skips.append(f"tastytrade options skipped: {exc}")

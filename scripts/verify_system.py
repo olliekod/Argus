@@ -160,34 +160,14 @@ async def verify_system(deep: bool = False):
             fail("Load config/secrets for Tastytrade", str(e))
             results["failed"] += 1
         else:
-            tasty_secrets = secrets.get("tastytrade", {})
-            username = tasty_secrets.get("username", "")
-            password = tasty_secrets.get("password", "")
-
-            if _is_placeholder(username) or _is_placeholder(password):
-                warn("Tastytrade credentials missing; skipping legacy auth test")
+            try:
+                from scripts.tastytrade_health_audit import get_tastytrade_rest_client
+                client = get_tastytrade_rest_client(config, secrets)
+            except Exception as e:
+                warn(f"Tastytrade credentials missing or auth failed; skipping auth/chain test: {e}")
                 results["warnings"] += 1
             else:
-                tt_config = config.get("tastytrade", {})
-                retry_cfg = tt_config.get("retries", {})
-                retry = RetryConfig(
-                    max_attempts=retry_cfg.get("max_attempts", 3),
-                    backoff_seconds=retry_cfg.get("backoff_seconds", 1.0),
-                    backoff_multiplier=retry_cfg.get("backoff_multiplier", 2.0),
-                )
-                client = TastytradeRestClient(
-                    username=username,
-                    password=password,
-                    environment=tt_config.get("environment", "live"),
-                    timeout_seconds=tt_config.get("timeout_seconds", 20),
-                    retries=retry,
-                )
                 try:
-                    start = time.perf_counter()
-                    client.login()
-                    ok(f"Tastytrade legacy login ({(time.perf_counter() - start):.2f}s)")
-                    results["passed"] += 1
-
                     start = time.perf_counter()
                     tasty_symbols = list(LIQUID_ETF_UNIVERSE) if deep else ["SPY"]
                     chain_fail = False
@@ -207,7 +187,7 @@ async def verify_system(deep: bool = False):
                     else:
                         results["passed"] += 1
                 except TastytradeError as e:
-                    fail("Tastytrade legacy auth/chain", str(e))
+                    fail("Tastytrade auth/chain", str(e))
                     results["failed"] += 1
                 finally:
                     client.close()
@@ -444,16 +424,27 @@ async def verify_system(deep: bool = False):
         conf = load_config()
         sec = load_secrets()
         tt_sec = sec.get("tastytrade_oauth2", {})
-        
+        if not tt_sec or _is_placeholder(tt_sec.get("client_id") or "") or _is_placeholder(tt_sec.get("refresh_token") or ""):
+            raise RuntimeError("tastytrade_oauth2 (client_id, client_secret, refresh_token) required for DXLink probe")
         oauth = TastytradeOAuthClient(tt_sec["client_id"], tt_sec["client_secret"], tt_sec["refresh_token"])
         token = oauth.refresh_access_token().access_token
-        
-        # Get one token for DXLink
+        # Get DXLink quote token (OAuth only)
         quote_resp = requests.get("https://api.tastytrade.com/api-quote-tokens", headers={"Authorization": f"Bearer {token}"}, timeout=10)
+        quote_resp.raise_for_status()
         quote_data = quote_resp.json()["data"]
-        
-        rest = TastytradeRestClient(sec["tastytrade"]["username"], sec["tastytrade"]["password"])
-        rest.login()
+        tt_config = conf.get("tastytrade", {})
+        retry_cfg = tt_config.get("retries", {})
+        from src.connectors.tastytrade_rest import RetryConfig
+        rest = TastytradeRestClient(
+            environment=tt_config.get("environment", "live"),
+            timeout_seconds=tt_config.get("timeout_seconds", 20),
+            retries=RetryConfig(
+                max_attempts=retry_cfg.get("max_attempts", 3),
+                backoff_seconds=retry_cfg.get("backoff_seconds", 1.0),
+                backoff_multiplier=retry_cfg.get("backoff_multiplier", 2.0),
+            ),
+            oauth_access_token=token,
+        )
         chain = rest.get_nested_option_chains("IBIT")
         norm = normalize_tastytrade_nested_chain(chain)
         rest.close()

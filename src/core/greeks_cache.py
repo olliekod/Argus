@@ -98,6 +98,7 @@ class GreeksCache:
         self._lock = threading.Lock()
         self._cache: Dict[str, CachedGreek] = {}
         self._max_age_ms = max_age_ms
+        self._last_update_ms: int = 0
 
     def update(
         self,
@@ -143,6 +144,8 @@ class GreeksCache:
             existing = self._cache.get(event_symbol)
             if existing is None or recv_ts_ms >= existing.recv_ts_ms:
                 self._cache[event_symbol] = entry
+                if recv_ts_ms > self._last_update_ms:
+                    self._last_update_ms = recv_ts_ms
 
     def get_atm_iv(
         self,
@@ -279,6 +282,12 @@ class GreeksCache:
         """Number of cached entries."""
         with self._lock:
             return len(self._cache)
+
+    @property
+    def last_update_ms(self) -> int:
+        """Epoch ms of the most recent cache update (0 if never updated)."""
+        with self._lock:
+            return self._last_update_ms
 
     def clear(self) -> None:
         """Remove all cached entries."""

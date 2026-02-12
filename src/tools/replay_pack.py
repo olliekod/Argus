@@ -303,7 +303,9 @@ async def create_replay_pack(
                 print(f"  Hint: No bars for provider={provider!r}. Bars in DB for {symbol}: {sources_str}. Try --provider <source>.")
             if outcome_providers and len(outcomes) == 0:
                 prov_str = ", ".join(f"{r['provider']}" for r in outcome_providers)
-                print(f"  Hint: No outcomes for provider={provider!r}. Outcomes in DB for {symbol}: provider(s) {prov_str}. Try --provider <provider>.")
+                print(f"  Hint: No outcomes for provider={bars_provider!r}. Outcomes in DB for {symbol}: provider(s) {prov_str}.")
+                print(f"  Likely cause: no outcomes computed for {start_date}. Run backfill first:")
+                print(f"    python -m src.outcomes backfill --provider {bars_provider} --symbol {symbol} --bar {bar_duration} --start {start_date} --end {end_date}")
 
         # 4. Fetch Regimes (Symbol and Market)
         market = "EQUITIES"

@@ -16,11 +16,7 @@ if str(REPO_ROOT) not in sys.path:
 
 from src.core.config import ConfigurationError, load_config, load_secrets
 from src.core.options_normalize import normalize_tastytrade_nested_chain
-from src.connectors.tastytrade_rest import (
-    RetryConfig,
-    TastytradeError,
-    TastytradeRestClient,
-)
+from src.connectors.tastytrade_rest import TastytradeError
 
 
 def _is_placeholder(value: str) -> bool:
@@ -63,31 +59,14 @@ def main() -> int:
         print(f"Config error: {exc}")
         return 1
 
-    tasty_secrets = secrets.get("tastytrade", {})
-    username = tasty_secrets.get("username", "")
-    password = tasty_secrets.get("password", "")
-    if _is_placeholder(username) or _is_placeholder(password):
-        print("Tastytrade credentials missing; update config/secrets.yaml.")
+    try:
+        from scripts.tastytrade_health_audit import get_tastytrade_rest_client
+        client = get_tastytrade_rest_client(config, secrets)
+    except Exception as e:
+        print(f"Tastytrade credentials missing or auth failed: {e}")
         return 1
 
-    tt_config = config.get("tastytrade", {})
-    retry_cfg = tt_config.get("retries", {})
-    retry = RetryConfig(
-        max_attempts=retry_cfg.get("max_attempts", 3),
-        backoff_seconds=retry_cfg.get("backoff_seconds", 1.0),
-        backoff_multiplier=retry_cfg.get("backoff_multiplier", 2.0),
-    )
-
-    client = TastytradeRestClient(
-        username=username,
-        password=password,
-        environment=tt_config.get("environment", "live"),
-        timeout_seconds=tt_config.get("timeout_seconds", 20),
-        retries=retry,
-    )
-
     try:
-        client.login()
         chain = client.get_nested_option_chains(args.underlying)
     except TastytradeError as exc:
         client.close()

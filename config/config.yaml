@@ -105,8 +105,8 @@ exchanges:
     bar_timeframe: "1Min"
     options:
       enabled: true
-      # Underlyings for options chain snapshot polling (Alpaca). Include SPY/QQQ for replay packs.
-      symbols: ["IBIT", "BITO", "SPY", "QQQ"]
+      # Underlyings for options chain snapshot polling (Alpaca). IBIT + liquid ETF universe (no BITO).
+      symbols: ["IBIT", "DIA", "GLD", "IWM", "QQQ", "SMH", "SPY", "TLT", "XLE", "XLF", "XLK"]
       poll_interval_seconds: 60  # 1 minute between chain polls (default)
       min_dte: 7
       max_dte: 21
@@ -121,7 +121,8 @@ exchanges:
 tastytrade:
   environment: "live"   # live | sandbox
   timeout_seconds: 20
-  underlyings: ["DIA", "GLD", "IWM", "QQQ", "SMH", "SPY", "TLT", "XLE", "XLF", "XLK", "IBIT", "BITO"]
+  # IV/Greeks and options streaming: IBIT + liquid ETF universe (BITO dropped)
+  underlyings: ["IBIT", "DIA", "GLD", "IWM", "QQQ", "SMH", "SPY", "TLT", "XLE", "XLF", "XLK"]
   snapshot_sampling:
     enabled: true
     retention_days: 14

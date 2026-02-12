@@ -327,6 +327,72 @@ class TastytradeOptionsConnector:
         except Exception:
             return None
 
+    def get_dxlink_option_symbols(
+        self,
+        underlyings: List[str],
+        min_dte: int = 7,
+        max_dte: int = 21,
+        max_total: int = 80,
+    ) -> List[str]:
+        """Return option symbols in DXLink streamer format for Greeks subscription.
+
+        DXLink sends Greeks per option contract; subscribing to underlying symbols
+        (e.g. SPY) does not yield Greeks. This fetches chains, normalizes, and
+        samples streamer_symbol (e.g. .SPY250321P590) for near-ATM options in
+        the given DTE range.
+
+        Returns:
+            List of symbols suitable for TastytradeStreamer(symbols=..., event_types=["Greeks"]).
+        """
+        result: List[str] = []
+        seen: set = set()
+        today = datetime.now(timezone.utc).date()
+
+        for symbol in underlyings:
+            if len(result) >= max_total:
+                break
+            raw = self.fetch_nested_chain(symbol)
+            if not raw:
+                continue
+            normalized = normalize_tastytrade_nested_chain(raw)
+            if not normalized:
+                continue
+
+            # Filter to DTE range and pick streamer symbol
+            in_range: List[Dict[str, Any]] = []
+            for c in normalized:
+                exp = c.get("expiry")
+                if not exp:
+                    continue
+                try:
+                    exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+                except ValueError:
+                    continue
+                dte = (exp_date - today).days
+                if min_dte <= dte <= max_dte:
+                    in_range.append(c)
+
+            if not in_range:
+                continue
+
+            # Prefer puts for ATM IV; sample by unique (expiry, strike) and streamer symbol
+            # Sort by expiry then strike so we get front month and a spread of strikes
+            in_range.sort(key=lambda x: (x.get("expiry") or "", x.get("strike") or 0))
+            # Take up to max_per underlying, favoring variety of strikes
+            per_underlying = max(20, (max_total - len(result)) // max(1, len(underlyings)))
+            added = 0
+            for c in in_range:
+                if len(result) >= max_total or added >= per_underlying:
+                    break
+                streamer = (c.get("meta") or {}).get("streamer_symbol") or c.get("option_symbol")
+                if not streamer or streamer in seen:
+                    continue
+                seen.add(streamer)
+                result.append(streamer)
+                added += 1
+
+        return result
+
     def get_expirations_in_range(
         self,
         normalized: List[Dict[str, Any]],

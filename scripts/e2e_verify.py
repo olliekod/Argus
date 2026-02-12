@@ -8,7 +8,9 @@ end-to-end:
 
 1. Confirms bars/outcomes coverage from ``bars_primary`` (Alpaca).
 2. Confirms option-snapshot coverage + % ``atm_iv`` presence from
-   ``options_snapshots_primary`` (Tastytrade).
+   ``options_snapshots_primary`` (Tastytrade). Note: Tastytrade IV comes from
+   live DXLink enrichment; snapshots written without DXLink running will have
+   0% atm_iv until new snapshots are collected with the orchestrator (OAuth + DXLink).
 3. Probes DXLink greeks/quotes availability.
 4. Builds a replay pack using policy defaults (no provider args).
 5. Runs a smoke experiment (``VRPCreditSpreadStrategy`` on SPY)
@@ -388,6 +390,8 @@ async def run_e2e(
         snap_result = await check_options_snapshots(db, policy, symbol, start_ms, end_ms)
         results["steps"]["options_snapshots"] = snap_result
         print(f"  Snapshots from {snap_result['provider']}: {snap_result['snapshot_count']} ({snap_result['atm_iv_pct']}% have atm_iv, {snap_result['iv_ready_pct']}% IV-ready) — {'PASS' if snap_result['pass'] else 'FAIL'}")
+        if snap_result.get("atm_iv_pct", 0) == 0 and snap_result.get("provider") == "tastytrade":
+            print("    (Hint: Tastytrade atm_iv requires live DXLink; run orchestrator with OAuth to populate IV for new snapshots.)")
     finally:
         await db.close()
 
