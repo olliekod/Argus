@@ -99,6 +99,12 @@ class ExperimentRunner:
 
         snapshots_objs = self._pack_snapshots_to_objects(all_snapshots)
 
+        # Warn if pack is missing data many strategies need (e.g. VRP needs outcomes + snapshots)
+        if not all_outcomes:
+            print("WARNING: Pack has 0 outcomes. Strategies that need realized_vol (e.g. VRPCreditSpreadStrategy) will never signal. Run: python -m src.outcomes backfill --provider <source> --symbol <sym> --bar 60 --start YYYY-MM-DD --end YYYY-MM-DD then re-pack.")
+        if not snapshots_objs:
+            print("WARNING: Pack has 0 option snapshots. Strategies that need IV/options will never signal.")
+
         # 2. Instantiate Strategy
         strategy = config.strategy_class(config.strategy_params)
         

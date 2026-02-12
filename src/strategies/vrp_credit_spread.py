@@ -181,6 +181,9 @@ class VRPCreditSpreadStrategy(ReplayStrategy):
         self.last_iv = None
         self.last_iv_source = None  # "tastytrade", "derived", or "alpaca"
         self.last_rv = None
+        self._logged_no_iv = False
+        self._logged_no_rv = False
+        self._logged_vrp_or_regime = False
 
     @property
     def strategy_id(self) -> str:
@@ -218,7 +221,10 @@ class VRPCreditSpreadStrategy(ReplayStrategy):
         intents = []
 
         # 1. Check if we have data
-        if self.last_iv is None or self.last_rv is None:
+        if self.last_iv is None:
+            if not self._logged_no_iv:
+                logger.warning("VRPCreditSpreadStrategy: no IV yet (need option snapshot with atm_iv). Snapshots may lack atm_iv or recv_ts_ms may be after sim time.")
+                self._logged_no_iv = True
             return []
 
         # 2. Compute VRP

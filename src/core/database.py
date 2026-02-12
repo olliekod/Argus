@@ -674,6 +674,13 @@ class Database:
             "CREATE INDEX IF NOT EXISTS idx_ocs_symbol_recv "
             "ON option_chain_snapshots(symbol, recv_ts_ms)"
         )
+        # Ensure UNIQUE(provider, symbol, timestamp_ms) exists for ON CONFLICT (migration for DBs created before this constraint)
+        await self._connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ocs_provider_symbol_ts "
+            "ON option_chain_snapshots(provider, symbol, timestamp_ms)"
+        )
+        # Migrate away from old UNIQUE(symbol, expiration_ms, timestamp_ms) so multiple providers can store
+        await self._migrate_option_chain_snapshots_if_old_schema()
 
         # Phase 4A.1: Bar outcomes (backtest ground truth)
         await self._connection.execute("""
@@ -837,6 +844,75 @@ class Database:
         """, (symbol,))
         row = await cursor.fetchone()
         return row[0] if row and row[0] else None
+
+    async def _migrate_option_chain_snapshots_if_old_schema(self) -> None:
+        """If the table has old UNIQUE(symbol, expiration_ms, timestamp_ms), recreate with UNIQUE(provider, symbol, timestamp_ms)."""
+        cursor = await self._connection.execute(
+            "PRAGMA index_list('option_chain_snapshots')"
+        )
+        rows = await cursor.fetchall()
+        has_old_constraint = False
+        for row in rows:
+            # (seq, name, unique)
+            if not row[2]:  # not unique
+                continue
+            idx_name = row[1]
+            info_cur = await self._connection.execute(
+                f"PRAGMA index_info('{idx_name}')"
+            )
+            info = await info_cur.fetchall()
+            cols = {r[2] for r in info}  # column names
+            if cols == {"symbol", "expiration_ms", "timestamp_ms"}:
+                has_old_constraint = True
+                break
+        if not has_old_constraint:
+            return
+        logger.info(
+            "Migrating option_chain_snapshots from UNIQUE(symbol, expiration_ms, timestamp_ms) to UNIQUE(provider, symbol, timestamp_ms)"
+        )
+        await self._connection.execute("""
+            CREATE TABLE option_chain_snapshots_new (
+                snapshot_id TEXT PRIMARY KEY,
+                symbol TEXT NOT NULL,
+                expiration_ms INTEGER NOT NULL,
+                underlying_price REAL NOT NULL,
+                n_strikes INTEGER,
+                atm_iv REAL,
+                timestamp_ms INTEGER NOT NULL,
+                source_ts_ms INTEGER,
+                recv_ts_ms INTEGER,
+                provider TEXT NOT NULL,
+                quotes_json TEXT NOT NULL,
+                UNIQUE(provider, symbol, timestamp_ms)
+            )
+        """)
+        await self._connection.execute("""
+            INSERT OR IGNORE INTO option_chain_snapshots_new
+            (snapshot_id, symbol, expiration_ms, underlying_price, n_strikes, atm_iv,
+             timestamp_ms, source_ts_ms, recv_ts_ms, provider, quotes_json)
+            SELECT snapshot_id, symbol, expiration_ms, underlying_price, n_strikes, atm_iv,
+                   timestamp_ms, source_ts_ms, recv_ts_ms, provider, quotes_json
+            FROM option_chain_snapshots
+            ORDER BY timestamp_ms DESC
+        """)
+        await self._connection.execute("DROP TABLE option_chain_snapshots")
+        await self._connection.execute(
+            "ALTER TABLE option_chain_snapshots_new RENAME TO option_chain_snapshots"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocs_ts ON option_chain_snapshots(timestamp_ms)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocs_recv_ts ON option_chain_snapshots(recv_ts_ms)"
+        )
+        await self._connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ocs_symbol_recv ON option_chain_snapshots(symbol, recv_ts_ms)"
+        )
+        await self._connection.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_ocs_provider_symbol_ts ON option_chain_snapshots(provider, symbol, timestamp_ms)"
+        )
+        await self._connection.commit()
+        logger.info("option_chain_snapshots migration completed")
 
     
     # Detection Operations

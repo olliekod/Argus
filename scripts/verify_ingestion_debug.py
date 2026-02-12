@@ -1,31 +1,144 @@
 """Verify option chain snapshot ingestion from all providers.
 
-Shows recent snapshots grouped by provider, with stats per symbol.
+Shows recent snapshots grouped by provider, stats per symbol, and validates:
+- Both polling tasks (Alpaca + Tastytrade) inferred from fresh data
+- Fresh option_chain_snapshots for SPY/QQQ/IBIT/BITO
+- Both providers present for at least one symbol (SPY preferred)
+- timestamp_ms minute-aligned (floored)
+- recv_ts_ms now-ish (within seconds of local time)
+
+Standalone connector debug (build snapshots without orchestrator):
+  python scripts/debug_tastytrade_options.py --symbol SPY
+  python scripts/debug_alpaca_options.py  (tests Alpaca expirations + snapshot build)
 
 Usage:
   python scripts/verify_ingestion_debug.py
   python scripts/verify_ingestion_debug.py --limit 50
+  python scripts/verify_ingestion_debug.py --validate   # exit 0 if all checks pass
 """
 
 import argparse
 import asyncio
 import sqlite3
+import sys
 from pathlib import Path
 from datetime import datetime, timezone
 
+# Symbols we expect when both providers are polling
+TARGET_SYMBOLS = ("SPY", "QQQ", "IBIT", "BITO")
+FRESH_WINDOW_MS = 10 * 60 * 1000   # 10 min
+POLLING_FRESH_MS = 5 * 60 * 1000   # 5 min to infer "task started"
+RECV_TOLERANCE_SEC = 120            # recv_ts_ms within this many seconds of "now"
 
-async def verify_ingestion(limit: int = 30):
+
+def _run_validation(cursor) -> tuple[bool, list[str]]:
+    """Run validation checks. Returns (all_passed, list of failure messages)."""
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    failures = []
+
+    # Fresh rows for SPY, QQQ, IBIT, BITO
+    cursor.execute("""
+        SELECT DISTINCT symbol FROM option_chain_snapshots
+        WHERE symbol IN (?, ?, ?, ?) AND timestamp_ms >= ?
+    """, (*TARGET_SYMBOLS, now_ms - FRESH_WINDOW_MS))
+    seen = {r[0] for r in cursor.fetchall()}
+    for sym in TARGET_SYMBOLS:
+        if sym not in seen:
+            failures.append(f"No fresh rows for {sym} (last {FRESH_WINDOW_MS // 60000} min)")
+
+    # Both providers present for at least one symbol (prefer SPY)
+    cursor.execute("""
+        SELECT symbol, GROUP_CONCAT(DISTINCT provider) as providers
+        FROM option_chain_snapshots
+        WHERE symbol IN (?, ?, ?, ?) AND timestamp_ms >= ?
+        GROUP BY symbol
+    """, (*TARGET_SYMBOLS, now_ms - FRESH_WINDOW_MS))
+    both_for_symbol = None
+    for symbol, providers in cursor.fetchall():
+        if not providers:
+            continue
+        prov_set = set(p.strip() for p in (providers or "").split(",") if p.strip())
+        if "alpaca" in prov_set and "tastytrade" in prov_set:
+            both_for_symbol = symbol
+            break
+    if both_for_symbol is None:
+        failures.append("Both providers (alpaca + tastytrade) not present for any of SPY/QQQ/IBIT/BITO (SPY preferred)")
+
+    # timestamp_ms minute-aligned for recent rows
+    cursor.execute("""
+        SELECT timestamp_ms FROM option_chain_snapshots
+        WHERE symbol IN (?, ?, ?, ?) AND timestamp_ms >= ?
+        LIMIT 500
+    """, (*TARGET_SYMBOLS, now_ms - FRESH_WINDOW_MS))
+    rows = cursor.fetchall()
+    misaligned = [r[0] for r in rows if r[0] is not None and (r[0] % 60_000) != 0]
+    if misaligned:
+        failures.append(f"timestamp_ms not minute-aligned: {len(misaligned)} recent rows have timestamp_ms % 60000 != 0 (e.g. {misaligned[0]})")
+
+    # recv_ts_ms now-ish for most recent row
+    cursor.execute("""
+        SELECT recv_ts_ms FROM option_chain_snapshots
+        WHERE symbol IN (?, ?, ?, ?)
+        ORDER BY timestamp_ms DESC LIMIT 1
+    """, TARGET_SYMBOLS)
+    row = cursor.fetchone()
+    if row and row[0] is not None:
+        recv_sec_ago = (now_ms - row[0]) / 1000
+        if abs(recv_sec_ago) > RECV_TOLERANCE_SEC:
+            failures.append(f"recv_ts_ms not now-ish: most recent recv_ts_ms is {abs(recv_sec_ago):.0f}s from now (tolerance {RECV_TOLERANCE_SEC}s)")
+    else:
+        failures.append("No recv_ts_ms found on recent snapshots")
+
+    return (len(failures) == 0, failures)
+
+
+async def verify_ingestion(limit: int = 30, validate_only: bool = False):
     db_path = Path("data/argus.db")
     if not db_path.exists():
         print(f"Error: Database not found at {db_path}")
+        if validate_only:
+            sys.exit(2)
         return
 
     conn = sqlite3.connect(db_path)
     cursor = conn.cursor()
 
+    if validate_only:
+        ok, failures = _run_validation(cursor)
+        conn.close()
+        if ok:
+            print("Validation PASSED: fresh SPY/QQQ/IBIT/BITO, both providers, minute-aligned timestamp_ms, now-ish recv_ts_ms")
+            sys.exit(0)
+        for f in failures:
+            print(f"FAIL: {f}")
+        sys.exit(1)
+    # --------
+
     print("=" * 90)
     print("Option Chain Snapshot Ingestion Report")
     print("=" * 90)
+
+    # ── Polling health (inferred from recent data) ─────────────────────
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    cutoff = now_ms - POLLING_FRESH_MS
+    cursor.execute("""
+        SELECT provider, MAX(timestamp_ms) as last_ts
+        FROM option_chain_snapshots
+        WHERE symbol IN (?, ?, ?, ?)
+        GROUP BY provider
+    """, TARGET_SYMBOLS)
+    provider_last = {r[0]: r[1] for r in cursor.fetchall()}
+    print("\n[0] Polling health (inferred from DB; run debug_tastytrade_options.py / debug_alpaca_options.py to test connectors)")
+    print("-" * 70)
+    for prov in ("alpaca", "tastytrade"):
+        last = provider_last.get(prov)
+        if last is None:
+            print(f"  {prov:<15} | no rows in DB (task may not be running or no data yet)")
+        elif last >= cutoff:
+            print(f"  {prov:<15} | OK (last snapshot within last {POLLING_FRESH_MS // 60000} min)")
+        else:
+            age_sec = (now_ms - last) / 1000
+            print(f"  {prov:<15} | STALE (last snapshot {age_sec:.0f}s ago)")
 
     # ── Provider summary ──────────────────────────────────────────────
     print("\n[1] Provider Summary")
@@ -126,6 +239,17 @@ async def verify_ingestion(limit: int = 30):
     else:
         print("  No multi-provider overlaps found (this is normal if only one provider is active).")
 
+    # ── Validation summary ────────────────────────────────────────────
+    print(f"\n[5] Validation (fresh SPY/QQQ/IBIT/BITO, both providers, minute-aligned timestamp_ms, now-ish recv_ts_ms)")
+    print("-" * 70)
+    ok, failures = _run_validation(cursor)
+    if ok:
+        print("  All checks PASSED.")
+    else:
+        for f in failures:
+            print(f"  FAIL: {f}")
+    print("  (Use --validate to run only these checks and exit 0/1)")
+
     conn.close()
     print(f"\n{'=' * 90}")
 
@@ -133,8 +257,9 @@ async def verify_ingestion(limit: int = 30):
 def main():
     parser = argparse.ArgumentParser(description="Verify option chain snapshot ingestion")
     parser.add_argument("--limit", type=int, default=30, help="Number of recent snapshots to show")
+    parser.add_argument("--validate", action="store_true", help="Run validation only; exit 0 if pass, 1 if fail")
     args = parser.parse_args()
-    asyncio.run(verify_ingestion(limit=args.limit))
+    asyncio.run(verify_ingestion(limit=args.limit, validate_only=args.validate))
 
 
 if __name__ == "__main__":

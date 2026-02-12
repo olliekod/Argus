@@ -10,6 +10,7 @@ Usage:
 
 import argparse
 import json
+import logging
 import yaml
 import importlib
 import sys
@@ -18,6 +19,9 @@ from typing import Any, Dict, List, Type
 
 # Add project root to path
 sys.path.append(str(Path(__file__).parent.parent))
+
+# So strategy diagnostics (e.g. why 0 trades) are visible
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 from src.analysis.experiment_runner import ExperimentRunner, ExperimentConfig
 from src.analysis.replay_harness import ReplayStrategy
