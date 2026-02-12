@@ -105,7 +105,7 @@ def test_sharpe_zero_movement():
         port.mark_to_market({}, 1000 * i)
     
     summary = port.summary()
-    assert summary["sharpe_proxy"] == 0.0
+    assert summary["sharpe_annualized_proxy"] == 0.0
     assert summary["profit_factor"] == 0.0
 
 if __name__ == "__main__":

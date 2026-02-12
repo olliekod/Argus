@@ -329,7 +329,7 @@ class ExperimentRunner:
             results.append({
                 "window": i,
                 "pnl": res.portfolio_summary["total_realized_pnl"],
-                "sharpe": res.portfolio_summary["sharpe_proxy"],
+                "sharpe": res.portfolio_summary["sharpe_annualized_proxy"],
                 "win_rate": res.portfolio_summary["win_rate"]
             })
             

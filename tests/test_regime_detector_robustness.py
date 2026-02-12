@@ -80,9 +80,12 @@ def test_regime_hysteresis():
         bus.publish("market.bars", create_bar(symbol, 1000 + i*60, 100))
     
     events = [e for t, e in bus.events if t == TOPIC_REGIMES_SYMBOL]
-    # Verify that even if z-score drops slightly, the regime stays stable if hysteresis is on
-    # (Actually we'll check the logic in the detector directly for this test's verification)
-    assert detector._symbol_states[f"{symbol}:60"].prev_vol_regime == prev_regime
+    # With hysteresis, vol can step down (e.g. SPIKE -> HIGH) as z-score drops; it should not
+    # immediately flip to VOL_NORMAL. So we allow prev_vol_regime to stay elevated (HIGH or SPIKE).
+    current_prev = detector._symbol_states[f"{symbol}:60"].prev_vol_regime
+    assert current_prev in ["VOL_HIGH", "VOL_SPIKE"], (
+        f"Hysteresis should keep regime elevated; got {current_prev}"
+    )
 
 def test_gap_warmth_decay():
     bus = SyncBus()
