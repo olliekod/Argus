@@ -54,6 +54,7 @@ from .connectors.yahoo_client import YahooFinanceClient
 from .connectors.alpaca_client import AlpacaDataClient
 from .connectors.alpaca_options import AlpacaOptionsConnector, AlpacaOptionsConfig
 from .connectors.tastytrade_options import TastytradeOptionsConnector, TastytradeOptionsConfig
+from .connectors.tastytrade_streamer import TastytradeStreamer
 from .core.greeks_cache import GreeksCache, enrich_snapshot_iv
 from .strategies.spread_generator import SpreadCandidateGenerator, SpreadGeneratorConfig
 from .connectors.polymarket_gamma import PolymarketGammaClient
@@ -192,6 +193,7 @@ class ArgusOrchestrator:
         self.tastytrade_options: Optional[TastytradeOptionsConnector] = None
         self.spread_generator: Optional[SpreadCandidateGenerator] = None
         self._greeks_cache: GreeksCache = GreeksCache()
+        self._dxlink_streamer: Optional[TastytradeStreamer] = None
         self.telegram: Optional[TelegramBot] = None
         
         # Off-hours monitoring
@@ -1436,6 +1438,48 @@ class ArgusOrchestrator:
 
             await asyncio.sleep(interval)
 
+    async def _start_dxlink_greeks_streamer(self) -> None:
+        """Obtain a DXLink token and run a Greeks streamer in the background.
+
+        Uses the already-authenticated TastytradeOptionsConnector's REST
+        client to fetch a DXLink streaming token, then subscribes to
+        Greeks events for the configured option symbols.  Events are
+        forwarded to ``_on_dxlink_greeks_event`` which populates
+        ``_greeks_cache``.
+        """
+        if not self.tastytrade_options:
+            return
+
+        symbols = getattr(self, '_tastytrade_options_symbols', [])
+        if not symbols:
+            return
+
+        try:
+            # Get authenticated REST client from the options connector
+            client = self.tastytrade_options._ensure_client()
+            quote_info = client.get_api_quote_token()
+            dxlink_url = quote_info["dxlink-url"]
+            dxlink_token = quote_info["token"]
+
+            # Build DXLink option symbols from the first snapshot fetch
+            # For now subscribe to underlying symbols for Quote events
+            # plus Greeks event type so the streamer asks for Greeks
+            self._dxlink_streamer = TastytradeStreamer(
+                dxlink_url=dxlink_url,
+                token=dxlink_token,
+                symbols=symbols,
+                on_event=self._on_dxlink_greeks_event,
+                event_types=["Greeks"],
+            )
+            self.logger.info(
+                "DXLink Greeks streamer starting for %s", symbols,
+            )
+            await self._dxlink_streamer.run_forever()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.logger.error("DXLink Greeks streamer failed: %s", exc)
+
     def _on_dxlink_greeks_event(self, event: Any) -> None:
         """Handle DXLink Greeks events by caching IV and Greeks.
 
@@ -2592,6 +2636,8 @@ class ArgusOrchestrator:
         # Tastytrade OPTIONS chain polling (runs in ALL modes, independent of Alpaca)
         if self.tastytrade_options:
             self._tasks.append(asyncio.create_task(self._poll_tastytrade_options_chains()))
+            # DXLink Greeks streamer populates _greeks_cache for IV enrichment
+            self._tasks.append(asyncio.create_task(self._start_dxlink_greeks_streamer()))
 
         self._tasks.append(asyncio.create_task(self._poll_deribit()))
         self._tasks.append(asyncio.create_task(self._health_check()))
