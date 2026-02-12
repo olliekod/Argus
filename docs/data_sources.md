@@ -11,9 +11,8 @@ is enforced across replay packs, experiments, and strategies.
 | 1-min OHLCV Bars | **Alpaca** | Market Data API v2 |
 | Bar Outcomes (forward returns) | Derived from **Alpaca** bars | OutcomeEngine consumes bars_primary |
 | Regimes | Computed from **Alpaca** bars | Optionally quote-aware if quote data exists |
-| Options Chain Snapshots (IV/surface) | **Tastytrade** REST or **Public.com** REST | Authoritative IV source |
+| Options Chain Snapshots (IV/surface) | **Tastytrade** REST or **Public.com** REST | Choose one as primary; keep the other as secondary/fallback |
 | Options Real-Time Quotes + Greeks | **Tastytrade** DXLink | Live mode only |
-| Options Snapshots (structural) | Alpaca *(secondary)* | Cross-check only; **no IV/greeks** |
 | Bars (backfill/sanity) | Yahoo *(secondary)* | Optional cross-validation |
 
 ## Configuration
@@ -27,7 +26,7 @@ data_sources:
   outcomes_from: bars_primary
   options_snapshots_primary: tastytrade  # or public
   options_snapshots_secondary:
-    - alpaca
+    - public  # or tastytrade (the non-primary provider)
   options_stream_primary: tastytrade_dxlink
   bars_secondary:
     - yahoo
@@ -79,28 +78,23 @@ config key is always `bars_primary`.
 - **Replay impact:** Replay packs and harness include these snapshots automatically
   because they are read from `option_chain_snapshots` without provider-specific schema.
 
-### Secondary: Alpaca (structural cross-check)
+### Secondary: the non-primary options provider
 
-- **Config key:** `options_snapshots_secondary: [alpaca]`
-- **What it provides:** Strike/expiry structure, underlying price,
-  contract counts.
-- **What it does NOT provide:** Reliable IV or Greeks.  Alpaca
-  option snapshots do not include `atm_iv` or Greeks fields.
-- **Usage:** Structural coverage sanity checks only.  Strategies
-  **must not** depend on IV/greeks from Alpaca unless the
-  `allow_alpaca_iv` flag is explicitly set.
+- **Config key:** `options_snapshots_secondary: [public]` when primary is `tastytrade`,
+  or `options_snapshots_secondary: [tastytrade]` when primary is `public`.
+- **What it provides:** Validation and substitution when the primary provider has gaps.
+- **Policy:** Collect both when enabled; replay pack build can include both streams
+  or prefer primary with secondary gap-fill fallback.
+
+> Alpaca is bars/outcomes only in this setup. It is **not** an options data source.
 
 ## Where Greeks / IV Come From
 
 ### Replay Mode (backtesting)
 
-1. **Tastytrade snapshots** — `atm_iv` field from snapshot.
-2. **Derived IV** — If `atm_iv` is null, a Brenner-Subrahmanyam
-   approximation is computed from the closest-to-ATM put's bid/ask
-   in the Tastytrade `quotes_json` payload.
-3. **Alpaca IV** — Only used if strategy explicitly sets
-   `allow_alpaca_iv: true`.  This is a last resort and is
-   discouraged.
+1. **Primary options snapshots** (`tastytrade` or `public`) — `atm_iv` from snapshot.
+2. **Derived IV** — If `atm_iv` is null, derive from options quotes in `quotes_json` when possible.
+3. **Secondary provider snapshots** — used for validation and optional gap-fill fallback in replay-pack creation.
 
 ### Live Mode
 
@@ -128,7 +122,7 @@ overrides:
 ```
 --bars-provider       Override bars/outcomes provider
 --options-snapshot-provider  Override snapshot provider
---include-secondary-options  Also fetch Alpaca snapshots
+--include-secondary-options  Also fetch secondary provider snapshots
 --provider            Legacy alias for --bars-provider
 --snapshot-provider   Legacy alias for --options-snapshot-provider
 ```
@@ -187,3 +181,38 @@ This confirms:
 6. Strategy evaluator produces rankings
 
 Artifacts: `logs/e2e/<date>/summary.json` and `summary.md`.
+
+
+## Public Connector Notes
+
+- Public REST calls are throttled by a shared client-side limiter (`public.rate_limit_rps`, default `10`) across account lookup and greeks requests.
+- Public options connector needs a structure source for expirations/contracts. It can use:
+  - `exchanges.alpaca.options` (async structure path), or
+  - `tastytrade.snapshot_sampling` (sync structure path wrapped for async use).
+- If Public returns 400/422 on greeks, verify `osiSymbols` query serialization against Public docs (repeated key vs comma-separated).
+
+## Provider Comparison Workflow
+
+Use the comparison tool to choose the options primary provider:
+
+```bash
+python scripts/compare_options_snapshot_providers.py --symbol SPY --start 2026-01-01 --end 2026-01-03
+```
+
+The report compares Tastytrade vs Public overlap (receipt freshness and `atm_iv` agreement) and prints a recommendation.
+Afterward, set:
+
+- `data_sources.options_snapshots_primary` = preferred provider
+- `data_sources.options_snapshots_secondary` = other provider
+
+## Replay Pack Primary-with-Fallback
+
+Replay pack builder supports primary-preferred merge with secondary gap-fill:
+
+```bash
+python -m src.tools.replay_pack --symbol SPY --start 2026-01-01 --end 2026-01-03 \
+  --options-snapshot-fallback --options-snapshot-gap-minutes 3
+```
+
+This mode keeps primary snapshots by default and inserts secondary snapshots only when primary has a multi-minute gap.
+Metadata records whether fallback was enabled/used and how many snapshots were filled.

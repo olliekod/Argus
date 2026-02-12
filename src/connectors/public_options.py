@@ -9,6 +9,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Sequence, Tuple
 
+import asyncio
+
+from ..core.options_normalize import normalize_tastytrade_nested_chain
+
 from ..core.option_events import OptionChainSnapshotEvent, OptionQuoteEvent
 from .public_client import PublicAPIClient
 
@@ -82,15 +86,51 @@ class PublicOptionsConnector:
         min_dte: int = 7,
         max_dte: int = 21,
     ) -> List[OptionChainSnapshotEvent]:
-        """Build Public-based snapshots using structure from the primary connector."""
-        expirations = await self._structure.get_expirations_in_range(
-            symbol,
-            min_dte=min_dte,
-            max_dte=max_dte,
-        )
+        """Build Public-based snapshots using Alpaca or Tastytrade structure."""
         snapshots: List[OptionChainSnapshotEvent] = []
+
+        # Async Alpaca structure connector path
+        if hasattr(self._structure, "get_expirations_in_range") and hasattr(self._structure, "build_chain_snapshot"):
+            try:
+                expirations = await self._structure.get_expirations_in_range(
+                    symbol,
+                    min_dte=min_dte,
+                    max_dte=max_dte,
+                )
+                for exp_date, _ in expirations:
+                    structure_snapshot = await self._structure.build_chain_snapshot(symbol, exp_date)
+                    if not structure_snapshot:
+                        continue
+                    snapshot = await self._build_snapshot_from_structure(structure_snapshot)
+                    if snapshot:
+                        snapshots.append(snapshot)
+                return snapshots
+            except TypeError:
+                # Tastytrade structure has a different sync method signature.
+                pass
+
+        # Sync Tastytrade structure connector path
+        raw_chain = await asyncio.to_thread(self._structure.fetch_nested_chain, symbol)
+        if not raw_chain:
+            return snapshots
+        normalized = normalize_tastytrade_nested_chain(raw_chain)
+        if not normalized:
+            return snapshots
+
+        expirations = await asyncio.to_thread(
+            self._structure.get_expirations_in_range,
+            normalized,
+            min_dte,
+            max_dte,
+        )
         for exp_date, _ in expirations:
-            structure_snapshot = await self._structure.build_chain_snapshot(symbol, exp_date)
+            structure_snapshot = await asyncio.to_thread(
+                self._structure.build_chain_snapshot,
+                symbol,
+                exp_date,
+                normalized,
+                0.0,
+            )
             if not structure_snapshot:
                 continue
             snapshot = await self._build_snapshot_from_structure(structure_snapshot)

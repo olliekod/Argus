@@ -54,3 +54,29 @@ async def test_get_account_id_from_list_accounts(monkeypatch):
 
     monkeypatch.setattr(client, "_request", fake_request)
     assert await client.get_account_id() == "acct-xyz"
+
+
+@pytest.mark.asyncio
+async def test_public_rate_limiter_waits_when_budget_exhausted(monkeypatch):
+    client = PublicAPIClient(PublicAPIConfig(api_secret="token", account_id="acct", rate_limit_rps=2))
+
+    ticks = [0.0, 0.1, 0.2, 0.2, 1.2]
+    sleeps = []
+
+    def fake_monotonic():
+        if ticks:
+            return ticks.pop(0)
+        return 1.2
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr("src.connectors.public_client.time.monotonic", fake_monotonic)
+    monkeypatch.setattr("src.connectors.public_client.asyncio.sleep", fake_sleep)
+
+    await client._acquire_rate_limit()
+    await client._acquire_rate_limit()
+    await client._acquire_rate_limit()
+
+    assert sleeps
+    assert sleeps[0] == pytest.approx(0.8, abs=1e-6)

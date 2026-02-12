@@ -215,6 +215,52 @@ async def _fetch_snapshots(
     return snapshots
 
 
+
+
+def _merge_snapshots_primary_with_fallback(
+    primary: List[Dict[str, Any]],
+    secondary: List[Dict[str, Any]],
+    gap_ms: int,
+) -> tuple[List[Dict[str, Any]], int]:
+    """Prefer primary snapshots and fill long primary gaps from secondary."""
+    if not primary:
+        merged = sorted(secondary, key=lambda s: s["recv_ts_ms"])
+        return merged, len(merged)
+
+    merged = list(primary)
+    inserted = 0
+    secondary_sorted = sorted(secondary, key=lambda s: s["recv_ts_ms"])
+
+    # Fill gaps before first and after last primary snapshot.
+    first_primary_ts = primary[0]["recv_ts_ms"]
+    last_primary_ts = primary[-1]["recv_ts_ms"]
+    for s in secondary_sorted:
+        ts = s["recv_ts_ms"]
+        if ts < first_primary_ts and (first_primary_ts - ts) >= gap_ms:
+            merged.append(s)
+            inserted += 1
+        elif ts > last_primary_ts and (ts - last_primary_ts) >= gap_ms:
+            merged.append(s)
+            inserted += 1
+
+    # Fill interior primary gaps.
+    for idx in range(len(primary) - 1):
+        left = primary[idx]["recv_ts_ms"]
+        right = primary[idx + 1]["recv_ts_ms"]
+        if (right - left) < gap_ms:
+            continue
+        candidates = [
+            s for s in secondary_sorted
+            if left < s["recv_ts_ms"] < right
+        ]
+        if not candidates:
+            continue
+        merged.extend(candidates)
+        inserted += len(candidates)
+
+    merged.sort(key=lambda s: s["recv_ts_ms"])
+    return merged, inserted
+
 async def _fetch_snapshots_multi(
     db: Database,
     symbol: str,
@@ -241,6 +287,8 @@ async def create_replay_pack(
     db_path: str = "data/argus.db",
     snapshot_provider: Optional[str] = None,
     include_secondary_options: bool = False,
+    options_snapshot_fallback: bool = False,
+    options_snapshot_gap_minutes: int = 3,
     policy: Optional[DataSourcePolicy] = None,
 ) -> Dict[str, Any]:
     """Create a replay pack for a single symbol.
@@ -315,7 +363,31 @@ async def create_replay_pack(
         print(f"  Fetched {len(all_regimes)} regimes ({len(symbol_regimes)} symbol, {len(market_regimes)} market).")
 
         # 5. Fetch Option Chain Snapshots
-        if include_secondary_options:
+        fallback_used = False
+        fallback_filled_count = 0
+        fallback_gap_minutes = options_snapshot_gap_minutes
+        if options_snapshot_fallback:
+            secondary_providers = [
+                p for p in policy.options_snapshots_secondary
+                if p != effective_snapshot_provider
+            ]
+            primary_snaps = await _fetch_snapshots(
+                db, symbol, start_ms, end_ms, provider_filter=effective_snapshot_provider
+            )
+            secondary_snaps = await _fetch_snapshots_multi(
+                db, symbol, start_ms, end_ms, secondary_providers
+            ) if secondary_providers else []
+            snapshots, fallback_filled_count = _merge_snapshots_primary_with_fallback(
+                primary=primary_snaps,
+                secondary=secondary_snaps,
+                gap_ms=max(1, options_snapshot_gap_minutes) * 60_000,
+            )
+            fallback_used = fallback_filled_count > 0
+            print(
+                f"  Fetched {len(primary_snaps)} primary snapshots and {len(secondary_snaps)} secondary snapshots; "
+                f"fallback filled {fallback_filled_count} entries (gap>={options_snapshot_gap_minutes}m)."
+            )
+        elif include_secondary_options:
             snap_providers = policy.snapshot_providers(include_secondary=True)
             # Override primary if user specified a custom snapshot provider
             if snapshot_provider is not None:
@@ -342,6 +414,10 @@ async def create_replay_pack(
                 "bars_provider": bars_provider,
                 "options_snapshot_provider": effective_snapshot_provider,
                 "secondary_options_included": secondary_included,
+                "options_snapshot_fallback_enabled": options_snapshot_fallback,
+                "options_snapshot_fallback_used": fallback_used if options_snapshot_fallback else False,
+                "options_snapshot_fallback_gap_minutes": fallback_gap_minutes if options_snapshot_fallback else None,
+                "options_snapshot_fallback_filled": fallback_filled_count if options_snapshot_fallback else 0,
                 "bar_duration": bar_duration,
                 "start_date": start_date,
                 "end_date": end_date,
@@ -382,6 +458,8 @@ async def create_universe_packs(
     symbols: Optional[List[str]] = None,
     snapshot_provider: Optional[str] = None,
     include_secondary_options: bool = False,
+    options_snapshot_fallback: bool = False,
+    options_snapshot_gap_minutes: int = 3,
     policy: Optional[DataSourcePolicy] = None,
 ) -> List[str]:
     """Create replay packs for every symbol in the liquid ETF universe.
@@ -409,6 +487,8 @@ async def create_universe_packs(
                 db_path=db_path,
                 snapshot_provider=snapshot_provider,
                 include_secondary_options=include_secondary_options,
+                options_snapshot_fallback=options_snapshot_fallback,
+                options_snapshot_gap_minutes=options_snapshot_gap_minutes,
                 policy=policy,
             )
             written.append(out_path)
@@ -471,7 +551,19 @@ def _build_parser() -> argparse.ArgumentParser:
         "--include-secondary-options",
         action="store_true",
         default=False,
-        help="Also include secondary options snapshots (e.g. Alpaca structural cross-check).",
+        help="Also include secondary options snapshots alongside primary.",
+    )
+    parser.add_argument(
+        "--options-snapshot-fallback",
+        action="store_true",
+        default=False,
+        help="Prefer primary options snapshots and fill multi-minute gaps with secondary provider snapshots.",
+    )
+    parser.add_argument(
+        "--options-snapshot-gap-minutes",
+        type=int,
+        default=3,
+        help="Gap threshold in minutes for --options-snapshot-fallback (default: 3).",
     )
     parser.add_argument("--db", default="data/argus.db", help="Path to argus.db")
     return parser
@@ -495,6 +587,8 @@ def main() -> None:
             db_path=args.db,
             snapshot_provider=snap_prov,
             include_secondary_options=args.include_secondary_options,
+            options_snapshot_fallback=args.options_snapshot_fallback,
+            options_snapshot_gap_minutes=args.options_snapshot_gap_minutes,
         ))
     else:
         default_file = f"data/packs/{args.symbol}_{args.start}_{args.end}.json"
@@ -516,6 +610,8 @@ def main() -> None:
             db_path=args.db,
             snapshot_provider=snap_prov,
             include_secondary_options=args.include_secondary_options,
+            options_snapshot_fallback=args.options_snapshot_fallback,
+            options_snapshot_gap_minutes=args.options_snapshot_gap_minutes,
         ))
 
 
