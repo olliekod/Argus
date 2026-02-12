@@ -106,16 +106,23 @@ def _attach_nested_chain_timestamps(payload: Dict[str, Any]) -> None:
 
 
 class TastytradeRestClient:
-    """Synchronous REST client for Tastytrade."""
+    """Synchronous REST client for Tastytrade.
+
+    Supports two auth modes:
+    - OAuth 2.0 (preferred): pass oauth_access_token; requests use Authorization: Bearer <token>.
+      Tastytrade has deprecated session auth; OAuth is required for market-data/option-chain endpoints.
+    - Session (legacy): pass username/password and call login() to get a session-token.
+    """
 
     def __init__(
         self,
-        username: str,
-        password: str,
+        username: str = "",
+        password: str = "",
         environment: str = "live",
         timeout_seconds: float = 20.0,
         retries: Optional[RetryConfig] = None,
         session: Optional[requests.Session] = None,
+        oauth_access_token: Optional[str] = None,
     ) -> None:
         self._username = username
         self._password = password
@@ -125,6 +132,10 @@ class TastytradeRestClient:
         self._session = session or requests.Session()
         self._owns_session = session is None
         self._token: Optional[str] = None
+        self._using_oauth = bool(oauth_access_token)
+        if oauth_access_token:
+            self._token = ensure_bearer_prefix(oauth_access_token)
+            self._session.headers["Authorization"] = self._token
 
     @property
     def base_url(self) -> str:
@@ -134,7 +145,15 @@ class TastytradeRestClient:
         if self._owns_session:
             self._session.close()
 
+    def set_oauth_token(self, access_token: str) -> None:
+        """Set or refresh the OAuth access token (Bearer). Use when token has been refreshed."""
+        self._token = ensure_bearer_prefix(access_token)
+        self._session.headers["Authorization"] = self._token
+        self._using_oauth = True
+
     def login(self) -> str:
+        if self._using_oauth:
+            return self._token or ""
         payload = {"login": self._username, "password": self._password}
         data = self._request("POST", "/sessions", json=payload, auth=False)
         token = (

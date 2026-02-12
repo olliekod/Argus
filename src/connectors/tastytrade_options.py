@@ -19,6 +19,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..connectors.tastytrade_oauth import TastytradeOAuthClient
 from ..connectors.tastytrade_rest import (
     RetryConfig,
     TastytradeError,
@@ -104,6 +105,10 @@ class TastytradeOptionsConfig:
     min_dte: int = 7
     max_dte: int = 21
     poll_interval_seconds: int = 60
+    # OAuth 2.0 (preferred): Tastytrade deprecated session auth; use these when set
+    oauth_client_id: str = ""
+    oauth_client_secret: str = ""
+    oauth_refresh_token: str = ""
 
 
 class TastytradeOptionsConnector:
@@ -125,8 +130,22 @@ class TastytradeOptionsConnector:
     def __init__(self, config: TastytradeOptionsConfig) -> None:
         self._config = config
         self._client: Optional[TastytradeRestClient] = None
+        self._oauth_client: Optional[TastytradeOAuthClient] = None
         self._sequence_id = 0
         self._authenticated = False
+
+        # OAuth: prefer when configured (Tastytrade deprecated session auth)
+        if (
+            config.oauth_client_id
+            and config.oauth_client_secret
+            and config.oauth_refresh_token
+        ):
+            self._oauth_client = TastytradeOAuthClient(
+                client_id=config.oauth_client_id,
+                client_secret=config.oauth_client_secret,
+                refresh_token=config.oauth_refresh_token,
+                timeout_s=config.timeout_seconds,
+            )
 
         # Login failure tracking — prevents login spam on repeated poll cycles
         self._last_login_failure_ms: int = 0
@@ -146,14 +165,70 @@ class TastytradeOptionsConnector:
     def _ensure_client(self) -> TastytradeRestClient:
         """Create and authenticate client if needed.
 
-        Respects a cooldown period after login failures to avoid spamming
-        the Tastytrade API with repeated auth attempts every poll cycle.
+        Prefers OAuth 2.0 when oauth_client_id/secret/refresh_token are set
+        (Tastytrade deprecated session auth; option-chain endpoints require OAuth).
+        Respects a cooldown period after auth failures to avoid spamming the API.
         """
+        now = _now_ms()
+
+        # OAuth path: refresh token and ensure client has valid Bearer token
+        if self._oauth_client is not None:
+            if self._client is not None and self._authenticated:
+                try:
+                    result = self._oauth_client.refresh_access_token()
+                    self._client.set_oauth_token(result.access_token)
+                    return self._client
+                except Exception as exc:
+                    logger.warning("Tastytrade OAuth refresh failed, will recreate client: %s", exc)
+                    self._authenticated = False
+                    self._client = None
+            # Enforce cooldown after prior OAuth failure
+            if self._last_login_failure_ms > 0:
+                elapsed = now - self._last_login_failure_ms
+                if elapsed < self._LOGIN_COOLDOWN_MS:
+                    remaining_s = (self._LOGIN_COOLDOWN_MS - elapsed) / 1000
+                    raise TastytradeError(
+                        f"Login cooldown active ({remaining_s:.0f}s remaining). "
+                        f"Last failure: {self._login_failure_reason}"
+                    )
+            try:
+                result = self._oauth_client.refresh_access_token()
+                retry = RetryConfig(
+                    max_attempts=self._config.max_attempts,
+                    backoff_seconds=self._config.backoff_seconds,
+                    backoff_multiplier=self._config.backoff_multiplier,
+                )
+                self._client = TastytradeRestClient(
+                    environment=self._config.environment,
+                    timeout_seconds=self._config.timeout_seconds,
+                    retries=retry,
+                    oauth_access_token=result.access_token,
+                )
+                self._authenticated = True
+                self._last_login_failure_ms = 0
+                self._login_failure_reason = ""
+                logger.info(
+                    "Tastytrade options connector authenticated via OAuth (env=%s)",
+                    self._config.environment,
+                )
+                return self._client
+            except Exception as exc:
+                self._error_count += 1
+                self._authenticated = False
+                self._last_login_failure_ms = _now_ms()
+                self._login_failure_reason = str(exc)
+                logger.error(
+                    "Tastytrade OAuth refresh failed (cooldown %ds): %s. "
+                    "Check tastytrade_oauth2 client_id, client_secret, refresh_token in secrets.yaml.",
+                    self._LOGIN_COOLDOWN_MS // 1000, exc,
+                )
+                raise TastytradeError(str(exc)) from exc
+
+        # Session (legacy) path
         if self._client is not None and self._authenticated:
             return self._client
 
         # Enforce cooldown after login failure
-        now = _now_ms()
         if self._last_login_failure_ms > 0:
             elapsed = now - self._last_login_failure_ms
             if elapsed < self._LOGIN_COOLDOWN_MS:
@@ -180,18 +255,17 @@ class TastytradeOptionsConnector:
             self._authenticated = True
             self._last_login_failure_ms = 0
             self._login_failure_reason = ""
-            logger.info("Tastytrade options connector authenticated (env=%s)", self._config.environment)
+            logger.info("Tastytrade options connector authenticated (session, env=%s)", self._config.environment)
         except TastytradeError as exc:
             self._error_count += 1
             self._authenticated = False
             self._last_login_failure_ms = _now_ms()
             self._login_failure_reason = str(exc)
-            # Distinguish credential errors from transient failures
             exc_str = str(exc)
             if "missing_request_token" in exc_str or "HTTP 400" in exc_str or "HTTP 401" in exc_str:
                 logger.error(
-                    "Tastytrade login failed (credentials/auth issue, cooldown %ds): %s. "
-                    "Check secrets.yaml tastytrade credentials or run OAuth2 bootstrap.",
+                    "Tastytrade login failed (session auth deprecated? cooldown %ds): %s. "
+                    "Use tastytrade_oauth2 in secrets.yaml and run OAuth bootstrap.",
                     self._LOGIN_COOLDOWN_MS // 1000, exc,
                 )
             else:

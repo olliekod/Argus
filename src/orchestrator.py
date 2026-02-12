@@ -622,11 +622,19 @@ class ArgusOrchestrator:
         tt_sampling = tt_cfg.get('snapshot_sampling', {})
         if tt_sampling.get('enabled', False):
             tt_secrets = self.secrets.get('tastytrade', {})
+            tt_oauth = self.secrets.get('tastytrade_oauth2', {})
             tt_username = tt_secrets.get('username', '')
             tt_password = tt_secrets.get('password', '')
-            if tt_username and tt_password and not tt_username.startswith('PASTE_'):
+            oauth_client_id = tt_oauth.get('client_id', '')
+            oauth_client_secret = tt_oauth.get('client_secret', '')
+            oauth_refresh_token = tt_oauth.get('refresh_token', '')
+            has_oauth = (
+                oauth_client_id and oauth_client_secret and oauth_refresh_token
+                and not oauth_client_id.startswith('PASTE_')
+            )
+            has_session = tt_username and tt_password and not tt_username.startswith('PASTE_')
+            if has_oauth or has_session:
                 retry_cfg = tt_cfg.get('retries', {})
-                # Derive options symbols: intersection with alpaca options symbols if available
                 alpaca_opts_symbols = getattr(self, '_alpaca_options_symbols', [])
                 tt_underlyings = tt_cfg.get('underlyings', [])
                 if alpaca_opts_symbols:
@@ -654,6 +662,9 @@ class ArgusOrchestrator:
                             min_dte=tt_min_dte,
                             max_dte=tt_max_dte,
                             poll_interval_seconds=tt_poll_interval,
+                            oauth_client_id=oauth_client_id,
+                            oauth_client_secret=oauth_client_secret,
+                            oauth_refresh_token=oauth_refresh_token,
                         )
                     )
                     self._tastytrade_options_symbols = tt_options_symbols
@@ -670,7 +681,10 @@ class ArgusOrchestrator:
                     )
                     self.tastytrade_options = None
             else:
-                self.logger.info("Tastytrade Options disabled (credentials missing in secrets.yaml)")
+                self.logger.info(
+                    "Tastytrade Options disabled (need tastytrade_oauth2 client_id, client_secret, refresh_token "
+                    "or tastytrade username/password in secrets.yaml)"
+                )
         else:
             self.logger.info("Tastytrade snapshot sampling disabled (set tastytrade.snapshot_sampling.enabled=true)")
 
