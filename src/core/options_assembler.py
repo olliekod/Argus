@@ -17,7 +17,6 @@ from .option_events import (
     OptionContractEvent,
     OptionQuoteEvent,
     OptionChainSnapshotEvent,
-    compute_snapshot_id,
     option_chain_to_dict,
     TOPIC_OPTIONS_CHAINS,
     TOPIC_OPTIONS_QUOTES,
@@ -133,7 +132,7 @@ class OptionsChainAssembler:
             atm_put = min(puts, key=lambda q: abs(q.strike - underlying_price))
             atm_iv = atm_put.iv
         
-        snapshot_id = compute_snapshot_id(symbol, expiration_ms, now_ms)
+        snapshot_id = f"{provider}_{symbol}_{expiration_ms}_{now_ms}"
         
         snapshot = OptionChainSnapshotEvent(
             symbol=symbol,

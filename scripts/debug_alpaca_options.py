@@ -1,12 +1,19 @@
+"""Debug Alpaca options: expirations + snapshot build. Run from repo root: python scripts/debug_alpaca_options.py"""
 
 import asyncio
 import logging
+import sys
 import yaml
 from pathlib import Path
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from src.connectors.alpaca_options import AlpacaOptionsConnector, AlpacaOptionsConfig
 
-# Load secrets
-with open("config/secrets.yaml") as f:
+# Load secrets (relative to repo root)
+with open(REPO_ROOT / "config" / "secrets.yaml") as f:
     secrets = yaml.safe_load(f)
 
 api_key = secrets.get('alpaca', {}).get('api_key')

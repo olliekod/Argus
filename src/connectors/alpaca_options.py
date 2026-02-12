@@ -30,7 +30,6 @@ from ..core.option_events import (
     OptionContractEvent,
     OptionQuoteEvent,
     OptionChainSnapshotEvent,
-    compute_snapshot_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -58,6 +57,24 @@ def _date_to_ms(date_str: str) -> int:
 def _compute_contract_id(option_symbol: str) -> str:
     """Compute deterministic contract ID from OCC option symbol."""
     return hashlib.sha256(option_symbol.encode()).hexdigest()[:16]
+
+
+def _expiration_from_occ_symbol(occ_symbol: str) -> Optional[str]:
+    """Derive YYYY-MM-DD expiration from OCC option symbol.
+    Format: ROOT + YYMMDD + C|P + STRIKE(8). Example: SPY250221C00450000 -> 2025-02-21.
+    """
+    if not occ_symbol or len(occ_symbol) < 15:
+        return None
+    for i in range(len(occ_symbol) - 9, 5, -1):
+        if occ_symbol[i] in ("C", "P") and occ_symbol[i + 1 : i + 9].isdigit():
+            yy = int(occ_symbol[i - 6 : i - 4])
+            mm = int(occ_symbol[i - 4 : i - 2])
+            dd = int(occ_symbol[i - 2 : i])
+            year = 2000 + yy if yy < 100 else yy
+            if 1 <= mm <= 12 and 1 <= dd <= 31:
+                return f"{year:04d}-{mm:02d}-{dd:02d}"
+            return None
+    return None
 
 
 @dataclass
@@ -176,15 +193,25 @@ class AlpacaOptionsConnector:
             return []
 
         expirations = set()
-        for snapshot in data.get("snapshots", {}).values():
-            exp = snapshot.get("expiration_date")
+        snapshots_dict = data.get("snapshots", {})
+        for opt_symbol, snapshot in snapshots_dict.items():
+            # API may return expiration_date (snake_case) or expirationDate (camelCase)
+            exp = snapshot.get("expiration_date") or snapshot.get("expirationDate")
             if exp:
-                expirations.add(exp)
+                expirations.add(exp if isinstance(exp, str) else str(exp))
+                continue
+            # Indicative (and some) feeds often omit expiration; derive from OCC symbol
+            try:
+                exp_str = _expiration_from_occ_symbol(opt_symbol)
+                if exp_str:
+                    expirations.add(exp_str)
+            except (ValueError, IndexError):
+                pass
 
         if not expirations:
             logger.warning(
                 "Expiration lookup for %s returned no expirations (snapshots=%d, feed=%s)",
-                symbol, len(data.get("snapshots", {})), self._config.feed,
+                symbol, len(snapshots_dict), self._config.feed,
             )
 
         result = sorted(expirations)
@@ -366,7 +393,7 @@ class AlpacaOptionsConnector:
             atm_put = min(puts, key=lambda q: abs(q.strike - underlying_price))
             atm_iv = atm_put.iv
 
-        snapshot_id = compute_snapshot_id(symbol, expiration_ms, timestamp_ms)
+        snapshot_id = f"{self.PROVIDER}_{symbol}_{expiration_ms}_{timestamp_ms}"
 
         return OptionChainSnapshotEvent(
             symbol=symbol,

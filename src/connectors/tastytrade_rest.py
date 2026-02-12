@@ -182,6 +182,20 @@ class TastytradeRestClient:
         logger.warning("Quotes endpoint not yet implemented.")
         return {"symbols": symbols, "data": []}
 
+    def get_equity_snapshot(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """Fetch equity market-data snapshot for underlying price.
+        GET /market-data/snapshots/{symbol}. Returns dict with price fields (e.g. mark, last) or None on failure.
+        """
+        try:
+            data = self._request(
+                "GET",
+                f"/market-data/snapshots/{symbol}",
+                error_excerpt_limit=300,
+            )
+            return data.get("data", data) if isinstance(data, dict) else data
+        except TastytradeError:
+            return None
+
     def _resolve_base_url(self, environment: str) -> str:
         env = (environment or "live").lower()
         if env == "sandbox":

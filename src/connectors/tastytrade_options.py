@@ -28,7 +28,6 @@ from ..core.options_normalize import normalize_tastytrade_nested_chain
 from ..core.option_events import (
     OptionQuoteEvent,
     OptionChainSnapshotEvent,
-    compute_snapshot_id,
 )
 
 logger = logging.getLogger(__name__)
@@ -55,6 +54,40 @@ def _date_to_ms(date_str: str) -> int:
 def _compute_contract_id(option_symbol: str) -> str:
     """Compute deterministic contract ID from option symbol."""
     return hashlib.sha256(option_symbol.encode()).hexdigest()[:16]
+
+
+def _underlying_price_from_raw_chain(raw: Dict[str, Any]) -> float:
+    """Extract underlying price from Tastytrade nested chain response if present.
+    Tries common keys in data or first item. Returns 0.0 if not found.
+    """
+    if not raw or not isinstance(raw, dict):
+        return 0.0
+    data = raw.get("data", raw)
+    if not isinstance(data, dict):
+        return 0.0
+    for key in ("underlying-price", "underlying_price", "spot-price", "spot_price", "mark", "last", "close"):
+        val = data.get(key)
+        if val is not None and val != "":
+            try:
+                p = float(val)
+                if p > 0:
+                    return p
+            except (TypeError, ValueError):
+                pass
+    items = data.get("items") or data.get("item")
+    if isinstance(items, list) and items:
+        first = items[0] if isinstance(items[0], dict) else None
+        if first:
+            for key in ("underlying-price", "underlying_price", "spot-price", "mark", "last", "close"):
+                val = first.get(key)
+                if val is not None and val != "":
+                    try:
+                        p = float(val)
+                        if p > 0:
+                            return p
+                    except (TypeError, ValueError):
+                        pass
+    return 0.0
 
 
 @dataclass
@@ -163,6 +196,26 @@ class TastytradeOptionsConnector:
             )
             self._authenticated = False
             return {}
+
+    def _fetch_underlying_spot(self, symbol: str) -> Optional[float]:
+        """Fetch underlying price from Tastytrade market-data snapshot. Returns None on failure."""
+        try:
+            client = self._ensure_client()
+            snap = client.get_equity_snapshot(symbol)
+            if not snap or not isinstance(snap, dict):
+                return None
+            for key in ("mark", "last", "close", "last-trade-price"):
+                val = snap.get(key)
+                if val is not None and val != "":
+                    try:
+                        p = float(val)
+                        if p > 0:
+                            return p
+                    except (TypeError, ValueError):
+                        pass
+            return None
+        except Exception:
+            return None
 
     def get_expirations_in_range(
         self,
@@ -294,7 +347,7 @@ class TastytradeOptionsConnector:
             atm_put = min(puts, key=lambda q: abs(q.strike - underlying_price))
             atm_iv = atm_put.iv
 
-        snapshot_id = compute_snapshot_id(symbol, expiration_ms, timestamp_ms)
+        snapshot_id = f"{self.PROVIDER}_{symbol}_{expiration_ms}_{timestamp_ms}"
 
         return OptionChainSnapshotEvent(
             symbol=symbol,
@@ -341,6 +394,29 @@ class TastytradeOptionsConnector:
                 symbol,
             )
             return []
+
+        # Prefer orchestrator-passed price (e.g. from Alpaca); fill from chain or spot when 0
+        from_chain = _underlying_price_from_raw_chain(raw)
+        if underlying_price <= 0 and from_chain > 0:
+            underlying_price = from_chain
+            logger.debug(
+                "Using underlying price from Tastytrade chain for %s: %.2f",
+                symbol, underlying_price,
+            )
+        if underlying_price <= 0:
+            try:
+                spot = self._fetch_underlying_spot(symbol)
+                if spot and spot > 0:
+                    underlying_price = spot
+                    logger.debug(
+                        "Using underlying price from Tastytrade market-data for %s: %.2f",
+                        symbol, underlying_price,
+                    )
+            except Exception as exc:
+                logger.debug(
+                    "Tastytrade spot fetch for %s failed (non-fatal): %s",
+                    symbol, exc,
+                )
 
         normalized = normalize_tastytrade_nested_chain(raw)
         if not normalized:

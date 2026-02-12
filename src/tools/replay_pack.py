@@ -26,6 +26,135 @@ from src.core.database import Database
 from src.core.liquid_etf_universe import get_liquid_etf_universe
 
 
+def _atm_iv_from_quotes_json(quotes_json: str, underlying_price: float) -> Optional[float]:
+    """Fill ATM put IV from quotes_json when snapshot has no atm_iv.
+
+    Provider IV is always preferred; derived IV is used only when provider
+    did not supply it. Order: (1) top-level atm_iv (from connector/provider),
+    (2) ATM put's iv field (provider on the quote), (3) derived from bid/ask
+    via GreeksEngine (Black-Scholes) when neither is present.
+    """
+    if not quotes_json or not underlying_price or underlying_price <= 0:
+        return None
+    try:
+        data = json.loads(quotes_json)
+        if not isinstance(data, dict):
+            return None
+        # Top-level atm_iv from serialized OptionChainSnapshotEvent
+        top = data.get("atm_iv")
+        if top is not None and top != "" and float(top) > 0:
+            return float(top)
+        puts = data.get("puts") or []
+        if not puts:
+            return None
+        timestamp_ms = int(data.get("timestamp_ms") or 0)
+        expiration_ms = int(data.get("expiration_ms") or 0)
+        T_years = 0.0
+        if timestamp_ms and expiration_ms and expiration_ms > timestamp_ms:
+            T_years = (expiration_ms - timestamp_ms) / (1000.0 * 365.25 * 24 * 3600)
+        # Find ATM put (strike closest to underlying)
+        best_put: Optional[Dict[str, Any]] = None
+        best_dist = float("inf")
+        for q in puts:
+            if not isinstance(q, dict):
+                continue
+            strike = q.get("strike")
+            if strike is None:
+                continue
+            try:
+                s = float(strike)
+                dist = abs(s - underlying_price)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_put = q
+            except (TypeError, ValueError):
+                continue
+        if not best_put:
+            return None
+        # Prefer provider iv on the ATM put
+        iv = best_put.get("iv")
+        if iv is not None and iv != "" and float(iv) > 0:
+            return float(iv)
+        # Build list of puts with usable price, sorted by distance to ATM
+        others_with_price = []
+        for q in puts:
+            if not isinstance(q, dict) or q is best_put:
+                continue
+            strike = q.get("strike")
+            if strike is None:
+                continue
+            try:
+                s = float(strike)
+            except (TypeError, ValueError):
+                continue
+            if (q.get("iv") and float(q.get("iv") or 0) > 0) or float(q.get("mid") or 0) > 0 or float(q.get("last") or 0) > 0 or (float(q.get("bid") or 0) > 0 or float(q.get("ask") or 0) > 0):
+                others_with_price.append((abs(s - underlying_price), q))
+        others_with_price.sort(key=lambda x: x[0])
+        candidates: List[Dict[str, Any]] = [best_put] + [q for _, q in others_with_price]
+        for put in candidates:
+            iv = put.get("iv")
+            if iv is not None and iv != "" and float(iv) > 0:
+                return float(iv)
+            K = float(put.get("strike", 0))
+            if K <= 0 or T_years <= 0:
+                continue
+            bid, ask = put.get("bid"), put.get("ask")
+            mid_from_bid_ask = None
+            if bid is not None and ask is not None and (float(bid or 0) > 0 or float(ask or 0) > 0):
+                mid_from_bid_ask = (float(bid) + float(ask)) / 2.0
+            mid_or_last = mid_from_bid_ask
+            if (mid_or_last is None or mid_or_last <= 0) and put.get("mid"):
+                try:
+                    mid_or_last = float(put["mid"])
+                except (TypeError, ValueError):
+                    pass
+            if (mid_or_last is None or mid_or_last <= 0) and put.get("last"):
+                try:
+                    mid_or_last = float(put["last"])
+                except (TypeError, ValueError):
+                    pass
+            if mid_or_last and mid_or_last > 0:
+                try:
+                    from src.analysis.greeks_engine import GreeksEngine
+                    engine = GreeksEngine()
+                    kwargs = {}
+                    if bid is not None and ask is not None and float(bid or 0) > 0:
+                        kwargs["bid"] = float(bid)
+                        kwargs["ask"] = float(ask)
+                    iv_val, _ = engine.implied_volatility(
+                        mid_or_last, underlying_price, K, T_years, "put", **kwargs
+                    )
+                    if iv_val and iv_val > 0:
+                        return iv_val
+                except Exception:
+                    continue
+        return None
+    except (json.JSONDecodeError, TypeError):
+        return None
+
+
+def _bar_timestamp_to_ms(ts: Any) -> int:
+    """Convert bar timestamp (ISO str or number) to milliseconds (UTC)."""
+    if ts is None:
+        return 0
+    if isinstance(ts, (int, float)):
+        return int(ts * 1000) if ts < 1e12 else int(ts)
+    try:
+        s = str(ts)
+        if "T" in s:
+            dt = datetime.fromisoformat(s.replace("Z", "+00:00"))
+        else:
+            dt = datetime.strptime(s, "%Y-%m-%d %H:%M:%S")
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except Exception:
+        try:
+            return int(float(ts) * 1000)
+        except Exception:
+            return 0
+
+
 async def _fetch_snapshots(
     db: Database,
     symbol: str,
@@ -59,13 +188,17 @@ async def _fetch_snapshots(
         recv_ts = row.get("recv_ts_ms")
         if recv_ts is None:
             recv_ts = row.get("timestamp_ms", 0)
+        atm_iv = row.get("atm_iv")
+        if atm_iv is None or (isinstance(atm_iv, (int, float)) and atm_iv <= 0):
+            underlying = float(row.get("underlying_price") or 0)
+            atm_iv = _atm_iv_from_quotes_json(row.get("quotes_json", "") or "", underlying)
 
         snapshots.append({
             "timestamp_ms": row.get("timestamp_ms", 0),
             "recv_ts_ms": recv_ts,
             "provider": row.get("provider", ""),
             "underlying_price": row.get("underlying_price", 0.0),
-            "atm_iv": row.get("atm_iv"),
+            "atm_iv": atm_iv,
             "quotes_json": row.get("quotes_json", ""),
             "symbol": row.get("symbol", symbol),
             "n_strikes": row.get("n_strikes", 0),
@@ -122,6 +255,19 @@ async def create_replay_pack(
         )
         print(f"  Fetched {len(outcomes)} outcomes.")
 
+        # If no bars or outcomes, hint which provider/source has data in the DB
+        if len(bars_raw) == 0 or len(outcomes) == 0:
+            bar_inv = await db.get_bar_inventory()
+            outcome_inv = await db.get_outcome_inventory()
+            bar_sources = [r for r in bar_inv if r.get("symbol") == symbol]
+            outcome_providers = [r for r in outcome_inv if r.get("symbol") == symbol]
+            if bar_sources and len(bars_raw) == 0:
+                sources_str = ", ".join(f"{r['source']} ({r.get('bar_count', 0)} bars)" for r in bar_sources)
+                print(f"  Hint: No bars for provider={provider!r}. Bars in DB for {symbol}: {sources_str}. Try --provider <source>.")
+            if outcome_providers and len(outcomes) == 0:
+                prov_str = ", ".join(f"{r['provider']}" for r in outcome_providers)
+                print(f"  Hint: No outcomes for provider={provider!r}. Outcomes in DB for {symbol}: provider(s) {prov_str}. Try --provider <provider>.")
+
         # 4. Fetch Regimes (Symbol and Market)
         market = "EQUITIES"
         symbol_regimes = await db.get_regimes(scope=symbol, start_ms=start_ms, end_ms=end_ms)
@@ -133,7 +279,31 @@ async def create_replay_pack(
         snapshots = await _fetch_snapshots(
             db, symbol, start_ms, end_ms, provider_filter=snapshot_provider
         )
-        print(f"  Fetched {len(snapshots)} option chain snapshots.")
+        # Cap recv_ts_ms so snapshots are releaseable: last sim_ts_ms in replay is last bar close
+        max_bar_ts_ms = max(
+            (_bar_timestamp_to_ms(b.get("timestamp")) for b in bars_raw),
+            default=0,
+        )
+        max_sim_ms = max_bar_ts_ms + bar_duration * 1000
+        for s in snapshots:
+            if s["recv_ts_ms"] > max_sim_ms:
+                s["recv_ts_ms"] = max_sim_ms
+        n_with_iv = sum(1 for s in snapshots if s.get("atm_iv") is not None and float(s.get("atm_iv") or 0) > 0)
+        print(f"  Fetched {len(snapshots)} option chain snapshots ({n_with_iv} with atm_iv).")
+        if n_with_iv == 0 and snapshots:
+            s0 = snapshots[0]
+            prov = s0.get("provider", "?")
+            try:
+                data = json.loads(s0.get("quotes_json") or "{}")
+                puts = data.get("puts") or []
+                n_with_iv_field = sum(1 for p in puts if isinstance(p, dict) and (float(p.get("iv") or 0) > 0))
+                n_with_mid_last = sum(1 for p in puts if isinstance(p, dict) and (float(p.get("mid") or 0) > 0 or float(p.get("last") or 0) > 0))
+                n_with_bid_ask = sum(1 for p in puts if isinstance(p, dict) and (float(p.get("bid") or 0) > 0 or float(p.get("ask") or 0) > 0))
+                print(f"  Hint (no atm_iv): first snapshot provider={prov!r}, puts: {len(puts)} total, {n_with_iv_field} with iv>0, {n_with_mid_last} with mid/last>0, {n_with_bid_ask} with bid/ask>0.")
+                if n_with_iv_field == 0 and n_with_mid_last == 0 and n_with_bid_ask == 0:
+                    print("  This looks like indicative-only data (no greeks, no quotes). For IV in replay, use option snapshots from a feed that provides greeks (e.g. Tastytrade) or ensure Tastytrade options polling runs so packs include snapshots with atm_iv.")
+            except Exception as e:
+                print(f"  Hint (no atm_iv): could not inspect quotes_json: {e}")
 
         # 6. Build Pack
         pack: Dict[str, Any] = {
@@ -143,13 +313,16 @@ async def create_replay_pack(
                 "bar_duration": bar_duration,
                 "start_date": start_date,
                 "end_date": end_date,
-                "packed_at": datetime.utcnow().isoformat(),
+                "packed_at": datetime.now(timezone.utc).isoformat(),
                 "bar_count": len(bars_raw),
                 "outcome_count": len(outcomes),
                 "regime_count": len(all_regimes),
                 "snapshot_count": len(snapshots),
             },
-            "bars": bars_raw,
+            "bars": [
+                {**b, "timestamp_ms": _bar_timestamp_to_ms(b.get("timestamp"))}
+                for b in bars_raw
+            ],
             "outcomes": outcomes,
             "regimes": all_regimes,
             "snapshots": snapshots,
@@ -258,7 +431,16 @@ def main() -> None:
             snapshot_provider=getattr(args, "snapshot_provider", None),
         ))
     else:
-        out_path = args.out or f"data/packs/{args.symbol}_{args.start}_{args.end}.json"
+        default_file = f"data/packs/{args.symbol}_{args.start}_{args.end}.json"
+        if args.out is None:
+            out_path = default_file
+        else:
+            p = Path(args.out)
+            if p.suffix != ".json" or p.exists() and p.is_dir():
+                # Treat as output directory: write SYMBOL_start_end.json inside it
+                out_path = str(Path(args.out).resolve() / f"{args.symbol}_{args.start}_{args.end}.json")
+            else:
+                out_path = args.out
         asyncio.run(create_replay_pack(
             symbol=args.symbol,
             start_date=args.start,
