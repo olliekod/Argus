@@ -187,6 +187,42 @@ def compute_regime_dependency_penalty(metrics: Dict[str, Any]) -> float:
     return 0.0
 
 
+def compute_regime_sensitivity_score(metrics: Dict[str, Any]) -> float:
+    """Score regime balance based on PnL-per-bar dispersion. Range [0, 1].
+
+    1.0 means stable across regimes; 0.0 means highly regime-sensitive.
+    """
+    breakdown = metrics.get("regime_breakdown", {})
+    if not breakdown:
+        return 0.5
+
+    pnl_per_bar_values: List[float] = []
+    for stats in breakdown.values():
+        if not isinstance(stats, dict):
+            continue
+        bars = int(_safe_float(stats.get("bars")))
+        if bars <= 0:
+            continue
+        pnl = _safe_float(stats.get("pnl"))
+        pnl_per_bar_values.append(pnl / bars)
+
+    if len(pnl_per_bar_values) == 0:
+        return 0.5
+    if len(pnl_per_bar_values) == 1:
+        return 0.0
+
+    mean = sum(pnl_per_bar_values) / len(pnl_per_bar_values)
+    variance = sum((v - mean) ** 2 for v in pnl_per_bar_values) / len(pnl_per_bar_values)
+    std = math.sqrt(variance)
+    if abs(mean) < 1e-9:
+        cv = 1.0 if std > 0 else 0.0
+    else:
+        cv = abs(std / mean)
+
+    sensitivity = max(0.0, 1.0 - min(cv, 1.0))
+    return round(sensitivity, 4)
+
+
 def compute_robustness_penalty(
     all_metrics: Sequence[Dict[str, Any]],
     target_run_id: str,
@@ -329,6 +365,7 @@ DEFAULT_WEIGHTS = {
     "reject_penalty": -0.10,
     "robustness_penalty": -0.10,
     "regime_dependency_penalty": -0.05,
+    "regime_sensitivity": 0.05,
     "walk_forward_penalty": -0.05,
 }
 
@@ -369,6 +406,7 @@ def compute_composite_score(
     rej_penalty = compute_reject_penalty(metrics)
     rob_penalty = compute_robustness_penalty(all_metrics, metrics.get("run_id", ""))
     regime_dep = compute_regime_dependency_penalty(metrics)
+    regime_sensitivity = compute_regime_sensitivity_score(metrics)
     wf_penalty = compute_walk_forward_penalty(all_metrics, metrics.get("run_id", ""))
 
     composite = (
@@ -378,6 +416,7 @@ def compute_composite_score(
         + w.get("reject_penalty", -0.10) * rej_penalty
         + w.get("robustness_penalty", -0.10) * rob_penalty
         + w.get("regime_dependency_penalty", -0.05) * regime_dep
+        + w.get("regime_sensitivity", 0.05) * regime_sensitivity
         + w.get("walk_forward_penalty", -0.05) * wf_penalty
     )
 
@@ -390,6 +429,7 @@ def compute_composite_score(
             "reject_penalty": round(rej_penalty, 4),
             "robustness_penalty": round(rob_penalty, 4),
             "regime_dependency_penalty": round(regime_dep, 4),
+            "regime_sensitivity": round(regime_sensitivity, 4),
             "walk_forward_penalty": round(wf_penalty, 4),
         },
         "weights": w,
@@ -408,13 +448,21 @@ class StrategyEvaluator:
         input_dir: str = "logs/experiments",
         output_dir: str = "logs",
         weights: Optional[Dict[str, float]] = None,
+        kill_thresholds: Optional[Dict[str, float]] = None,
     ):
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
         self.weights = weights or DEFAULT_WEIGHTS
+        self.kill_thresholds = kill_thresholds or {
+            "robustness_penalty": 0.6,
+            "walk_forward_penalty": 0.6,
+            "regime_dependency_penalty": 0.7,
+            "composite_score_min": 0.1,
+        }
         self._experiments: List[Dict[str, Any]] = []
         self._metrics: List[Dict[str, Any]] = []
         self._rankings: List[Dict[str, Any]] = []
+        self._killed: List[Dict[str, Any]] = []
 
     def load_experiments(self, paths: Optional[List[str]] = None) -> int:
         """Load experiment JSON files.
@@ -478,6 +526,7 @@ class StrategyEvaluator:
                 "strategy_class": metrics["strategy_class"],
                 "strategy_params": metrics["strategy_params"],
                 "composite_score": score_info["composite_score"],
+                "regime_sensitivity_score": score_info["components"]["regime_sensitivity"],
                 "scoring": score_info,
                 "metrics": {
                     "total_pnl": metrics["total_pnl"],
@@ -497,6 +546,10 @@ class StrategyEvaluator:
                 "manifest_ref": self._experiments[i].get("manifest", {}),
                 "source_file": self._experiments[i].get("_source_file", ""),
             }
+
+            kill_reasons = self._compute_kill_reasons(record)
+            record["killed"] = len(kill_reasons) > 0
+            record["kill_reasons"] = kill_reasons
             scored.append(record)
 
         # 3. Sort by composite score descending
@@ -507,7 +560,64 @@ class StrategyEvaluator:
             rec["rank"] = i + 1
 
         self._rankings = scored
+        self._killed = []
+        for rec in scored:
+            for reason in rec.get("kill_reasons", []):
+                self._killed.append(
+                    {
+                        "run_id": rec.get("run_id", ""),
+                        "strategy_id": rec.get("strategy_id", ""),
+                        "strategy_class": rec.get("strategy_class", ""),
+                        "strategy_params": rec.get("strategy_params", {}),
+                        "reason": reason["reason"],
+                        "value": reason["value"],
+                        "threshold": reason["threshold"],
+                    }
+                )
         return scored
+
+    def _compute_kill_reasons(self, record: Dict[str, Any]) -> List[Dict[str, Any]]:
+        reasons: List[Dict[str, Any]] = []
+        thresholds = self.kill_thresholds
+        components = record.get("scoring", {}).get("components", {})
+
+        if components.get("robustness_penalty", 0.0) >= thresholds.get("robustness_penalty", 2.0):
+            reasons.append(
+                {
+                    "reason": "robustness_penalty",
+                    "value": round(components.get("robustness_penalty", 0.0), 4),
+                    "threshold": thresholds.get("robustness_penalty"),
+                }
+            )
+
+        if components.get("walk_forward_penalty", 0.0) >= thresholds.get("walk_forward_penalty", 2.0):
+            reasons.append(
+                {
+                    "reason": "walk_forward_penalty",
+                    "value": round(components.get("walk_forward_penalty", 0.0), 4),
+                    "threshold": thresholds.get("walk_forward_penalty"),
+                }
+            )
+
+        if components.get("regime_dependency_penalty", 0.0) >= thresholds.get("regime_dependency_penalty", 2.0):
+            reasons.append(
+                {
+                    "reason": "regime_dependency_penalty",
+                    "value": round(components.get("regime_dependency_penalty", 0.0), 4),
+                    "threshold": thresholds.get("regime_dependency_penalty"),
+                }
+            )
+
+        if record.get("composite_score", 0.0) < thresholds.get("composite_score_min", -1.0):
+            reasons.append(
+                {
+                    "reason": "composite_score_min",
+                    "value": round(record.get("composite_score", 0.0), 6),
+                    "threshold": thresholds.get("composite_score_min"),
+                }
+            )
+
+        return reasons
 
     def save_rankings(self, output_path: Optional[str] = None) -> str:
         """Write the rankings to JSON.
@@ -527,7 +637,9 @@ class StrategyEvaluator:
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "experiment_count": len(self._rankings),
             "weights": self.weights,
+            "kill_thresholds": self.kill_thresholds,
             "rankings": self._rankings,
+            "killed": self._killed,
         }
 
         with open(output_path, "w") as f:
@@ -579,3 +691,7 @@ class StrategyEvaluator:
     @property
     def metrics(self) -> List[Dict[str, Any]]:
         return list(self._metrics)
+
+    @property
+    def killed(self) -> List[Dict[str, Any]]:
+        return list(self._killed)

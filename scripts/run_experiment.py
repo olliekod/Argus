@@ -24,6 +24,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
 
 from src.analysis.experiment_runner import ExperimentRunner, ExperimentConfig
+from src.analysis.regime_stress import run_regime_subset_stress
 from src.analysis.replay_harness import ReplayStrategy
 
 def load_strategy_class(name: str) -> Type[ReplayStrategy]:
@@ -53,6 +54,7 @@ def main():
     parser.add_argument("--sweep", help="Path to YAML param grid for parameter sweep")
     parser.add_argument("--output", default="logs/experiments", help="Output directory for results")
     parser.add_argument("--cash", type=float, default=10000.0, help="Starting cash")
+    parser.add_argument("--regime-stress", action="store_true", default=False, help="Run regime subset stress test after the main run")
 
     args = parser.parse_args()
 
@@ -113,6 +115,45 @@ def main():
         print(f"Max DD:        {p['max_drawdown']:>10}")
         print("-" * 40)
         print(f"Output saved to: {args.output}")
+        if args.regime_stress:
+            packs = [runner.load_pack(p) for p in args.pack]
+            bars = []
+            outcomes = []
+            regimes = []
+            snapshots = []
+            from src.core.outcome_engine import BarData
+            for pack in packs:
+                for b in pack.get("bars", []):
+                    bar = BarData(
+                        timestamp_ms=b["timestamp_ms"],
+                        open=b["open"],
+                        high=b["high"],
+                        low=b["low"],
+                        close=b["close"],
+                        volume=b.get("volume", 0),
+                    )
+                    if "symbol" in b:
+                        object.__setattr__(bar, "symbol", b["symbol"])
+                    bars.append(bar)
+                outcomes.extend(pack.get("outcomes", []))
+                regimes.extend(pack.get("regimes", []))
+                snapshots.extend(pack.get("snapshots", []))
+
+            stress = run_regime_subset_stress(
+                bars=bars,
+                outcomes=outcomes,
+                regimes=regimes,
+                snapshots=snapshots,
+                strategy_class=strat_cls,
+                strategy_params=params,
+                starting_cash=args.cash,
+            )
+            stress_path = Path(args.output) / f"{result.strategy_id}_regime_stress.json"
+            stress_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(stress_path, "w") as f:
+                json.dump(stress, f, indent=2)
+            print(f"Regime stress saved to: {stress_path}")
+            print(f"Regime stress score (fraction profitable): {stress['stress_score']}")
 
 if __name__ == "__main__":
     main()
