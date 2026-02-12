@@ -372,12 +372,12 @@ async def run_e2e(
 
     # Write summary.json
     summary_json_path = output_root / "summary.json"
-    with open(summary_json_path, "w") as f:
+    with open(summary_json_path, "w", encoding="utf-8") as f:
         json.dump(results, f, indent=2, default=str)
 
     # Write summary.md
     summary_md_path = output_root / "summary.md"
-    with open(summary_md_path, "w") as f:
+    with open(summary_md_path, "w", encoding="utf-8") as f:
         f.write(f"# Argus E2E Verification — {today.isoformat()}\n\n")
         f.write(f"**Symbol:** {symbol}  \n")
         f.write(f"**Date range:** {start_date} → {end_date}  \n")
