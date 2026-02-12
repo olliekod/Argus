@@ -2848,9 +2848,11 @@ class ArgusOrchestrator:
         if self.telegram:
             await self.telegram.stop_polling()
 
-        # Cancel all tasks
+        # Cancel all tasks and await their completion
         for task in self._tasks:
             task.cancel()
+        if self._tasks:
+            await asyncio.gather(*self._tasks, return_exceptions=True)
 
         # Stop Polymarket clients
         if self.polymarket_gamma:

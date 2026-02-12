@@ -566,7 +566,14 @@ class ReplayHarness:
         4. Market data snapshots are only visible when
            ``sim_time >= snapshot.recv_ts_ms`` (data availability barrier).
         5. Strategy only sees data it could have observed at that point.
+
+        The execution model's ledger is reset at the start of every run()
+        so that consecutive replay calls produce independent results and
+        ledger state does not leak between runs.
         """
+        # Reset execution model ledger so consecutive runs are independent
+        self._exec.reset()
+
         bar_duration_ms = self._cfg.bar_duration_seconds * 1000
         visible_outcomes: Dict[int, OutcomeResult] = {}
         visible_snapshots: List[MarketDataSnapshot] = []

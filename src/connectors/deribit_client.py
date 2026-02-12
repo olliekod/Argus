@@ -74,15 +74,17 @@ class DeribitClient:
     
     async def _request(self, method: str, params: Dict = None) -> Dict:
         """Make a public API request."""
-        # Simple rate limiting
+        # Simple rate limiting: 20 requests per 60-second window.
+        # Uses total_seconds() (not .seconds) to correctly handle intervals > 60s.
         now = datetime.now(timezone.utc)
-        if (now - self._last_reset).seconds >= 60:
+        elapsed = (now - self._last_reset).total_seconds()
+        if elapsed >= 60:
             self._request_count = 0
             self._last_reset = now
-        
+
         if self._request_count >= self._rate_limit:
-            wait_time = 60 - (now - self._last_reset).seconds
-            logger.warning(f"Rate limit reached, waiting {wait_time}s")
+            wait_time = max(0, 60 - (now - self._last_reset).total_seconds())
+            logger.warning(f"Rate limit reached, waiting {wait_time:.0f}s")
             await asyncio.sleep(wait_time)
             self._request_count = 0
             self._last_reset = datetime.now(timezone.utc)

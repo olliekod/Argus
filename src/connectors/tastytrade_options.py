@@ -119,11 +119,18 @@ class TastytradeOptionsConnector:
 
     PROVIDER = "tastytrade"
 
+    # Cooldown after login failure to avoid spamming the API
+    _LOGIN_COOLDOWN_MS = 300_000  # 5 minutes
+
     def __init__(self, config: TastytradeOptionsConfig) -> None:
         self._config = config
         self._client: Optional[TastytradeRestClient] = None
         self._sequence_id = 0
         self._authenticated = False
+
+        # Login failure tracking — prevents login spam on repeated poll cycles
+        self._last_login_failure_ms: int = 0
+        self._login_failure_reason: str = ""
 
         # Health metrics
         self._request_count = 0
@@ -137,9 +144,24 @@ class TastytradeOptionsConnector:
         return self._sequence_id
 
     def _ensure_client(self) -> TastytradeRestClient:
-        """Create and authenticate client if needed."""
+        """Create and authenticate client if needed.
+
+        Respects a cooldown period after login failures to avoid spamming
+        the Tastytrade API with repeated auth attempts every poll cycle.
+        """
         if self._client is not None and self._authenticated:
             return self._client
+
+        # Enforce cooldown after login failure
+        now = _now_ms()
+        if self._last_login_failure_ms > 0:
+            elapsed = now - self._last_login_failure_ms
+            if elapsed < self._LOGIN_COOLDOWN_MS:
+                remaining_s = (self._LOGIN_COOLDOWN_MS - elapsed) / 1000
+                raise TastytradeError(
+                    f"Login cooldown active ({remaining_s:.0f}s remaining). "
+                    f"Last failure: {self._login_failure_reason}"
+                )
 
         retry = RetryConfig(
             max_attempts=self._config.max_attempts,
@@ -156,11 +178,25 @@ class TastytradeOptionsConnector:
         try:
             self._client.login()
             self._authenticated = True
+            self._last_login_failure_ms = 0
+            self._login_failure_reason = ""
             logger.info("Tastytrade options connector authenticated (env=%s)", self._config.environment)
         except TastytradeError as exc:
             self._error_count += 1
-            logger.error("Tastytrade login failed: %s", exc)
             self._authenticated = False
+            self._last_login_failure_ms = _now_ms()
+            self._login_failure_reason = str(exc)
+            # Distinguish credential errors from transient failures
+            exc_str = str(exc)
+            if "missing_request_token" in exc_str or "HTTP 400" in exc_str or "HTTP 401" in exc_str:
+                logger.error(
+                    "Tastytrade login failed (credentials/auth issue, cooldown %ds): %s. "
+                    "Check secrets.yaml tastytrade credentials or run OAuth2 bootstrap.",
+                    self._LOGIN_COOLDOWN_MS // 1000, exc,
+                )
+            else:
+                logger.error("Tastytrade login failed (transient, cooldown %ds): %s",
+                             self._LOGIN_COOLDOWN_MS // 1000, exc)
             raise
 
         return self._client

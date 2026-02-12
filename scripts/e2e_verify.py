@@ -112,10 +112,13 @@ async def check_options_snapshots(
 
     Reports:
     - snapshot_count: total snapshots from primary provider
-    - atm_iv_present: count with non-null atm_iv (provider or enriched)
-    - atm_iv_pct: percentage with atm_iv
-    - iv_derivable: count where IV could be derived from quotes
-    - iv_ready_pct: percentage where IV is available (atm_iv OR derivable)
+    - atm_iv_present: count with non-null atm_iv (provider-supplied)
+    - atm_iv_pct: percentage with provider atm_iv
+    - iv_derivable: count where IV could be derived from greeks cache enrichment
+    - iv_derivable_pct: percentage with derived atm_iv
+    - iv_ready_count: total with either provider or derived IV
+    - iv_ready_pct: percentage IV-ready overall
+    - recv_ts_gated: count with valid recv_ts_ms
     """
     raw = await db.get_option_chain_snapshots(
         symbol=symbol,
@@ -124,6 +127,7 @@ async def check_options_snapshots(
     )
     primary = [r for r in raw if r.get("provider") == policy.options_snapshot_provider]
     iv_present = sum(1 for r in primary if r.get("atm_iv") is not None)
+    recv_ts_gated = sum(1 for r in primary if r.get("recv_ts_ms") is not None and r.get("recv_ts_ms", 0) > 0)
 
     # Check how many snapshots have derivable IV from quotes_json
     iv_derivable = 0
@@ -141,6 +145,7 @@ async def check_options_snapshots(
 
     iv_ready = iv_present + iv_derivable
     pct = (iv_present / len(primary) * 100) if primary else 0.0
+    iv_derivable_pct = (iv_derivable / len(primary) * 100) if primary else 0.0
     iv_ready_pct = (iv_ready / len(primary) * 100) if primary else 0.0
     return {
         "provider": policy.options_snapshot_provider,
@@ -149,7 +154,10 @@ async def check_options_snapshots(
         "atm_iv_present": iv_present,
         "atm_iv_pct": round(pct, 1),
         "iv_derivable": iv_derivable,
+        "iv_derivable_pct": round(iv_derivable_pct, 1),
+        "iv_ready_count": iv_ready,
         "iv_ready_pct": round(iv_ready_pct, 1),
+        "recv_ts_gated": recv_ts_gated,
         "pass": len(primary) > 0,
     }
 
@@ -214,6 +222,46 @@ async def build_smoke_pack(
 # Step 5 — Smoke Experiment
 # ═══════════════════════════════════════════════════════════════════════════
 
+def diagnose_zero_trades(pack_path: str) -> List[str]:
+    """Diagnose why a smoke experiment produced zero trades.
+
+    Returns a list of human-readable reason strings.
+    """
+    reasons: List[str] = []
+    try:
+        with open(pack_path, "r", encoding="utf-8") as f:
+            pack = json.load(f)
+    except Exception:
+        reasons.append("could not load replay pack JSON")
+        return reasons
+
+    bars = pack.get("bars", [])
+    snapshots = pack.get("snapshots", [])
+    meta = pack.get("metadata", {})
+
+    if not bars:
+        reasons.append("no bars in replay pack")
+    if not snapshots:
+        reasons.append("no snapshots in range")
+    else:
+        # Check recv_ts_ms gating
+        gated = sum(1 for s in snapshots if s.get("recv_ts_ms") and s["recv_ts_ms"] > 0)
+        if gated == 0:
+            reasons.append("snapshots gated by recv_ts_ms (all have recv_ts_ms=0 or missing)")
+        # Check atm_iv availability
+        with_iv = sum(1 for s in snapshots if s.get("atm_iv") is not None and s["atm_iv"] > 0)
+        if with_iv == 0:
+            reasons.append("no atm_iv and no quotes to derive IV from")
+        # Check for stale greeks
+        if with_iv == 0 and gated > 0:
+            reasons.append("stale greeks (snapshots present but no IV)")
+
+    if not reasons:
+        reasons.append("unknown (bars and snapshots present with IV)")
+
+    return reasons
+
+
 def run_smoke_experiment(
     pack_path: str,
     output_dir: str,
@@ -236,11 +284,17 @@ def run_smoke_experiment(
     portfolio = summary.get("portfolio_summary", summary)
     trades = portfolio.get("total_trades", 0)
 
+    # If zero trades, diagnose why
+    zero_trade_reasons: List[str] = []
+    if trades == 0:
+        zero_trade_reasons = diagnose_zero_trades(pack_path)
+
     return {
         "strategy": "VRPCreditSpreadStrategy",
         "trades": trades,
         "pnl": portfolio.get("total_realized_pnl", 0),
         "bars_replayed": summary.get("bars_replayed", result.bars_replayed),
+        "zero_trade_reasons": zero_trade_reasons,
         "pass": True,  # smoke test passes if it runs without error
     }
 
@@ -368,7 +422,10 @@ async def run_e2e(
         try:
             exp_result = run_smoke_experiment(pack_path, experiment_dir)
             results["steps"]["smoke_experiment"] = exp_result
-            print(f"  Trades: {exp_result['trades']}, PnL: {exp_result['pnl']}, Bars: {exp_result['bars_replayed']} — {'PASS' if exp_result['pass'] else 'FAIL'}")
+            status_str = 'PASS' if exp_result['pass'] else 'FAIL'
+            print(f"  Trades: {exp_result['trades']}, PnL: {exp_result['pnl']}, Bars: {exp_result['bars_replayed']} -- {status_str}")
+            if exp_result.get("zero_trade_reasons"):
+                print(f"  Zero-trade reasons: {', '.join(exp_result['zero_trade_reasons'])}")
         except Exception as exc:
             results["steps"]["smoke_experiment"] = {"error": str(exc), "pass": False}
             print(f"  Experiment FAILED: {exc}")
@@ -407,7 +464,7 @@ async def run_e2e(
     with open(summary_md_path, "w", encoding="utf-8") as f:
         f.write(f"# Argus E2E Verification — {today.isoformat()}\n\n")
         f.write(f"**Symbol:** {symbol}  \n")
-        f.write(f"**Date range:** {start_date} → {end_date}  \n")
+        f.write(f"**Date range:** {start_date} -> {end_date}  \n")
         f.write(f"**Result:** {passed}/{total} steps passed  \n\n")
         f.write("## Policy\n\n")
         f.write(f"- bars_primary: `{policy.bars_primary}`\n")
@@ -420,6 +477,27 @@ async def run_e2e(
             status = "PASS" if info.get("pass") else ("SKIP" if info.get("skipped") else "FAIL")
             f.write(f"| {step} | {status} |\n")
         f.write("\n")
+
+        # IV readiness detail (if options_snapshots step ran)
+        snap_info = all_steps.get("options_snapshots", {})
+        if snap_info.get("snapshot_count", 0) > 0:
+            f.write("## IV Readiness\n\n")
+            f.write(f"- Provider atm_iv: {snap_info.get('atm_iv_present', 0)}/{snap_info['snapshot_count']}"
+                    f" ({snap_info.get('atm_iv_pct', 0)}%)\n")
+            f.write(f"- Derived atm_iv (greeks cache): {snap_info.get('iv_derivable', 0)}/{snap_info['snapshot_count']}"
+                    f" ({snap_info.get('iv_derivable_pct', 0)}%)\n")
+            f.write(f"- IV-ready overall: {snap_info.get('iv_ready_count', 0)}/{snap_info['snapshot_count']}"
+                    f" ({snap_info.get('iv_ready_pct', 0)}%)\n")
+            f.write(f"- recv_ts_ms gated: {snap_info.get('recv_ts_gated', 0)}/{snap_info['snapshot_count']}\n")
+            f.write("\n")
+
+        # Zero-trade diagnostics
+        smoke_info = all_steps.get("smoke_experiment", {})
+        if smoke_info.get("zero_trade_reasons"):
+            f.write("## Zero-Trade Diagnostics\n\n")
+            for reason in smoke_info["zero_trade_reasons"]:
+                f.write(f"- {reason}\n")
+            f.write("\n")
 
     print("\n" + "=" * 60)
     print(f"E2E Verification: {passed}/{total} steps passed")
