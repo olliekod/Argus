@@ -53,7 +53,7 @@ class TestDataSourcePolicyDefaults:
 
     def test_default_options_snapshots_secondary(self):
         policy = DataSourcePolicy()
-        assert policy.options_snapshots_secondary == ["alpaca"]
+        assert policy.options_snapshots_secondary == ["public"]
 
     def test_default_options_stream_primary(self):
         policy = DataSourcePolicy()
@@ -73,7 +73,7 @@ class TestDataSourcePolicyDefaults:
 
     def test_is_secondary_options_provider(self):
         policy = DataSourcePolicy()
-        assert policy.is_secondary_options_provider("alpaca") is True
+        assert policy.is_secondary_options_provider("public") is True
         assert policy.is_secondary_options_provider("tastytrade") is False
 
     def test_snapshot_providers_primary_only(self):
@@ -83,7 +83,7 @@ class TestDataSourcePolicyDefaults:
     def test_snapshot_providers_with_secondary(self):
         policy = DataSourcePolicy()
         providers = policy.snapshot_providers(include_secondary=True)
-        assert providers == ["tastytrade", "alpaca"]
+        assert providers == ["tastytrade", "public"]
 
     def test_policy_is_frozen(self):
         policy = DataSourcePolicy()
@@ -102,7 +102,7 @@ class TestGetDataSourcePolicy:
                 "bars_primary": "alpaca",
                 "outcomes_from": "bars_primary",
                 "options_snapshots_primary": "tastytrade",
-                "options_snapshots_secondary": ["alpaca"],
+                "options_snapshots_secondary": ["public"],
                 "options_stream_primary": "tastytrade_dxlink",
                 "bars_secondary": ["yahoo"],
             }
@@ -133,11 +133,11 @@ class TestGetDataSourcePolicy:
     def test_secondary_as_string_coerced_to_list(self):
         config = {
             "data_sources": {
-                "options_snapshots_secondary": "alpaca",
+                "options_snapshots_secondary": "public",
             }
         }
         policy = get_data_source_policy(config)
-        assert policy.options_snapshots_secondary == ["alpaca"]
+        assert policy.options_snapshots_secondary == ["public"]
 
 
 # ═══════════════════════════════════════════════════════════════════════════

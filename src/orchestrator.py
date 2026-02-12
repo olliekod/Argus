@@ -712,12 +712,14 @@ class ArgusOrchestrator:
             if not public_api_secret or str(public_api_secret).startswith('PASTE_'):
                 raise ValueError("public_options.enabled=true requires secrets.public.api_secret")
 
-            if not self.alpaca_options:
+            structure_connector = self.alpaca_options or self.tastytrade_options
+            if structure_connector is None:
                 self.logger.warning(
-                    "Public options enabled but Alpaca options structure connector is unavailable; "
-                    "set exchanges.alpaca.options.enabled=true"
+                    "Public options enabled but no structure connector is available; "
+                    "enable exchanges.alpaca.options or tastytrade.snapshot_sampling"
                 )
             else:
+                structure_provider = 'alpaca' if self.alpaca_options else 'tastytrade'
                 self._public_options_symbols = public_opts_cfg.get('symbols', _DEFAULT_OPTIONS_SYMBOLS)
                 self._public_options_poll_interval = int(public_opts_cfg.get('poll_interval_seconds', 60))
                 self._public_options_min_dte = int(public_opts_cfg.get('min_dte', 7))
@@ -729,11 +731,12 @@ class ArgusOrchestrator:
                         account_id=public_account_id,
                         base_url=public_cfg.get('base_url', 'https://api.public.com'),
                         timeout_seconds=float(public_cfg.get('timeout_seconds', 20.0)),
+                        rate_limit_rps=int(public_cfg.get('rate_limit_rps', 10)),
                     )
                 )
                 self.public_options = PublicOptionsConnector(
                     client=public_client,
-                    structure_connector=self.alpaca_options,
+                    structure_connector=structure_connector,
                     config=PublicOptionsConfig(
                         symbols=self._public_options_symbols,
                         poll_interval_seconds=self._public_options_poll_interval,
@@ -742,11 +745,12 @@ class ArgusOrchestrator:
                     ),
                 )
                 self.logger.info(
-                    "Public options snapshot connector configured for %s (poll=%ds, DTE=%d-%d)",
+                    "Public options snapshot connector configured for %s (poll=%ds, DTE=%d-%d, structure=%s)",
                     self._public_options_symbols,
                     self._public_options_poll_interval,
                     self._public_options_min_dte,
                     self._public_options_max_dte,
+                    structure_provider,
                 )
         else:
             self.logger.info("Public options snapshots disabled (set public_options.enabled=true)")

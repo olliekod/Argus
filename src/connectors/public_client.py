@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import logging
+import asyncio
 import time
+from collections import deque
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -29,6 +31,7 @@ class PublicAPIConfig:
     account_id: str = ""
     base_url: str = "https://api.public.com"
     timeout_seconds: float = 20.0
+    rate_limit_rps: int = 10
 
 
 class PublicAPIClient:
@@ -42,6 +45,24 @@ class PublicAPIClient:
         self._config = config
         self._session: Optional[aiohttp.ClientSession] = None
         self._resolved_account_id: str = config.account_id or ""
+        self._rate_limit_lock = asyncio.Lock()
+        self._request_timestamps: deque[float] = deque()
+
+    async def _acquire_rate_limit(self) -> None:
+        """Enforce Public REST request budget (default: 10 req/s)."""
+        rate_limit = max(int(self._config.rate_limit_rps or 10), 1)
+        async with self._rate_limit_lock:
+            while True:
+                now = time.monotonic()
+                while self._request_timestamps and (now - self._request_timestamps[0]) >= 1.0:
+                    self._request_timestamps.popleft()
+
+                if len(self._request_timestamps) < rate_limit:
+                    self._request_timestamps.append(now)
+                    return
+
+                wait_seconds = max(0.0, 1.0 - (now - self._request_timestamps[0]))
+                await asyncio.sleep(wait_seconds)
 
     async def _get_session(self) -> aiohttp.ClientSession:
         if aiohttp is None:
@@ -58,6 +79,7 @@ class PublicAPIClient:
     async def _request(self, method: str, path: str, *, params: Optional[Dict[str, Any]] = None, retry_401: bool = True) -> Dict[str, Any]:
         session = await self._get_session()
         url = f"{self._config.base_url.rstrip('/')}{path}"
+        await self._acquire_rate_limit()
         async with session.request(method, url, params=params) as resp:
             if resp.status == 401 and retry_401:
                 logger.warning("Public API 401 for %s; retrying once", path)
@@ -92,6 +114,8 @@ class PublicAPIClient:
             raise PublicAPIError(f"Public greeks limit exceeded: {len(osi_symbols)} > {self.MAX_GREEKS_SYMBOLS}")
         if not osi_symbols:
             return []
+        # NOTE: If Public responds with 400/422, verify whether osiSymbols should be
+        # encoded as repeated keys (?osiSymbols=A&osiSymbols=B) or comma-separated.
         account_id = await self.get_account_id()
         payload = await self._request(
             "GET",

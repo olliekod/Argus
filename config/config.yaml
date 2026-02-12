@@ -39,9 +39,9 @@ logging:
 #                        Provider: tastytrade_dxlink.
 #
 # SECONDARY SOURCES (redundancy / sanity-check only)
-#   options_snapshots_secondary — structural coverage cross-check.
-#                        Provider: alpaca.  DO NOT depend on IV/greeks
-#                        from Alpaca; they are absent or unreliable.
+#   options_snapshots_secondary — secondary options provider for
+#                        validation and fallback (the non-primary
+#                        provider: tastytrade or public).
 #   bars_secondary      — optional backfill / cross-validation.
 #                        Provider: yahoo.
 #
@@ -49,7 +49,7 @@ data_sources:
   bars_primary: "alpaca"
   outcomes_from: "bars_primary"            # always derived from bars_primary
   options_snapshots_primary: "tastytrade"  # authoritative IV / surface source
-  options_snapshots_secondary: "alpaca"                             # structural cross-check only; no IV/greeks
+  options_snapshots_secondary: "public"                             # secondary options provider for validation/fallback
   options_stream_primary: "tastytrade_dxlink"
   bars_secondary: "yahoo"                              # optional sanity / backfill
 
@@ -121,6 +121,7 @@ exchanges:
 tastytrade:
   environment: "live"   # live | sandbox
   timeout_seconds: 20
+  rate_limit_rps: 10
   # IV/Greeks and options streaming: IBIT + liquid ETF universe (BITO dropped)
   underlyings: ["IBIT", "DIA", "GLD", "IWM", "QQQ", "SMH", "SPY", "TLT", "XLE", "XLF", "XLK"]
   snapshot_sampling:
@@ -138,11 +139,12 @@ tastytrade:
 public:
   base_url: "https://api.public.com"
   timeout_seconds: 20
+  rate_limit_rps: 10
   account_id: ""   # optional; if empty, connector tries /userapigateway/accounts
 
 public_options:
   enabled: false
-  # Underlyings for options chain snapshot polling (Public greeks + Alpaca structure).
+  # Underlyings for options chain snapshot polling (Public greeks + structure source).
   symbols: ["IBIT", "DIA", "GLD", "IWM", "QQQ", "SMH", "SPY", "TLT", "XLE", "XLF", "XLK"]
   poll_interval_seconds: 60
   min_dte: 7

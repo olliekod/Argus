@@ -33,7 +33,7 @@ logger = logging.getLogger("argus.data_sources")
 _DEFAULT_BARS_PRIMARY = "alpaca"
 _DEFAULT_OUTCOMES_FROM = "bars_primary"
 _DEFAULT_OPTIONS_SNAPSHOTS_PRIMARY = "tastytrade"
-_DEFAULT_OPTIONS_SNAPSHOTS_SECONDARY: List[str] = ["alpaca"]
+_DEFAULT_OPTIONS_SNAPSHOTS_SECONDARY: List[str] = ["public"]
 _DEFAULT_OPTIONS_STREAM_PRIMARY = "tastytrade_dxlink"
 _DEFAULT_BARS_SECONDARY: List[str] = ["yahoo"]
 
