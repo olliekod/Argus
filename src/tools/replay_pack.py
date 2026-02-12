@@ -10,6 +10,11 @@ Supports:
 - Single-symbol mode: ``--symbol SPY``
 - Universe mode: ``--universe`` (loads all liquid ETF symbols)
 
+Provider defaults are read from the ``data_sources`` policy in
+``config/config.yaml``.  No ``--provider`` flag is required for
+normal usage.  Advanced overrides (``--bars-provider``,
+``--options-snapshot-provider``) are available but rarely needed.
+
 Option chain snapshots are included when available.  Symbols without
 options data simply produce packs with an empty ``snapshots`` list.
 """
@@ -23,6 +28,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from src.core.database import Database
+from src.core.data_sources import get_data_source_policy, DataSourcePolicy
 from src.core.liquid_etf_universe import get_liquid_etf_universe
 
 
@@ -209,20 +215,51 @@ async def _fetch_snapshots(
     return snapshots
 
 
+async def _fetch_snapshots_multi(
+    db: Database,
+    symbol: str,
+    start_ms: int,
+    end_ms: int,
+    providers: List[str],
+) -> List[Dict[str, Any]]:
+    """Fetch snapshots for multiple providers and merge chronologically."""
+    all_snaps: List[Dict[str, Any]] = []
+    for prov in providers:
+        snaps = await _fetch_snapshots(db, symbol, start_ms, end_ms, provider_filter=prov)
+        all_snaps.extend(snaps)
+    all_snaps.sort(key=lambda s: s["recv_ts_ms"])
+    return all_snaps
+
+
 async def create_replay_pack(
     symbol: str,
     start_date: str,  # YYYY-MM-DD
     end_date: str,    # YYYY-MM-DD
     output_path: str,
-    provider: str = "tastytrade",
+    provider: Optional[str] = None,
     bar_duration: int = 60,
     db_path: str = "data/argus.db",
     snapshot_provider: Optional[str] = None,
+    include_secondary_options: bool = False,
+    policy: Optional[DataSourcePolicy] = None,
 ) -> Dict[str, Any]:
     """Create a replay pack for a single symbol.
 
+    Provider defaults come from the data-source policy unless
+    explicitly overridden via *provider* or *snapshot_provider*.
+
     Returns the pack dict (also written to *output_path*).
     """
+    if policy is None:
+        policy = get_data_source_policy()
+
+    # Resolve effective providers from policy + overrides
+    bars_provider = provider if provider is not None else policy.bars_provider
+    effective_snapshot_provider = (
+        snapshot_provider if snapshot_provider is not None
+        else policy.options_snapshot_provider
+    )
+
     db = Database(db_path)
     await db.connect()
 
@@ -233,11 +270,11 @@ async def create_replay_pack(
         start_ms = int(start_dt.timestamp() * 1000)
         end_ms = int(end_dt.timestamp() * 1000) + (24 * 3600 * 1000) - 1
 
-        print(f"Packing data for {symbol} ({provider}) from {start_date} to {end_date}...")
+        print(f"Packing data for {symbol} (bars={bars_provider}, snapshots={effective_snapshot_provider}) from {start_date} to {end_date}...")
 
         # 2. Fetch Bars
         bars_raw = await db.get_bars_for_outcome_computation(
-            source=provider,
+            source=bars_provider,
             symbol=symbol,
             bar_duration=bar_duration,
             start_ms=start_ms,
@@ -245,9 +282,9 @@ async def create_replay_pack(
         )
         print(f"  Fetched {len(bars_raw)} bars.")
 
-        # 3. Fetch Outcomes
+        # 3. Fetch Outcomes (always from bars_primary)
         outcomes = await db.get_bar_outcomes(
-            provider=provider,
+            provider=bars_provider,
             symbol=symbol,
             bar_duration_seconds=bar_duration,
             start_ms=start_ms,
@@ -275,41 +312,34 @@ async def create_replay_pack(
         all_regimes = symbol_regimes + market_regimes
         print(f"  Fetched {len(all_regimes)} regimes ({len(symbol_regimes)} symbol, {len(market_regimes)} market).")
 
-        # 5. Fetch Option Chain Snapshots (all providers by default; use snapshot_provider to filter)
-        snapshots = await _fetch_snapshots(
-            db, symbol, start_ms, end_ms, provider_filter=snapshot_provider
-        )
-        # Cap recv_ts_ms so snapshots are releaseable: last sim_ts_ms in replay is last bar close
-        max_bar_ts_ms = max(
-            (_bar_timestamp_to_ms(b.get("timestamp")) for b in bars_raw),
-            default=0,
-        )
-        max_sim_ms = max_bar_ts_ms + bar_duration * 1000
-        for s in snapshots:
-            if s["recv_ts_ms"] > max_sim_ms:
-                s["recv_ts_ms"] = max_sim_ms
-        n_with_iv = sum(1 for s in snapshots if s.get("atm_iv") is not None and float(s.get("atm_iv") or 0) > 0)
-        print(f"  Fetched {len(snapshots)} option chain snapshots ({n_with_iv} with atm_iv).")
-        if n_with_iv == 0 and snapshots:
-            s0 = snapshots[0]
-            prov = s0.get("provider", "?")
-            try:
-                data = json.loads(s0.get("quotes_json") or "{}")
-                puts = data.get("puts") or []
-                n_with_iv_field = sum(1 for p in puts if isinstance(p, dict) and (float(p.get("iv") or 0) > 0))
-                n_with_mid_last = sum(1 for p in puts if isinstance(p, dict) and (float(p.get("mid") or 0) > 0 or float(p.get("last") or 0) > 0))
-                n_with_bid_ask = sum(1 for p in puts if isinstance(p, dict) and (float(p.get("bid") or 0) > 0 or float(p.get("ask") or 0) > 0))
-                print(f"  Hint (no atm_iv): first snapshot provider={prov!r}, puts: {len(puts)} total, {n_with_iv_field} with iv>0, {n_with_mid_last} with mid/last>0, {n_with_bid_ask} with bid/ask>0.")
-                if n_with_iv_field == 0 and n_with_mid_last == 0 and n_with_bid_ask == 0:
-                    print("  This looks like indicative-only data (no greeks, no quotes). For IV in replay, use option snapshots from a feed that provides greeks (e.g. Tastytrade) or ensure Tastytrade options polling runs so packs include snapshots with atm_iv.")
-            except Exception as e:
-                print(f"  Hint (no atm_iv): could not inspect quotes_json: {e}")
+        # 5. Fetch Option Chain Snapshots
+        if include_secondary_options:
+            snap_providers = policy.snapshot_providers(include_secondary=True)
+            # Override primary if user specified a custom snapshot provider
+            if snapshot_provider is not None:
+                snap_providers = [snapshot_provider] + [
+                    p for p in policy.options_snapshots_secondary
+                    if p != snapshot_provider
+                ]
+            snapshots = await _fetch_snapshots_multi(
+                db, symbol, start_ms, end_ms, snap_providers
+            )
+            print(f"  Fetched {len(snapshots)} option chain snapshots (providers: {snap_providers}).")
+        else:
+            snapshots = await _fetch_snapshots(
+                db, symbol, start_ms, end_ms, provider_filter=effective_snapshot_provider
+            )
+            print(f"  Fetched {len(snapshots)} option chain snapshots (provider: {effective_snapshot_provider}).")
 
         # 6. Build Pack
+        secondary_included = include_secondary_options
         pack: Dict[str, Any] = {
             "metadata": {
                 "symbol": symbol,
-                "provider": provider,
+                "provider": bars_provider,
+                "bars_provider": bars_provider,
+                "options_snapshot_provider": effective_snapshot_provider,
+                "secondary_options_included": secondary_included,
                 "bar_duration": bar_duration,
                 "start_date": start_date,
                 "end_date": end_date,
@@ -344,13 +374,17 @@ async def create_universe_packs(
     start_date: str,
     end_date: str,
     output_dir: str = "data/packs",
-    provider: str = "tastytrade",
+    provider: Optional[str] = None,
     bar_duration: int = 60,
     db_path: str = "data/argus.db",
     symbols: Optional[List[str]] = None,
     snapshot_provider: Optional[str] = None,
+    include_secondary_options: bool = False,
+    policy: Optional[DataSourcePolicy] = None,
 ) -> List[str]:
     """Create replay packs for every symbol in the liquid ETF universe.
+
+    Provider defaults come from the data-source policy.
 
     Returns a list of output file paths that were written.
     """
@@ -372,6 +406,8 @@ async def create_universe_packs(
                 bar_duration=bar_duration,
                 db_path=db_path,
                 snapshot_provider=snapshot_provider,
+                include_secondary_options=include_secondary_options,
+                policy=policy,
             )
             written.append(out_path)
         except Exception as exc:
@@ -387,7 +423,8 @@ async def create_universe_packs(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Create Replay Pack(s) from the Argus database.",
+        description="Create Replay Pack(s) from the Argus database.  "
+                    "Defaults follow the data_sources policy in config/config.yaml.",
     )
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--symbol", help="Single symbol to pack (e.g. SPY)")
@@ -406,11 +443,33 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Output path (single-symbol mode) or directory (universe mode). "
              "Defaults to data/packs/",
     )
-    parser.add_argument("--provider", default="tastytrade", help="Provider for bars/outcomes")
+
+    # ── Provider overrides (advanced) ─────────────────────────────────
+    parser.add_argument(
+        "--provider",
+        default=None,
+        help="(Legacy) Alias for --bars-provider.  Still accepted for backward compatibility.",
+    )
+    parser.add_argument(
+        "--bars-provider",
+        default=None,
+        help="Override bars/outcomes provider (default: data_sources.bars_primary from config).",
+    )
+    parser.add_argument(
+        "--options-snapshot-provider",
+        default=None,
+        help="Override primary options snapshot provider (default: data_sources.options_snapshots_primary from config).",
+    )
     parser.add_argument(
         "--snapshot-provider",
         default=None,
-        help="Restrict option chain snapshots to this provider (e.g. alpaca, tastytrade). Default: include all providers.",
+        help="(Legacy) Alias for --options-snapshot-provider.",
+    )
+    parser.add_argument(
+        "--include-secondary-options",
+        action="store_true",
+        default=False,
+        help="Also include secondary options snapshots (e.g. Alpaca structural cross-check).",
     )
     parser.add_argument("--db", default="data/argus.db", help="Path to argus.db")
     return parser
@@ -420,15 +479,20 @@ def main() -> None:
     parser = _build_parser()
     args = parser.parse_args()
 
+    # Resolve provider overrides: new flags take precedence over legacy
+    bars_prov = args.bars_provider or args.provider  # None = use policy default
+    snap_prov = args.options_snapshot_provider or args.snapshot_provider  # None = use policy default
+
     if args.universe:
         out_dir = args.out or "data/packs"
         asyncio.run(create_universe_packs(
             start_date=args.start,
             end_date=args.end,
             output_dir=out_dir,
-            provider=args.provider,
+            provider=bars_prov,
             db_path=args.db,
-            snapshot_provider=getattr(args, "snapshot_provider", None),
+            snapshot_provider=snap_prov,
+            include_secondary_options=args.include_secondary_options,
         ))
     else:
         default_file = f"data/packs/{args.symbol}_{args.start}_{args.end}.json"
@@ -446,9 +510,10 @@ def main() -> None:
             start_date=args.start,
             end_date=args.end,
             output_path=out_path,
-            provider=args.provider,
+            provider=bars_prov,
             db_path=args.db,
-            snapshot_provider=getattr(args, "snapshot_provider", None),
+            snapshot_provider=snap_prov,
+            include_secondary_options=args.include_secondary_options,
         ))
 
 
