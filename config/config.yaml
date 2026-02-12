@@ -131,6 +131,23 @@ tastytrade:
     backoff_seconds: 1.0
     backoff_multiplier: 2.0
 
+
+# -----------------------------------------------------------------------------
+# Public.com Options Greeks (REST snapshots)
+# -----------------------------------------------------------------------------
+public:
+  base_url: "https://api.public.com"
+  timeout_seconds: 20
+  account_id: ""   # optional; if empty, connector tries /userapigateway/accounts
+
+public_options:
+  enabled: false
+  # Underlyings for options chain snapshot polling (Public greeks + Alpaca structure).
+  symbols: ["IBIT", "DIA", "GLD", "IWM", "QQQ", "SMH", "SPY", "TLT", "XLE", "XLF", "XLK"]
+  poll_interval_seconds: 60
+  min_dte: 7
+  max_dte: 21
+
 # -----------------------------------------------------------------------------
 # Alert Configuration
 # -----------------------------------------------------------------------------

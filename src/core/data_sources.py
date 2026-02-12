@@ -37,30 +37,12 @@ _DEFAULT_OPTIONS_SNAPSHOTS_SECONDARY: List[str] = ["alpaca"]
 _DEFAULT_OPTIONS_STREAM_PRIMARY = "tastytrade_dxlink"
 _DEFAULT_BARS_SECONDARY: List[str] = ["yahoo"]
 
+_ALLOWED_OPTIONS_SNAPSHOT_PROVIDERS = {"tastytrade", "alpaca", "public"}
+
 
 @dataclass(frozen=True)
 class DataSourcePolicy:
-    """Immutable snapshot of the Argus data-source policy.
-
-    Attributes
-    ----------
-    bars_primary : str
-        Provider for 1-min OHLCV bars (default ``"alpaca"``).
-    outcomes_from : str
-        How outcomes are derived.  ``"bars_primary"`` means the
-        OutcomeEngine consumes bars from *bars_primary*.
-    options_snapshots_primary : str
-        Authoritative source for option-chain snapshots including
-        IV / surface fields (default ``"tastytrade"``).
-    options_snapshots_secondary : list[str]
-        Secondary snapshot providers for structural cross-checks
-        only.  IV/greeks from these providers are **not** trusted.
-    options_stream_primary : str
-        Real-time option quote + greeks stream (default
-        ``"tastytrade_dxlink"``).
-    bars_secondary : list[str]
-        Optional bar providers for backfill / sanity-checking.
-    """
+    """Immutable snapshot of the Argus data-source policy."""
 
     bars_primary: str = _DEFAULT_BARS_PRIMARY
     outcomes_from: str = _DEFAULT_OUTCOMES_FROM
@@ -73,34 +55,18 @@ class DataSourcePolicy:
         default_factory=lambda: list(_DEFAULT_BARS_SECONDARY)
     )
 
-    # ── Derived helpers ───────────────────────────────────────────────
-
     @property
     def bars_provider(self) -> str:
-        """Resolve the effective bars provider.
-
-        ``outcomes_from`` is always ``"bars_primary"`` so we just
-        return *bars_primary* for both bars and outcomes.
-        """
         return self.bars_primary
 
     @property
     def options_snapshot_provider(self) -> str:
-        """Alias for the primary options snapshot provider."""
         return self.options_snapshots_primary
 
     def is_secondary_options_provider(self, provider: str) -> bool:
-        """Return True if *provider* is a secondary options source."""
         return provider in self.options_snapshots_secondary
 
     def snapshot_providers(self, include_secondary: bool = False) -> List[str]:
-        """Return list of snapshot providers to include.
-
-        Parameters
-        ----------
-        include_secondary : bool
-            If True, append secondary providers after the primary.
-        """
         providers = [self.options_snapshots_primary]
         if include_secondary:
             providers.extend(self.options_snapshots_secondary)
@@ -108,7 +74,6 @@ class DataSourcePolicy:
 
 
 def _parse_list(value: Any) -> List[str]:
-    """Coerce a YAML value to a list of strings."""
     if value is None:
         return []
     if isinstance(value, str):
@@ -118,23 +83,8 @@ def _parse_list(value: Any) -> List[str]:
     return [str(value)]
 
 
-def get_data_source_policy(
-    config: Optional[Dict[str, Any]] = None,
-) -> DataSourcePolicy:
-    """Load the data-source policy from config.
-
-    Parameters
-    ----------
-    config : dict, optional
-        Pre-loaded config dict (top-level keys like ``data_sources``,
-        ``system``, etc.).  If *None* the function calls
-        ``load_config()`` to read ``config/config.yaml``.
-
-    Returns
-    -------
-    DataSourcePolicy
-        Frozen dataclass with all provider selections.
-    """
+def get_data_source_policy(config: Optional[Dict[str, Any]] = None) -> DataSourcePolicy:
+    """Load the data-source policy from config."""
     if config is None:
         try:
             config = load_config()
@@ -149,7 +99,7 @@ def get_data_source_policy(
         logger.info("No data_sources section in config; using defaults")
         return DataSourcePolicy()
 
-    return DataSourcePolicy(
+    policy = DataSourcePolicy(
         bars_primary=ds.get("bars_primary", _DEFAULT_BARS_PRIMARY),
         outcomes_from=ds.get("outcomes_from", _DEFAULT_OUTCOMES_FROM),
         options_snapshots_primary=ds.get(
@@ -161,7 +111,14 @@ def get_data_source_policy(
         options_stream_primary=ds.get(
             "options_stream_primary", _DEFAULT_OPTIONS_STREAM_PRIMARY
         ),
-        bars_secondary=_parse_list(
-            ds.get("bars_secondary", _DEFAULT_BARS_SECONDARY)
-        ),
+        bars_secondary=_parse_list(ds.get("bars_secondary", _DEFAULT_BARS_SECONDARY)),
     )
+
+    if policy.options_snapshots_primary not in _ALLOWED_OPTIONS_SNAPSHOT_PROVIDERS:
+        logger.warning(
+            "Unknown options_snapshots_primary=%s; expected one of %s",
+            policy.options_snapshots_primary,
+            sorted(_ALLOWED_OPTIONS_SNAPSHOT_PROVIDERS),
+        )
+
+    return policy
