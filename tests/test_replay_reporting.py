@@ -32,7 +32,11 @@ class MockExecutionModel:
             @property
             def rejects_count(self): return 0
         self.ledger = Ledger()
-    
+
+    def reset(self):
+        """Reset ledger — no-op for mock since state is stateless."""
+        pass
+
     def attempt_fill(self, quote, side, quantity, sim_ts_ms, multiplier=100):
         from src.analysis.execution_model import FillResult
         return FillResult(filled=True, fill_price=quote.ask, quantity=quantity, side=side, commission=1.0)
