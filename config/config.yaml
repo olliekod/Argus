@@ -46,14 +46,12 @@ logging:
 #                        Provider: yahoo.
 #
 data_sources:
-  bars_primary: alpaca
-  outcomes_from: bars_primary            # always derived from bars_primary
-  options_snapshots_primary: tastytrade  # authoritative IV / surface source
-  options_snapshots_secondary:
-    - alpaca                             # structural cross-check only; no IV/greeks
-  options_stream_primary: tastytrade_dxlink
-  bars_secondary:
-    - yahoo                              # optional sanity / backfill
+  bars_primary: "alpaca"
+  outcomes_from: "bars_primary"            # always derived from bars_primary
+  options_snapshots_primary: "tastytrade"  # authoritative IV / surface source
+  options_snapshots_secondary: "alpaca"                             # structural cross-check only; no IV/greeks
+  options_stream_primary: "tastytrade_dxlink"
+  bars_secondary: "yahoo"                              # optional sanity / backfill
 
 # -----------------------------------------------------------------------------
 # Assets to Monitor
