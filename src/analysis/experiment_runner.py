@@ -277,7 +277,9 @@ class ExperimentRunner:
         
         unique_dates = sorted(date_groups.keys())
         step_days = step_days or test_days
-        
+        if step_days < 1:
+            step_days = 1  # avoid infinite loop when test_days=0
+
         # 2. Slide window across dates
         current_idx = 0
         while current_idx + train_days + test_days <= len(unique_dates):

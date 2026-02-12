@@ -47,6 +47,7 @@ score = w_return * norm_return
       + w_rej    * reject_penalty          (negative weight)
       + w_rob    * robustness_penalty      (negative weight)
       + w_regime * regime_dep_penalty      (negative weight)
+      + w_rs     * regime_sensitivity      (positive weight; higher = more balanced)
       + w_wf     * walk_forward_penalty    (negative weight)
 ```
 
@@ -60,6 +61,7 @@ score = w_return * norm_return
 | Reject penalty | -0.10 | Lower penalty is better |
 | Robustness penalty | -0.10 | Lower penalty is better |
 | Regime dependency penalty | -0.05 | Lower penalty is better |
+| Regime sensitivity | +0.05 | Higher is better (balanced across regimes) |
 | Walk-forward penalty | -0.05 | Lower penalty is better |
 
 ### Normalization
@@ -117,6 +119,16 @@ Measures sign consistency across walk-forward windows:
 | <= 50% consistency | 0.8 |
 | Between | Linear interpolation |
 
+### Regime Sensitivity (score, not penalty)
+
+Measures PnL-per-bar balance across regime buckets (coefficient of variation of per-regime PnL/bar). **Higher is better** (more stable across regimes):
+
+| Condition | Score |
+|-----------|-------|
+| No regime breakdown | 0.5 (neutral) |
+| Single regime only | 0.0 (fully regime-dependent) |
+| Balanced PnL/bar across regimes | Up to 1.0 |
+
 ## Regime-Conditioned Performance
 
 Each strategy is scored per regime bucket (e.g., `regime:SPY`, `session:RTH`). The output includes:
@@ -165,12 +177,16 @@ The rankings JSON has this structure:
   "generated_at": "2024-01-15T12:00:00+00:00",
   "experiment_count": 10,
   "weights": { ... },
+  "kill_thresholds": { "robustness_penalty": 0.6, "walk_forward_penalty": 0.6, "regime_dependency_penalty": 0.7, "composite_score_min": 0.1 },
   "rankings": [
     {
       "rank": 1,
       "strategy_id": "OVERNIGHT_MOMENTUM_V2",
       "run_id": "abc12345",
       "composite_score": 0.4521,
+      "regime_sensitivity_score": 0.85,
+      "killed": false,
+      "kill_reasons": [],
       "scoring": {
         "composite_score": 0.4521,
         "components": {
@@ -180,6 +196,7 @@ The rankings JSON has this structure:
           "reject_penalty": 0.0,
           "robustness_penalty": 0.1,
           "regime_dependency_penalty": 0.0,
+          "regime_sensitivity": 0.85,
           "walk_forward_penalty": 0.0
         }
       },
@@ -187,9 +204,14 @@ The rankings JSON has this structure:
       "regime_scores": { ... },
       "manifest_ref": { ... }
     }
+  ],
+  "killed": [
+    { "run_id": "...", "reason": "robustness_penalty", "value": 0.8, "threshold": 0.6 }
   ]
 }
 ```
+
+**Kill thresholds (Phase 4C):** Experiments that exceed any penalty threshold or fall below `composite_score_min` are marked `killed: true` and listed in the top-level `killed` array with reason, value, and threshold. Use `--kill-thresholds` (JSON or YAML path) and `--output-killed` to customize and export the killed set.
 
 ## Replay Pack Integration
 

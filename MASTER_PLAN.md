@@ -6,7 +6,17 @@ This document is the **single source of truth** for Argus: vision, current state
 
 ## 1. Vision and Alpha
 
-**Alpha** is the GPU engine: Heston-model Monte Carlo Probability of Profit (PoP) and IV surface anomaly detection. These are sophisticated, proprietary outputs that are safer to sell than raw price feeds. The long-term pipeline:
+**Alpha** is the GPU engine: Heston-model Monte Carlo Probability of Profit (PoP) and IV surface anomaly detection. These are sophisticated, proprietary outputs that are safer to sell than raw price feeds.
+
+**Terminology (for implementers):** In this document, **“Monte Carlo”** and **“MC”** appear in two distinct contexts. Do not conflate them:
+- **GPU / Heston Monte Carlo** (Vision, §1): Options pricing and PoP — `gpu_engine.monte_carlo_pop_heston()`, etc. Used for alpha product (IV surface, probability of profit). Not used for strategy selection or robustness.
+- **MC / bootstrap in research (Phase 4C, §8):** Robustness and kill logic only. **Not** option pricing, not Heston, not random market simulation. It **is** Monte Carlo over **realized trades or PnL paths** from replay:
+  - **Monte Carlo (MC):** Take the historical trade list or PnL path from a replay run; generate many alternative paths by **resampling or reordering** those trades. From the distribution of paths, compute max drawdown distribution, ruin probability, worst-case paths, stability of returns. **Goal:** Kill strategies whose success depends on lucky sequencing.
+  - **Bootstrap (preferred for trading):** Same idea but **block sampling** (e.g. stationary bootstrap of trade sequences), not iid resampling. Preserves volatility clusters, regime runs, and crash sequences for more realistic stress. Implement in `experiment_runner` / `regime_stress` / `strategy_evaluator` path.
+  - **Regime-stress** (complement): Run replay per regime bucket; kill if strategy collapses in too many buckets. See §8.2b.
+  - **Use:** (A) Kill fragile strategies (e.g. survives only 20% of MC paths → kill). (B) Estimate true risk: drawdown distribution, tail risk, ruin probability, realistic Sharpe range. (C) Detect parameter fragility. **Survival rule:** A strategy survives only if MC median is good, worst 5–10% paths are acceptable, and there is no ruin risk; otherwise kill.
+
+The long-term pipeline:
 
 ```mermaid
 flowchart LR
@@ -68,15 +78,15 @@ flowchart LR
 | **3B** | Options pipeline | Done | Options ingestion, chain normalization, spread generation, liquidity filtering, deterministic persistence, tape capture, replay validation. |
 | **4A** | Outcome engine | Done | Forward returns, run-up, drawdown, multi-horizon outcomes, outcome DB storage, deterministic backfills. |
 | **4B** | Backtesting engine | Done | Replay harness, position simulator, entry/exit modeling, transaction costs, slippage (conservative execution model). |
-| **4C** | Parameter search & optimization / | **In progress** | Parameter sweeps, Monte Carlo runs, GPU simulations; **regime sensitivity scoring**, **parameter stability auto-kill**, **MC/bootstrap stress over regimes**. |
-| **5** | Portfolio risk engine | Future | Position sizing, exposure limits, drawdown controls, correlation awareness, strategy budgets. |
-| **6** | Execution engine | Future | Broker integration, order routing, fill simulation, paper then live trading. |
+| **4C** | Parameter search & robustness lab | **In progress** | Parameter sweeps; **regime sensitivity scoring**; **parameter stability auto-kill**; **MC/bootstrap on realized trades** (replay → trade list → resample/reorder paths → distribution of outcomes → kill if median bad, worst 5–10% paths unacceptable, or ruin risk; block bootstrap preferred; see §1). Plus regime-subset stress replays. Optional: Deflated Sharpe, slippage sensitivity sweeps. |
+| **5** | Portfolio risk engine | Future | Position sizing (fractional Kelly with caps; see §9.3), exposure limits, **per-play cap (e.g. ≤7% of equity)**, drawdown controls, correlation awareness, strategy budgets. Black–Scholes (or existing Greeks): delta/vega for exposure and implementation shortfall, not a separate phase. |
+| **6** | Execution engine | Future | Broker integration, order routing, fill simulation, paper then live trading. TCA ledger (decision price, arrival, NBBO, executed, spread paid). |
 | **7** | Strategy expansion | Future | Put spread selling, volatility plays, panic snapback, FVG, session momentum, crypto–ETF relationships, Polymarket. |
-| **8** | Portfolio intelligence | Future | Strategy aggregation, signal voting, dynamic allocation, regime-based capital shifts. |
+| **8** | Portfolio intelligence | Future | Strategy aggregation, signal voting, dynamic allocation, regime-based capital shifts. **StrategyLeague** (tournament allocator): eligibility gate, smoothed weight updates, degradation detector, kill/quarantine; allocate from health metrics not raw short-run PnL. |
 | **9** | Intelligence API product | Future | Expose bars, regimes, options intelligence, spread candidates, signals for subscription revenue. |
 | **10** | Self-improving system | Future | Automatic idea testing, strategy mutation, performance pruning, adaptive weighting. |
 
-**Current status:** Research engine complete through 4B. Public options/Greeks integration done (second IV source, health script, Tastytrade-as-structure path). **Active focus:** Phase 4C —: regime sensitivity scoring, parameter stability auto-kill, MC/bootstrap stress over regimes.
+**Current status:** Research engine complete through 4B. Public options/Greeks integration done (second IV source, health script, Tastytrade-as-structure path). **Active focus:** Phase 4C — regime sensitivity scoring, parameter stability auto-kill, then **MC/bootstrap on realized trades** (replay → trade list → path distribution → kill unstable) plus regime-stress; not GPU/option-pricing Monte Carlo.
 
 ---
 
@@ -135,6 +145,7 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 - **Replay must be honest.** No mid-price fills, no lookahead bias, no optimistic fills; execution model must be pessimistic.
 - **Determinism.** Same input → same output for all systems (bars, indicators, regimes, signals, outcomes).
 - **Regime detection is critical.** Volatility, liquidity, risk-on/off, trend acceleration must feed strategy gating and risk.
+- **Deploy gates.** No deploy if multiple-testing corrected metrics fail; no deploy if slippage sensitivity shows edge disappears; no deploy if performance is localized to one regime/fold. Strategy versioning: treat strategy changes as new hypotheses.
 
 ---
 
@@ -187,17 +198,20 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 ### 8.2b Kill bad strategies fast (Phase 4C — next)
 
 - **Regime sensitivity scoring** — Score strategy/parameter sets by performance across regimes (e.g. trend vs range, low-vol vs high-vol); flag or down-rank sets that only work in one regime.
-- **Parameter stability auto-kill** — Automatic flagging or removal of parameter sets that are unstable (e.g. small change in params → large change in outcome, or walk-forward failure). Integrate with experiment evaluator.
-- **MC / bootstrap stress over regimes** — Monte Carlo or bootstrap runs that resample or perturb regimes; stress-test strategy robustness across regime mixes and kill sets that collapse under regime shift.
+- **Parameter stability auto-kill** — Automatic flagging or removal of parameter sets that are unstable (e.g. small change in params → large change in outcome, or walk-forward failure). Integrate with experiment evaluator; output explicit `killed` list (run_id + reason).
+- **MC / bootstrap on realized trades (Phase 4C completion):** For each strategy/parameter set: **run replay → get trade list (or PnL path) → run MC/bootstrap on trades.** (1) **Monte Carlo:** Resample or reorder trades to generate many alternative paths; compute distribution of max drawdown, median return, ruin probability, worst 5–10% paths. (2) **Bootstrap (preferred):** Block sampling of trade sequences to preserve regime/vol clustering. **Kill** if: strategy survives only a low fraction of paths (e.g. &lt;20%), worst paths unacceptable, or ruin risk present. Survival rule: MC median good AND worst 5–10% paths acceptable AND no ruin risk. (3) **Regime-stress** (complement): Replay per regime bucket; kill if strategy collapses in &gt;50% of buckets. Implement in experiment_runner / regime_stress / strategy_evaluator path. Not option pricing; MC over **realized outcomes** only.
+- **Selection gate (Phase 4C optional, then mandatory for deploy):** Deflated Sharpe Ratio (DSR) as deploy gate; Reality Check / SPA-style benchmark comparison; PBO-style penalty in ranking. Multiple-testing correction so “best of many” does not pass by chance. Regression test: random strategy family must not frequently pass (e.g. tests/test_false_discovery_rate.py).
+- **Slippage sensitivity (mandatory for deploy):** Every experiment reports performance under cost inflation (baseline, +25%, +50%). Auto-fail if edge disappears at reasonable slippage. Tests: e.g. test_vrp_cost_sensitivity.py, test_iv_time_gating.py.
 
 ### 8.3 Strategic / product TODOs
 
-- **Strategy allocation engine** — Strategy registry, capital competition, budget updates, promotion/demotion; consume strategy forecasts + risk estimates and output orders/target exposures under hard constraints.
-- **Strategy lifecycle & kill engine** — Rolling performance metrics, degradation detection, quarantine, automatic strategy death when edge disappears.
-- **Portfolio risk engine** — Exposure limits, correlation control, risk budgeting, drawdown containment. Required before safe live deployment.
-- **Sizing engine (Phase 1)** — Vol-targeted fractional Kelly with caps: μ from strategy backtest (walk-forward), shrunk by confidence; σ from rolling realized vol; size = c·μ/σ² with caps and portfolio vol target; skip trades where expected edge < costs.
-- **Sizing engine (Phase 2–3)** — Covariance shrinkage and portfolio risk budgeting; then drawdown probability constraints and ES monitoring.
-- **Live vs backtest drift monitor** — Compare live fills vs simulated; detect slippage drift and execution degradation.
+- **Strategy allocation engine (StrategyLeague)** — Strategy registry, capital competition, budget updates, promotion/demotion. **Contract:** eligibility gate (binary pass/fail on data quality, deployability); allocation update with **smoothed weight updates** and anti-churn (no allocation change > X% per rebalance); degradation detector (kill/quarantine on rolling expectancy deterioration, slippage spikes, drawdown regime breach, model drift). Consume strategy forecasts + risk estimates; output target exposures under hard constraints. No strategy gets allocation if it fails data-quality gates in the recent window.
+- **Strategy lifecycle & kill engine** — Rolling performance metrics, degradation detection, quarantine, automatic strategy death when edge disappears. Kill triggers: rolling expectancy beyond confidence bounds, slippage/lag spikes, drawdown regime breach, data distribution shift.
+- **Portfolio risk engine** — Exposure limits, correlation control, risk budgeting, drawdown containment. **Per-play cap:** e.g. ≤7% of equity per play (one position or correlated cluster); portfolio caps for sector/underlying/vega concentration. Required before safe live deployment. Tests: e.g. test_risk_caps.py (allocator clamps when multiple signals try to exceed caps).
+- **Sizing engine (Phase 1)** — Vol-targeted **fractional Kelly** with caps (e.g. quarter-Kelly 0.25·μ/σ² as upper bound; 10–25% Kelly for automated deploy). μ from strategy backtest (walk-forward), shrunk by confidence; σ from rolling realized vol; size = c·μ/σ² with caps and portfolio vol target; skip trades where expected edge < costs. Treat Kelly as upper bound; hard drawdown and max-loss constraints always apply.
+- **Sizing engine (Phase 2–3)** — Covariance shrinkage and portfolio risk budgeting; then drawdown probability constraints and ES monitoring. Two allocators: simple vol-scaling/risk-budget baseline; shrinkage-covariance allocator for multi-strategy. Tests: test_allocator_numerics.py (PSD covariance, weight sum constraints).
+- **Black–Scholes / Greeks usage** — Use for risk (delta/vega, max vega per underlying), IV/VRP inputs (already in use), and implementation shortfall (decision vs execution). Not a separate phase; part of execution and risk caps.
+- **Live vs backtest drift monitor** — Compare live fills vs simulated; detect slippage drift and execution degradation. Alert if realized slippage exceeds backtest assumption by Yσ → quarantine strategy.
 - **Strategy health monitoring** — Rolling performance, degradation alerts, quarantine engine.
 - **Cross-strategy correlation analysis** — Correlation tracking and capital diversification enforcement.
 
@@ -230,9 +244,11 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 
 4. **Phase 4C — (current focus)**  
    - **Regime sensitivity scoring:** Score strategy/parameter sets by performance across regimes; flag sets that only work in one regime.  
-   - **Parameter stability auto-kill:** Auto-flag or kill parameter sets that are unstable (walk-forward failure, high sensitivity to param changes).  
-   - **MC/bootstrap stress over regimes:** Monte Carlo or bootstrap over regime mixes; kill sets that collapse under regime shift.  
+   - **Parameter stability auto-kill:** Auto-flag or kill parameter sets that are unstable (walk-forward failure, high sensitivity to param changes); output explicit `killed` list.  
+   - **Regime-subset stress:** Replay per regime bucket; kill if strategy collapses in too many buckets (done).  
+   - **MC/bootstrap on realized trades (4C completion):** For each strategy/param set: replay → trade list → MC/bootstrap on trades (reorder or block-resample) → distribution of outcomes (median return, 5% worst drawdown, ruin probability) → kill if unstable (e.g. survives only 20% of paths, worst paths bad, ruin risk). Block bootstrap preferred. See §1 terminology.  
    - Optional: BOCPD or similar as regime gate for VRP (Master Plan §5).  
+   - Later in 4C or deploy gate: DSR, Reality Check/SPA-style comparison, slippage sensitivity sweeps (baseline, +25%, +50% costs).  
    - Outcome: Only strategies and parameter sets that survive robust testing get capital later.
 
 5. **Strategy allocation and sizing (Phase 5 prelude)**   
@@ -256,6 +272,20 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 
 Public API is done (second IV source); focus is on killing bad strategies fast so only robust parameter sets get capital later.
 
+### 8.5 Research-to-deploy pipeline and invariants
+
+Discovery and deployment follow a single pipeline. Each stage has contracts and tests.
+
+- **Data ingest** — Bars, options chains, greeks, account. **Data QA gates:** completeness, staleness, symbol integrity. Staleness guards: if IV/greeks older than threshold → no trade. Time-consistency: no strategy can access greeks whose receipt timestamp exceeds sim time (lookahead hazard). Monitor per-provider lag in live and replay.
+- **Feature store** — Price, options, relval, regimes. **Feature invariants:** no NaNs after warmup; monotonic time indices; no dependence on future bars/snapshots. Tests: e.g. tests/test_feature_leakage.py. Separate feature computation from strategy logic (e.g. src/features/).
+- **Strategy factory** — **Strategy family constraints:** define allowable instruments, max trading frequency, max parameter count, invariant risk constraints. Tests: e.g. tests/test_strategy_constraints.py reject strategies exceeding parameter-count or turnover budget.
+- **Replay backtests** — Conservative fills + barriers (existing). Outcomes/labels: all label horizons respected; purging/embargo in train/test splits when labels depend on future. Tests: e.g. tests/test_cv_embargo.py (training excludes overlapping label ranges).
+- **Robustness lab** — Walk-forward, **MC/bootstrap on realized trades** (replay → trade list → resample/reorder paths → distribution; block bootstrap preferred; not GPU Monte Carlo), **regime-stress** runs, slippage sensitivity sweeps. Kill criteria: e.g. survives only low % of paths, worst 5–10% paths unacceptable, ruin risk, probability edge ≤ 0 net of costs.
+- **Selection gate** — Multiple-testing correction, DSR, Reality Check/SPA-style benchmark, cost robustness. No deploy if sensitivity to costs is too high or performance is localized to one fold/regime.
+- **Portfolio allocator** — Risk budgets, correlation clusters, per-play cap (e.g. 7%). Paper then live with TCA monitoring; promotion to live only after health thresholds and kill switches in place.
+
+**Non-negotiable invariants (auto-fail):** No lookahead; no trade on incomplete snapshots/greeks; no deployment if cost sensitivity shows edge disappears at reasonable slippage; no strategy receives allocation if it violates risk caps (including per-play ≤ 7%); no allocation change exceeds X% per rebalance (anti-churn).
+
 ---
 
 ## 9. Alpha, Sizing, and Deployment (Lessons)
@@ -278,7 +308,7 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 ### 9.3 Sizing stack (practical order)
 
 - **Layer A — Forecast normalization:** Standard object per instrument: μ̂, σ̂, edge_score, cost_hat, confidence so all strategies speak a common language.
-- **Layer B — Single-instrument sizing:** Fractional Kelly (e.g. f = c·μ/σ², c ∈ [0.10, 0.50]); vol-target overlay (weight ∝ target_vol/σ); clip to ±w_max. Quarter-Kelly is a common conservative choice.
+- **Layer B — Single-instrument sizing:** Fractional Kelly (e.g. f = c·μ/σ², c ∈ [0.10, 0.50]); vol-target overlay (weight ∝ target_vol/σ); clip to ±w_max. **Quarter-Kelly (c ≈ 0.25)** is the standard conservative choice for automated deployment; treat full Kelly as upper bound only.
 - **Layer C — Estimation error:** Shrink μ toward 0 by confidence; use covariance shrinkage for multi-asset; fractional Kelly + shrinkage + caps in practice.
 - **Layer D — Portfolio sizing:** Correlation-aware risk budgeting; gross and per-instrument caps; vol-target the portfolio.
 - **Layer E — Hard risk constraints:** Drawdown-aware guardrails; kill-switch (scale exposure when realized drawdown > D). ES/CVaR as monitor first, not primary optimizer.
@@ -287,7 +317,7 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 ### 9.4 Things that kill trading systems
 
 1. **Fake alpha from bad execution** — Mid fills, infinite liquidity, no latency. Argus: conservative fill engine, staleness/liquidity guards; keep validating live vs simulated slippage.
-2. **Overfitting** — Argus: walk-forward, Monte Carlo, deterministic replay. Still needed: automatic parameter robustness scoring, kill unstable parameter sets.
+2. **Overfitting** — Argus: walk-forward, bootstrap/regime-stress (Phase 4C; not GPU Monte Carlo), deterministic replay. Still needed: automatic parameter robustness scoring, kill unstable parameter sets, multiple-testing correction (DSR, Reality Check).
 3. **Strategy edge decay** — Rolling performance monitor, degradation detection, quarantine & kill engine, strategy lifecycle. Largely missing.
 4. **Capital allocation mistakes** — Portfolio risk engine, allocation constraints, correlation awareness. Not implemented yet.
 5. **Latency / data timing** — Argus: recv_ts_ms gating, replay barriers. Maintain strict discipline.
@@ -335,5 +365,7 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 | [docs/outcome_semantics.md](docs/outcome_semantics.md) | Bar outcome window definition, metrics, statuses, quantization, CLI for backfill and coverage. |
 | [docs/replay_pack_and_iv_summary.md](docs/replay_pack_and_iv_summary.md) | Replay pack contents, IV from provider vs derived, checklist for replay + IV + non-zero experiments. |
 | [docs/AUDIT_CODEBASE.md](docs/AUDIT_CODEBASE.md) | Full codebase audit: bugs fixed, risks ranked, concrete patch plan (P1–P3). |
+| [docs/strategy_evaluation.md](docs/strategy_evaluation.md) | Strategy evaluator metrics, composite scoring, penalties, deployability interpretation. |
 | [ONBOARDING_ROADMAP.md](ONBOARDING_ROADMAP.md) | Learning path through the codebase: architecture, data flow, config, soak/tape, glossary. |
 | [argus_strategy_backlog.md](argus_strategy_backlog.md) | Idea parking lot and strategy evaluation framework; master plan is authoritative for priority order. |
+| Phase 4C implementation plan  | Regime sensitivity, parameter stability auto-kill, MC/bootstrap (regime-stress + bootstrap) implementation details; clarifies that “MC/bootstrap” here is not the GPU Heston Monte Carlo. |
