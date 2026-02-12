@@ -42,27 +42,41 @@ class CachedGreek:
     vega: Optional[float] = None
 
 
-def _parse_option_symbol(event_symbol: str) -> Optional[Tuple[str, str, float]]:
-    """Parse a DXLink-style option symbol into (underlying, option_type, strike).
+def _parse_option_symbol(event_symbol: str) -> Optional[Tuple[str, str, float, str]]:
+    """Parse a DXLink-style option symbol into (underlying, option_type, strike, expiry).
 
     Supports formats like:
-    - ``.SPY250321P590``   → ("SPY", "PUT", 590.0)
-    - ``.SPY250321C595``   → ("SPY", "CALL", 595.0)
-    - ``.IBIT250321P55``   → ("IBIT", "PUT", 55.0)
+    - ``.SPY250321P590``   → ("SPY", "PUT", 590.0, "250321")
+    - ``.SPY250321C595``   → ("SPY", "CALL", 595.0, "250321")
+    - ``.IBIT250321P55``   → ("IBIT", "PUT", 55.0, "250321")
+
+    The fourth element is the raw YYMMDD expiration string.
 
     Returns None if the symbol cannot be parsed.
     """
     # Pattern: .UNDERLYING YYMMDD [CP] STRIKE
     m = re.match(
-        r"^\.?([A-Z]+)\d{6}([CP])(\d+(?:\.\d+)?)$",
+        r"^\.?([A-Z]+)(\d{6})([CP])(\d+(?:\.\d+)?)$",
         event_symbol.strip(),
     )
     if not m:
         return None
     underlying = m.group(1)
-    opt_type = "PUT" if m.group(2) == "P" else "CALL"
-    strike = float(m.group(3))
-    return underlying, opt_type, strike
+    expiry = m.group(2)
+    opt_type = "PUT" if m.group(3) == "P" else "CALL"
+    strike = float(m.group(4))
+    return underlying, opt_type, strike, expiry
+
+
+def _yymmdd_to_epoch_ms(yymmdd: str) -> int:
+    """Convert a YYMMDD string to midnight-UTC epoch milliseconds."""
+    from datetime import datetime, timezone
+    dt = datetime.strptime(yymmdd, "%y%m%d").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+# One calendar day in milliseconds — used for date-level matching.
+_ONE_DAY_MS = 86_400_000
 
 
 class GreeksCache:
@@ -137,6 +151,7 @@ class GreeksCache:
         as_of_ms: int,
         *,
         option_type: str = "PUT",
+        expiration_ms: Optional[int] = None,
     ) -> Optional[float]:
         """Find ATM implied volatility from cached Greeks.
 
@@ -144,11 +159,18 @@ class GreeksCache:
         those with ``recv_ts_ms <= as_of_ms``, and returns the IV of the
         strike nearest to ``underlying_price``.
 
+        When ``expiration_ms`` is supplied, only Greeks whose YYMMDD
+        expiration matches the same calendar day (UTC) are considered.
+        This prevents cross-expiration IV contamination when the cache
+        holds multiple expirations for the same underlying.
+
         Args:
             underlying: Underlying symbol (e.g. ``"SPY"``).
             underlying_price: Current underlying price for ATM determination.
             as_of_ms: Only consider Greeks received at or before this time.
             option_type: ``"PUT"`` or ``"CALL"``. Defaults to ``"PUT"``.
+            expiration_ms: If provided, restrict to options expiring on this
+                date (midnight-UTC epoch ms).
 
         Returns:
             ATM implied volatility (annualized decimal), or None if no
@@ -158,6 +180,10 @@ class GreeksCache:
             return None
 
         target_type = option_type.upper()
+        target_day: Optional[int] = None
+        if expiration_ms is not None:
+            target_day = expiration_ms // _ONE_DAY_MS
+
         best_iv: Optional[float] = None
         best_dist = float("inf")
 
@@ -173,11 +199,17 @@ class GreeksCache:
                 parsed = _parse_option_symbol(sym)
                 if parsed is None:
                     continue
-                sym_underlying, opt_type, strike = parsed
+                sym_underlying, opt_type, strike, expiry = parsed
                 if sym_underlying != underlying:
                     continue
                 if opt_type != target_type:
                     continue
+
+                # Expiration filter: match on calendar day
+                if target_day is not None:
+                    sym_day = _yymmdd_to_epoch_ms(expiry) // _ONE_DAY_MS
+                    if sym_day != target_day:
+                        continue
 
                 dist = abs(strike - underlying_price)
                 if dist < best_dist:
@@ -192,6 +224,8 @@ class GreeksCache:
         strike: float,
         option_type: str,
         as_of_ms: int,
+        *,
+        expiration_ms: Optional[int] = None,
     ) -> Optional[CachedGreek]:
         """Get the cached Greeks entry for a specific strike.
 
@@ -200,11 +234,17 @@ class GreeksCache:
             strike: Strike price.
             option_type: ``"PUT"`` or ``"CALL"``.
             as_of_ms: Time gate.
+            expiration_ms: If provided, restrict to options expiring on
+                this date (midnight-UTC epoch ms).
 
         Returns:
             CachedGreek or None.
         """
         target_type = option_type.upper()
+        target_day: Optional[int] = None
+        if expiration_ms is not None:
+            target_day = expiration_ms // _ONE_DAY_MS
+
         best: Optional[CachedGreek] = None
         best_dist = float("inf")
 
@@ -218,9 +258,14 @@ class GreeksCache:
                 parsed = _parse_option_symbol(sym)
                 if parsed is None:
                     continue
-                sym_underlying, opt_type, sym_strike = parsed
+                sym_underlying, opt_type, sym_strike, expiry = parsed
                 if sym_underlying != underlying or opt_type != target_type:
                     continue
+
+                if target_day is not None:
+                    sym_day = _yymmdd_to_epoch_ms(expiry) // _ONE_DAY_MS
+                    if sym_day != target_day:
+                        continue
 
                 dist = abs(sym_strike - strike)
                 if dist < best_dist:
@@ -301,12 +346,14 @@ def enrich_snapshot_iv(
         )
         return snapshot
 
-    # Try provider IV from DXLink Greeks cache
+    # Try provider IV from DXLink Greeks cache (match expiration to prevent
+    # cross-expiration contamination)
     atm_iv = greeks_cache.get_atm_iv(
         underlying=snapshot.symbol,
         underlying_price=snapshot.underlying_price,
         as_of_ms=snapshot.recv_ts_ms,
         option_type="PUT",
+        expiration_ms=snapshot.expiration_ms,
     )
 
     if atm_iv is None:
@@ -316,6 +363,7 @@ def enrich_snapshot_iv(
             underlying_price=snapshot.underlying_price,
             as_of_ms=snapshot.recv_ts_ms,
             option_type="CALL",
+            expiration_ms=snapshot.expiration_ms,
         )
 
     if atm_iv is None:

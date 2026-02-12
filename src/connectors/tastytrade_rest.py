@@ -178,6 +178,26 @@ class TastytradeRestClient:
             _attach_nested_chain_timestamps(payload)
         return data
 
+    def get_api_quote_token(self) -> Dict[str, str]:
+        """Fetch a DXLink streaming token.
+
+        Returns:
+            Dict with ``"token"`` and ``"dxlink-url"`` keys.
+
+        Raises:
+            TastytradeError: if the request fails or required fields are
+                missing in the response.
+        """
+        data = self._request("GET", "/api-quote-tokens")
+        payload = data.get("data", data)
+        token = payload.get("token")
+        url = payload.get("dxlink-url")
+        if not token or not url:
+            raise TastytradeError(
+                "api-quote-tokens response missing 'token' or 'dxlink-url'"
+            )
+        return {"token": token, "dxlink-url": url}
+
     def get_quotes(self, symbols: list[str]) -> Any:
         logger.warning("Quotes endpoint not yet implemented.")
         return {"symbols": symbols, "data": []}

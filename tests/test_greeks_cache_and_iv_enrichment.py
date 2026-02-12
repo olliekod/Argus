@@ -47,10 +47,17 @@ def _make_snapshot(
     calls: tuple = (),
     provider: str = "tastytrade",
 ) -> OptionChainSnapshotEvent:
-    """Create a minimal OptionChainSnapshotEvent for testing."""
+    """Create a minimal OptionChainSnapshotEvent for testing.
+
+    Default expiration_ms corresponds to 2025-03-21 midnight UTC to
+    align with the ``.SPY250321P*`` symbols used throughout the tests.
+    """
+    from datetime import datetime, timezone as _tz
+    # 2025-03-21 00:00 UTC in epoch ms
+    _default_exp_ms = int(datetime(2025, 3, 21, tzinfo=_tz.utc).timestamp() * 1000)
     return OptionChainSnapshotEvent(
         symbol=symbol,
-        expiration_ms=1_700_000_000_000 + 14 * 86_400_000,
+        expiration_ms=_default_exp_ms,
         underlying_price=underlying_price,
         puts=puts,
         calls=calls,
@@ -70,24 +77,24 @@ def _make_snapshot(
 class TestParseOptionSymbol:
     def test_put_symbol(self):
         result = _parse_option_symbol(".SPY250321P590")
-        assert result == ("SPY", "PUT", 590.0)
+        assert result == ("SPY", "PUT", 590.0, "250321")
 
     def test_call_symbol(self):
         result = _parse_option_symbol(".SPY250321C595")
-        assert result == ("SPY", "CALL", 595.0)
+        assert result == ("SPY", "CALL", 595.0, "250321")
 
     def test_without_leading_dot(self):
         """Some formats omit the leading dot."""
         result = _parse_option_symbol("SPY250321P590")
-        assert result == ("SPY", "PUT", 590.0)
+        assert result == ("SPY", "PUT", 590.0, "250321")
 
     def test_ibit_symbol(self):
         result = _parse_option_symbol(".IBIT250321P55")
-        assert result == ("IBIT", "PUT", 55.0)
+        assert result == ("IBIT", "PUT", 55.0, "250321")
 
     def test_decimal_strike(self):
         result = _parse_option_symbol(".SPY250321P590.5")
-        assert result == ("SPY", "PUT", 590.5)
+        assert result == ("SPY", "PUT", 590.5, "250321")
 
     def test_invalid_symbol(self):
         assert _parse_option_symbol("INVALID") is None
@@ -235,6 +242,44 @@ class TestGreeksCache:
         assert greek.volatility == 0.22
         assert greek.delta == -0.45
 
+    def test_cross_expiration_filtering(self):
+        """ATM IV must not mix expirations when expiration_ms is supplied."""
+        from datetime import datetime, timezone
+
+        cache = GreeksCache()
+        # March 21 expiry: IV = 0.22
+        cache.update(".SPY250321P590", volatility=0.22, recv_ts_ms=1000)
+        # April 18 expiry: IV = 0.30
+        cache.update(".SPY250418P590", volatility=0.30, recv_ts_ms=1000)
+
+        # March 21 midnight UTC in ms
+        mar21_ms = int(datetime(2025, 3, 21, tzinfo=timezone.utc).timestamp() * 1000)
+        apr18_ms = int(datetime(2025, 4, 18, tzinfo=timezone.utc).timestamp() * 1000)
+
+        # When filtering to March expiry, must get March IV
+        iv = cache.get_atm_iv(
+            "SPY", underlying_price=590.0, as_of_ms=2000,
+            expiration_ms=mar21_ms,
+        )
+        assert iv == 0.22
+
+        # When filtering to April expiry, must get April IV
+        iv = cache.get_atm_iv(
+            "SPY", underlying_price=590.0, as_of_ms=2000,
+            expiration_ms=apr18_ms,
+        )
+        assert iv == 0.30
+
+    def test_no_expiration_filter_matches_all(self):
+        """Without expiration_ms, get_atm_iv still matches all expirations."""
+        cache = GreeksCache()
+        cache.update(".SPY250321P590", volatility=0.22, recv_ts_ms=1000)
+        cache.update(".SPY250418P595", volatility=0.30, recv_ts_ms=1000)
+
+        # No expiration filter: should pick nearest strike to 593 → 590 (dist=3) vs 595 (dist=2)
+        iv = cache.get_atm_iv("SPY", underlying_price=593.0, as_of_ms=2000)
+        assert iv == 0.30  # 595 is closer to 593 (dist=2 vs dist=3)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Tests: enrich_snapshot_iv
@@ -318,6 +363,34 @@ class TestEnrichSnapshotIV:
         snapshot = _make_snapshot(underlying_price=0.0, atm_iv=None)
         enriched = enrich_snapshot_iv(snapshot, cache)
         assert enriched is snapshot
+
+    def test_enrichment_respects_expiration(self):
+        """Enrichment must not use IV from a different expiration."""
+        from datetime import datetime, timezone
+
+        cache = GreeksCache()
+        # Only March expiry in cache
+        cache.update(".SPY250321P595", volatility=0.22, recv_ts_ms=1_700_000_050_000)
+
+        # Snapshot is for April expiry
+        apr18_ms = int(datetime(2025, 4, 18, tzinfo=timezone.utc).timestamp() * 1000)
+        snapshot = OptionChainSnapshotEvent(
+            symbol="SPY",
+            expiration_ms=apr18_ms,
+            underlying_price=595.0,
+            puts=(),
+            calls=(),
+            n_strikes=0,
+            atm_iv=None,
+            timestamp_ms=1_700_000_060_000,
+            recv_ts_ms=1_700_000_060_000,
+            provider="tastytrade",
+            snapshot_id="test_exp",
+        )
+        enriched = enrich_snapshot_iv(snapshot, cache)
+
+        # Must NOT enrich with March IV for an April snapshot
+        assert enriched.atm_iv is None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
