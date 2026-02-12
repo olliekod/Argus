@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -39,6 +40,28 @@ def _ms_to_osi_date(expiration_ms: int) -> str:
 
 def _normalize_osi_symbol(osi: str) -> str:
     return "".join((osi or "").upper().split())
+
+
+def _response_osi_to_canonical(response_symbol: str) -> str:
+    """Normalize Public API response symbol to our canonical OSI (8-digit strike).
+
+    We send e.g. SPY250321P00550000. Public may return the same or e.g. SPY250321P550000
+    (strike without leading zeros). Convert to canonical so lookup matches.
+    """
+    s = _normalize_osi_symbol(response_symbol)
+    if not s:
+        return ""
+    # OSI: underlying (letters) + YYMMDD (6 digits) + P|C + strike (digits)
+    m = re.match(r"^([A-Z]+)(\d{6})([PC])(\d+)$", s)
+    if not m:
+        return s
+    underlying, yymmdd, right, strike_digits = m.groups()
+    try:
+        strike_int = int(strike_digits)
+    except ValueError:
+        return s
+    canonical = f"{underlying}{yymmdd}{right}{strike_int:08d}"
+    return canonical
 
 
 def _to_osi_symbol(symbol: str, expiration_ms: int, option_type: str, strike: float) -> str:
@@ -105,8 +128,9 @@ class PublicOptionsConnector:
                     if snapshot:
                         snapshots.append(snapshot)
                 return snapshots
-            except TypeError:
-                # Tastytrade structure has a different sync method signature.
+            except (TypeError, AttributeError):
+                # Alpaca uses (symbol, min_dte, max_dte); Tastytrade uses (normalized, min_dte, max_dte).
+                # When structure is Tastytrade we pass symbol and it expects a list -> AttributeError.
                 pass
 
         # Sync Tastytrade structure connector path
@@ -158,21 +182,42 @@ class PublicOptionsConnector:
             ordered_osi.append(osi)
 
         greeks_by_osi: Dict[str, Dict] = {}
+        sample_response_symbols: List[str] = []
         batch_size = max(1, min(self._config.batch_size, self._client.MAX_GREEKS_SYMBOLS))
         for i in range(0, len(ordered_osi), batch_size):
             batch = ordered_osi[i : i + batch_size]
             rows = await self._client.get_option_greeks(batch)
             for row in rows:
-                key = _normalize_osi_symbol(str(row.get("symbol", "")))
+                if not isinstance(row, dict):
+                    continue
+                greeks_val = row.get("greeks")
+                if not isinstance(greeks_val, dict):
+                    greeks_val = {}
+                raw_sym = str(row.get("symbol", ""))
+                if not raw_sym:
+                    continue
+                if len(sample_response_symbols) < 3:
+                    sample_response_symbols.append(raw_sym)
+                # Store under canonical key so we match our _to_osi_symbol format
+                # (Public may return strike with fewer digits, e.g. 550000 vs 00550000)
+                key = _response_osi_to_canonical(raw_sym)
                 if key:
-                    greeks_by_osi[key] = row.get("greeks", {}) if isinstance(row.get("greeks"), dict) else row
+                    greeks_by_osi[key] = greeks_val
+        if ordered_osi and not greeks_by_osi and sample_response_symbols:
+            logger.debug(
+                "Public greeks: no keys matched our OSI format; sample request: %s, sample response symbols: %s",
+                ordered_osi[:2],
+                sample_response_symbols,
+            )
 
         puts: List[OptionQuoteEvent] = []
         calls: List[OptionQuoteEvent] = []
 
         for osi_norm, base_quote in osi_to_quote.items():
-            g = greeks_by_osi.get(osi_norm, {})
-            iv = g.get("impliedVolatility")
+            g = greeks_by_osi.get(osi_norm) or {}
+            if not isinstance(g, dict):
+                g = {}
+            iv = g.get("impliedVolatility") or g.get("iv")
             q = OptionQuoteEvent(
                 contract_id=base_quote.contract_id or _compute_contract_id(osi_norm),
                 symbol=base_quote.symbol,

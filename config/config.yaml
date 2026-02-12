@@ -104,7 +104,7 @@ exchanges:
     poll_interval_seconds: 60
     bar_timeframe: "1Min"
     options:
-      enabled: true
+      enabled: false
       # Underlyings for options chain snapshot polling (Alpaca). IBIT + liquid ETF universe (no BITO).
       symbols: ["IBIT", "DIA", "GLD", "IWM", "QQQ", "SMH", "SPY", "TLT", "XLE", "XLF", "XLK"]
       poll_interval_seconds: 60  # 1 minute between chain polls (default)
@@ -140,10 +140,10 @@ public:
   base_url: "https://api.public.com"
   timeout_seconds: 20
   rate_limit_rps: 10
-  account_id: ""   # optional; if empty, connector tries /userapigateway/accounts
+  account_id: "5OG33612"   # optional; if empty, connector tries /userapigateway/accounts
 
 public_options:
-  enabled: false
+  enabled: true
   # Underlyings for options chain snapshot polling (Public greeks + structure source).
   symbols: ["IBIT", "DIA", "GLD", "IWM", "QQQ", "SMH", "SPY", "TLT", "XLE", "XLF", "XLK"]
   poll_interval_seconds: 60

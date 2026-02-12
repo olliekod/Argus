@@ -46,12 +46,13 @@ flowchart LR
 ### IV / snapshot / replay truth map
 
 - **Bars and outcomes:** Alpaca (or configured bar provider).
-- **Options snapshots:** Tastytrade REST.
-- **IV source:** DXLink Greeks → GreeksCache → snapshot `atm_iv` at publish time.
+- **Options snapshots:** Tastytrade REST (primary); **Public.com** (secondary when `public_options.enabled`). Structure can come from Tastytrade when Alpaca options is off; Public provides greeks/IV via batch API.
+- **IV source:** Tastytrade: DXLink Greeks → GreeksCache → snapshot `atm_iv`. Public: Get option greeks API → snapshot `atm_iv` (canonical OSI matching, optional second source).
 - **Replay:** Uses snapshot `atm_iv`; no lookahead (gating by `recv_ts_ms`).
 - **Storage:** Only ATM IV persisted; no DB bloat from tick-level Greeks.
+- **Health and comparison:** `scripts/options_providers_health.py` pre-checks both providers (snapshots, atm_iv %, symbols); `compare_options_snapshot_providers.py` for post-close comparison.
 
-**Remaining risk (ordering/timing):** Outcomes depend on GreeksCache being populated before the snapshot is published. Verify two edge cases: (1) cold start right after Argus boots (cache empty for a few minutes), (2) illiquid symbols / delayed Greeks (cache updates lag snapshots). E2E metrics should show `atm_iv` presence climbing after a short warmup.
+**Remaining risk (ordering/timing):** Outcomes depend on GreeksCache (Tastytrade) or Public greeks response being correct before snapshot publish. Cold start and illiquid symbols: E2E metrics should show `atm_iv` presence climbing after warmup. Public 0% atm_iv historically was addressed with OSI canonical matching and IV key fallback; re-validate after all-day Public runs.
 
 ---
 
@@ -67,7 +68,7 @@ flowchart LR
 | **3B** | Options pipeline | Done | Options ingestion, chain normalization, spread generation, liquidity filtering, deterministic persistence, tape capture, replay validation. |
 | **4A** | Outcome engine | Done | Forward returns, run-up, drawdown, multi-horizon outcomes, outcome DB storage, deterministic backfills. |
 | **4B** | Backtesting engine | Done | Replay harness, position simulator, entry/exit modeling, transaction costs, slippage (conservative execution model). |
-| **4C** | Parameter search & optimization | Next | Parameter sweeps, Monte Carlo runs, GPU simulations, regime sensitivity tests. |
+| **4C** | Parameter search & optimization / | **In progress** | Parameter sweeps, Monte Carlo runs, GPU simulations; **regime sensitivity scoring**, **parameter stability auto-kill**, **MC/bootstrap stress over regimes**. |
 | **5** | Portfolio risk engine | Future | Position sizing, exposure limits, drawdown controls, correlation awareness, strategy budgets. |
 | **6** | Execution engine | Future | Broker integration, order routing, fill simulation, paper then live trading. |
 | **7** | Strategy expansion | Future | Put spread selling, volatility plays, panic snapback, FVG, session momentum, crypto–ETF relationships, Polymarket. |
@@ -75,7 +76,7 @@ flowchart LR
 | **9** | Intelligence API product | Future | Expose bars, regimes, options intelligence, spread candidates, signals for subscription revenue. |
 | **10** | Self-improving system | Future | Automatic idea testing, strategy mutation, performance pruning, adaptive weighting. |
 
-**Current status:** Research engine complete through 4B. Next step: Phase 4C (measure outcomes at scale, kill bad strategies fast).
+**Current status:** Research engine complete through 4B. Public options/Greeks integration done (second IV source, health script, Tastytrade-as-structure path). **Active focus:** Phase 4C —: regime sensitivity scoring, parameter stability auto-kill, MC/bootstrap stress over regimes.
 
 ---
 
@@ -176,12 +177,18 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 - **10.13 Bybit WS invalid quotes** — Skip invalid quotes instead of publishing zeroed values.
 - **10.14 Tastytrade snapshot NULL IV documentation** — Document in data_sources policy; add health check warning when DXLink is disconnected and Tastytrade is primary snapshot source.
 
-### 8.2 Public API integration
+### 8.2 Public API integration — **Done**
 
-- **Public API client** — New module (e.g. `src/connectors/public_client.py`): auth via `public.api_secret` (create personal access token, refresh before expiry), resolve `accountId` (config or List Accounts), generic request helper with Bearer token and 401 retry.
-- **Public options connector** — New module (e.g. `src/connectors/public_options.py`): poll option expirations and option chain; call Public “Get option greeks” (batch, OSI symbols) to get IV; build `OptionChainSnapshotEvent` with `atm_iv` and `provider="public"`; publish to same topic as Alpaca/Tastytrade. Config: `public_options.enabled`, symbols, poll_interval; orchestrator wiring and task in `_tasks`.
-- **Config and secrets** — Use `public.api_secret`; optionally `public.account_id`. Validate when `public_options.enabled` that secret is present.
-- **Tests and docs** — Unit tests with mocked Public responses; update data_sources docs to list Public as options/Greeks provider.
+- **Public API client** — Implemented: `src/connectors/public_client.py` — auth via token exchange (`public.api_secret`), `public.account_id` required (no accounts API); 10 req/s rate limit; get_option_greeks with comma-separated OSI; 401 retry.
+- **Public options connector** — Implemented: `src/connectors/public_options.py` — structure from Alpaca or Tastytrade; greeks from Public API; canonical OSI matching for response symbols; atm_iv from ATM put; Tastytrade-as-structure path fixed (AttributeError + TypeError fallback to sync path).
+- **Config and secrets** — `public.api_secret`, `public.account_id`; `public.rate_limit_rps`; validation when `public_options.enabled`.
+- **Health and comparison** — `scripts/options_providers_health.py` (pre-check both providers); `compare_options_snapshot_providers.py`. Tests and data_sources docs updated.
+
+### 8.2b Kill bad strategies fast (Phase 4C — next)
+
+- **Regime sensitivity scoring** — Score strategy/parameter sets by performance across regimes (e.g. trend vs range, low-vol vs high-vol); flag or down-rank sets that only work in one regime.
+- **Parameter stability auto-kill** — Automatic flagging or removal of parameter sets that are unstable (e.g. small change in params → large change in outcome, or walk-forward failure). Integrate with experiment evaluator.
+- **MC / bootstrap stress over regimes** — Monte Carlo or bootstrap runs that resample or perturb regimes; stress-test strategy robustness across regime mixes and kill sets that collapse under regime shift.
 
 ### 8.3 Strategic / product TODOs
 
@@ -199,9 +206,9 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 **Assessment (codebase vs Master Plan):**
 
 - **Phases 0–4B:** In place. Event bus, bars, regimes, options pipeline, outcome engine, replay harness, experiment runner, execution model, and (after audit fixes) DXLink Greeks + cross-expiration IV are the backbone. Replay packs with bars + outcomes + regimes + snapshots work; VRP strategy can consume `atm_iv` and `realized_vol` in replay.
-- **Phase 4C:** Partially present. `run_experiment.py --sweep` and `ExperimentRunner` support parameter grids; `optimizer` / `ultra_optimizer` / `production_optimizer` exist for backtester-style optimization. Missing: unified regime-sensitivity scoring, automatic kill of unstable parameter sets, and tight integration with strategy evaluator for “kill bad strategies fast.”
+- **Phase 4C:** In progress. `run_experiment.py --sweep` and `ExperimentRunner` support parameter grids; Optimizer variants exist. **Next:** regime-sensitivity scoring, parameter stability auto-kill, MC/bootstrap stress over regimes — unified with strategy evaluator to kill bad strategies fast.
 - **Audit:** Two critical bugs fixed. P1–P3 items (timestamp parsing, rate limiter, snapshot retry, task tracking check, bar lock, DXLink errors, ExecutionModel reset, secrets permissions, VRP RV, etc.) are still open and affect correctness or operational safety.
-- **Public API:** Not started. Would add a second IV/Greeks source and optional market data; reduces dependence on DXLink for IV.
+- **Public API:** Done. Second IV/Greeks source; health script and provider comparison; reduces dependence on DXLink alone.
 - **Strategic gaps:** No strategy allocation engine, no portfolio risk engine, no sizing layer, no strategy lifecycle/kill engine, no live vs backtest drift monitor. These block safe scaling and live deployment.
 
 **Recommended next steps (ordered):**
@@ -221,12 +228,14 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
    - Use existing `--sweep` and evaluator for parameter robustness and regime sensitivity.  
    - Document what works and what doesn’t; feed results into strategy priority (Master Plan §4) and into future allocation/sizing design.
 
-4. **Phase 4C completion and “kill bad strategies fast”**  
-   - Extend experiment/optimizer flow: regime-sensitivity scoring, Monte Carlo or bootstrap over regimes, automatic flagging/kill of unstable parameter sets.  
-   - Optional: BOCPD or similar as a regime gate for VRP (Master Plan §5).  
+4. **Phase 4C — (current focus)**  
+   - **Regime sensitivity scoring:** Score strategy/parameter sets by performance across regimes; flag sets that only work in one regime.  
+   - **Parameter stability auto-kill:** Auto-flag or kill parameter sets that are unstable (walk-forward failure, high sensitivity to param changes).  
+   - **MC/bootstrap stress over regimes:** Monte Carlo or bootstrap over regime mixes; kill sets that collapse under regime shift.  
+   - Optional: BOCPD or similar as regime gate for VRP (Master Plan §5).  
    - Outcome: Only strategies and parameter sets that survive robust testing get capital later.
 
-5. **Strategy allocation and sizing (Phase 5 prelude)**  
+5. **Strategy allocation and sizing (Phase 5 prelude)**   
    - Introduce a small **strategy allocation engine:** registry, forecast normalization (μ̂, σ̂, confidence), and a single-instrument sizing rule (e.g. vol-targeted fractional Kelly with caps). No broker execution yet; output is target exposure or “risk budget” per strategy/symbol.  
    - Optionally add options-spread sizing (risk budget / max loss per contract).  
    - Outcome: Clear separation “strategy says what; sizing says how much” and a path to portfolio risk (Phase 5).
@@ -241,11 +250,11 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 
 **Best route going forward:**
 
-- **Short term:** Treat **data correctness and replay trust** as non-negotiable. Do P1 + selected P2 audit items and the E2E IV check. In parallel, add **Public API** so IV/Greeks are not dependent on a single provider.  
-- **Medium term:** Use the existing replay and experiment pipeline to **validate VRP (and session ideas)** on multiple packs and regimes; tighten Phase 4C so bad parameter sets are killed automatically. Then add a **minimal allocation/sizing layer** that consumes strategy forecasts and outputs risk budgets under caps, without execution.  
+- **Short term:** **Phase 4C —** Implement regime sensitivity scoring, parameter stability auto-kill, and MC/bootstrap stress over regimes; integrate with experiment evaluator. Keep P1/P2 audit items in backlog; E2E IV check when running both providers.  
+- **Medium term:** Use the replay and experiment pipeline to **validate VRP (and session ideas)** on multiple packs and regimes with the new kill criteria. Add a **minimal allocation/sizing layer** that consumes strategy forecasts and outputs risk budgets under caps, without execution.  
 - **Long term:** Add **portfolio risk engine** and **strategy lifecycle**, then paper trading and live execution. Keep the Master Plan order: allocation → lifecycle → risk engine → monitoring → paper → live → strategy expansion.
 
-This order keeps the research engine credible first, adds a second IV source, proves edge with existing tools, then builds the layers (sizing, risk, lifecycle) needed before scaling capital or going live.
+Public API is done (second IV source); focus is on killing bad strategies fast so only robust parameter sets get capital later.
 
 ---
 

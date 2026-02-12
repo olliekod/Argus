@@ -410,7 +410,10 @@ class TastytradeOptionsConnector:
             List of (expiry_date_str, dte) tuples.
         """
         today = datetime.now(timezone.utc).date()
-        expirations = sorted({c["expiry"] for c in normalized if c.get("expiry")})
+        expirations = sorted({
+            c["expiry"] for c in normalized
+            if isinstance(c, dict) and c.get("expiry")
+        })
         results = []
         for exp_str in expirations:
             try:

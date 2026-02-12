@@ -711,6 +711,12 @@ class ArgusOrchestrator:
 
             if not public_api_secret or str(public_api_secret).startswith('PASTE_'):
                 raise ValueError("public_options.enabled=true requires secrets.public.api_secret")
+            public_account_id = (public_account_id or "").strip()
+            if not public_account_id:
+                raise ValueError(
+                    "public_options.enabled=true requires public.account_id (set in config or secrets). "
+                    "The Public API does not expose an accounts listing endpoint."
+                )
 
             structure_connector = self.alpaca_options or self.tastytrade_options
             if structure_connector is None:
@@ -754,6 +760,26 @@ class ArgusOrchestrator:
                 )
         else:
             self.logger.info("Public options snapshots disabled (set public_options.enabled=true)")
+
+        # SpreadCandidateGenerator: subscribe to options.chains when we have any options
+        # chain source (Tastytrade or Public), so we don't require Alpaca options.
+        if self.spread_generator is None and (self.tastytrade_options or self.public_options):
+            min_dte = getattr(self, '_tastytrade_options_min_dte', None) or getattr(
+                self, '_public_options_min_dte', 7
+            )
+            max_dte = getattr(self, '_tastytrade_options_max_dte', None) or getattr(
+                self, '_public_options_max_dte', 21
+            )
+            self.spread_generator = SpreadCandidateGenerator(
+                strategy_id="PUT_SPREAD_V1",
+                config=SpreadGeneratorConfig(min_dte=min_dte, max_dte=max_dte),
+                on_signal=self._on_spread_signal,
+            )
+            self.event_bus.subscribe(TOPIC_OPTIONS_CHAINS, self.spread_generator.on_chain_snapshot)
+            self.logger.info(
+                "SpreadCandidateGenerator configured from options chain source (DTE=%d-%d)",
+                min_dte, max_dte,
+            )
 
     async def _setup_polymarket(self) -> None:
         """Initialize Polymarket connectors (optional, fail-soft)."""

@@ -30,3 +30,18 @@ async def test_public_options_enabled_requires_api_secret(monkeypatch):
     orch = ArgusOrchestrator(config_dir="config")
     with pytest.raises(ValueError, match="public_options.enabled=true requires secrets.public.api_secret"):
         await orch._setup_connectors()
+
+
+@pytest.mark.asyncio
+async def test_public_options_enabled_requires_account_id(monkeypatch):
+    cfg = _base_config()
+    cfg["secrets"]["public"] = {"api_secret": "a-real-token"}
+    cfg["public"] = {}
+
+    monkeypatch.setattr("src.orchestrator.load_all_config", lambda *_: cfg)
+    monkeypatch.setattr("src.orchestrator.validate_secrets", lambda *_: [])
+    monkeypatch.setattr("src.orchestrator.setup_logger", lambda *a, **k: None)
+
+    orch = ArgusOrchestrator(config_dir="config")
+    with pytest.raises(ValueError, match="public.account_id"):
+        await orch._setup_connectors()

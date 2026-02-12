@@ -45,15 +45,17 @@ async def test_get_option_greeks_uses_account_and_parses_rows(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_get_account_id_from_list_accounts(monkeypatch):
+async def test_get_account_id_uses_config():
+    client = PublicAPIClient(PublicAPIConfig(api_secret="token", account_id="acct-from-config"))
+    assert await client.get_account_id() == "acct-from-config"
+    assert await client.get_account_id() == "acct-from-config"
+
+
+@pytest.mark.asyncio
+async def test_get_account_id_raises_when_missing():
     client = PublicAPIClient(PublicAPIConfig(api_secret="token", account_id=""))
-
-    async def fake_request(method, path, *, params=None, retry_401=True):
-        assert path == "/userapigateway/accounts"
-        return {"accounts": [{"accountId": "acct-xyz"}]}
-
-    monkeypatch.setattr(client, "_request", fake_request)
-    assert await client.get_account_id() == "acct-xyz"
+    with pytest.raises(PublicAPIError, match="account_id is required"):
+        await client.get_account_id()
 
 
 @pytest.mark.asyncio
