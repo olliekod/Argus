@@ -22,6 +22,40 @@ logging:
   backup_count: 10
 
 # -----------------------------------------------------------------------------
+# Data Source Policy
+# -----------------------------------------------------------------------------
+# Canonical provider selections for all Argus pipelines. Replay packs,
+# experiment runners, and strategies read these defaults so you never
+# need to specify --provider manually.
+#
+# PRIMARY SOURCES
+#   bars_primary       — 1-min OHLCV bars.  Provider: alpaca
+#   outcomes_from      — forward-return outcomes.  Derived from bars_primary
+#                        (OutcomeEngine consumes bars from this source).
+#   options_snapshots_primary — option chain quotes + strikes/expiries + IV
+#                        surface fields.  Provider: tastytrade (REST).
+#                        This is the authoritative IV source.
+#   options_stream_primary   — real-time option quotes + greeks (DXLink).
+#                        Provider: tastytrade_dxlink.
+#
+# SECONDARY SOURCES (redundancy / sanity-check only)
+#   options_snapshots_secondary — structural coverage cross-check.
+#                        Provider: alpaca.  DO NOT depend on IV/greeks
+#                        from Alpaca; they are absent or unreliable.
+#   bars_secondary      — optional backfill / cross-validation.
+#                        Provider: yahoo.
+#
+data_sources:
+  bars_primary: alpaca
+  outcomes_from: bars_primary            # always derived from bars_primary
+  options_snapshots_primary: tastytrade  # authoritative IV / surface source
+  options_snapshots_secondary:
+    - alpaca                             # structural cross-check only; no IV/greeks
+  options_stream_primary: tastytrade_dxlink
+  bars_secondary:
+    - yahoo                              # optional sanity / backfill
+
+# -----------------------------------------------------------------------------
 # Assets to Monitor
 # -----------------------------------------------------------------------------
 assets:

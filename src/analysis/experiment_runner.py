@@ -24,6 +24,7 @@ from src.analysis.replay_harness import (
 )
 from src.analysis.execution_model import ExecutionModel, ExecutionConfig
 from src.core.outcome_engine import BarData
+from src.core.data_sources import get_data_source_policy
 
 logger = logging.getLogger("argus.experiment_runner")
 
@@ -147,10 +148,37 @@ class ExperimentRunner:
             results.append(self.run(config))
         return results
 
+    def _extract_pack_data_sources(self, pack_paths: List[str]) -> Dict[str, Any]:
+        """Extract data-source metadata from loaded packs."""
+        bars_providers = set()
+        options_snapshot_providers = set()
+        secondary_included = False
+
+        for p in pack_paths:
+            try:
+                with open(p, "r") as f:
+                    meta = json.load(f).get("metadata", {})
+                bars_providers.add(
+                    meta.get("bars_provider", meta.get("provider", "unknown"))
+                )
+                options_snapshot_providers.add(
+                    meta.get("options_snapshot_provider", "unknown")
+                )
+                if meta.get("secondary_options_included", False):
+                    secondary_included = True
+            except Exception:
+                pass
+
+        return {
+            "bars_providers": sorted(bars_providers),
+            "options_snapshot_providers": sorted(options_snapshot_providers),
+            "secondary_options_included": secondary_included,
+        }
+
     def _save_result(self, config: ExperimentConfig, result: ReplayResult):
         """Persist result to JSON artifact with rich manifest."""
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        
+
         # 1. Environment Metadata
         git_commit = "UNKNOWN"
         try:
@@ -170,14 +198,26 @@ class ExperimentRunner:
             except:
                 pack_info.append({"path": str(p), "hash": "ERROR"})
 
-        # 3. Deterministic Run ID
+        # 3. Data Source Policy (from packs + live config)
+        pack_data_sources = self._extract_pack_data_sources(config.replay_pack_paths)
+        try:
+            policy = get_data_source_policy()
+            policy_snapshot = {
+                "bars_primary": policy.bars_primary,
+                "options_snapshots_primary": policy.options_snapshots_primary,
+                "options_stream_primary": policy.options_stream_primary,
+            }
+        except Exception:
+            policy_snapshot = {}
+
+        # 4. Deterministic Run ID
         # Strategy + Sorted Params + Sorted Pack Paths
         input_data = f"{result.strategy_id}_{json.dumps(config.strategy_params, sort_keys=True)}_{sorted(config.replay_pack_paths)}"
         run_id = hashlib.md5(input_data.encode()).hexdigest()[:8]
         filename = f"{result.strategy_id}_{config.tag}_{run_id}.json"
-        
+
         output_file = self.output_dir / filename
-        
+
         artifact = {
             "manifest": {
                 "run_id": run_id,
@@ -185,6 +225,10 @@ class ExperimentRunner:
                 "strategy_params": config.strategy_params,
                 "execution_config": config.execution_config.__dict__ if config.execution_config else "DEFAULT",
                 "replay_packs": pack_info,
+                "data_sources": {
+                    "from_packs": pack_data_sources,
+                    "config_policy": policy_snapshot,
+                },
                 "environment": {
                     "git_commit": git_commit,
                     "python_version": f"{datetime.now().year}.{datetime.now().month}", # Or sys.version
@@ -193,10 +237,10 @@ class ExperimentRunner:
             },
             "result": result.summary()
         }
-        
+
         with open(output_file, "w") as f:
             json.dump(artifact, f, indent=2)
-        
+
         logger.info(f"Experiment result saved to {output_file}")
 
     def split_walk_forward(self, bars: List[BarData], 
