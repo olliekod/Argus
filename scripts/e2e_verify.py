@@ -108,7 +108,15 @@ async def check_options_snapshots(
     start_ms: int,
     end_ms: int,
 ) -> Dict[str, Any]:
-    """Check snapshot coverage from options_snapshots_primary."""
+    """Check snapshot coverage from options_snapshots_primary.
+
+    Reports:
+    - snapshot_count: total snapshots from primary provider
+    - atm_iv_present: count with non-null atm_iv (provider or enriched)
+    - atm_iv_pct: percentage with atm_iv
+    - iv_derivable: count where IV could be derived from quotes
+    - iv_ready_pct: percentage where IV is available (atm_iv OR derivable)
+    """
     raw = await db.get_option_chain_snapshots(
         symbol=symbol,
         start_ms=start_ms,
@@ -116,13 +124,32 @@ async def check_options_snapshots(
     )
     primary = [r for r in raw if r.get("provider") == policy.options_snapshot_provider]
     iv_present = sum(1 for r in primary if r.get("atm_iv") is not None)
+
+    # Check how many snapshots have derivable IV from quotes_json
+    iv_derivable = 0
+    for r in primary:
+        if r.get("atm_iv") is not None:
+            continue  # Already has IV, don't double count
+        try:
+            from src.tools.replay_pack import _atm_iv_from_quotes_json
+            underlying = float(r.get("underlying_price") or 0)
+            derived = _atm_iv_from_quotes_json(r.get("quotes_json", "") or "", underlying)
+            if derived is not None and derived > 0:
+                iv_derivable += 1
+        except Exception:
+            pass
+
+    iv_ready = iv_present + iv_derivable
     pct = (iv_present / len(primary) * 100) if primary else 0.0
+    iv_ready_pct = (iv_ready / len(primary) * 100) if primary else 0.0
     return {
         "provider": policy.options_snapshot_provider,
         "symbol": symbol,
         "snapshot_count": len(primary),
         "atm_iv_present": iv_present,
         "atm_iv_pct": round(pct, 1),
+        "iv_derivable": iv_derivable,
+        "iv_ready_pct": round(iv_ready_pct, 1),
         "pass": len(primary) > 0,
     }
 
@@ -306,7 +333,7 @@ async def run_e2e(
         print("\nStep 2: Checking options snapshot coverage...")
         snap_result = await check_options_snapshots(db, policy, symbol, start_ms, end_ms)
         results["steps"]["options_snapshots"] = snap_result
-        print(f"  Snapshots from {snap_result['provider']}: {snap_result['snapshot_count']} ({snap_result['atm_iv_pct']}% have atm_iv) — {'PASS' if snap_result['pass'] else 'FAIL'}")
+        print(f"  Snapshots from {snap_result['provider']}: {snap_result['snapshot_count']} ({snap_result['atm_iv_pct']}% have atm_iv, {snap_result['iv_ready_pct']}% IV-ready) — {'PASS' if snap_result['pass'] else 'FAIL'}")
     finally:
         await db.close()
 

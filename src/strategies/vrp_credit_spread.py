@@ -112,7 +112,7 @@ def _select_iv_from_snapshots(
     2. Derived IV from latest Tastytrade snapshot's bid/ask quotes.
     3. If ``allow_alpaca_iv`` is True, latest Alpaca snapshot with
        non-null ``atm_iv`` (structural cross-check only).
-    4. None if nothing is available.
+    4. None — logs one-line reason and strategy skips deterministically.
     """
     if not visible_snapshots:
         return None
@@ -133,9 +133,12 @@ def _select_iv_from_snapshots(
             return snap.get("atm_iv")
         return None
 
+    tt_snap_count = 0
+
     # Pass 1: Tastytrade atm_iv (most recent first)
     for snap in reversed(visible_snapshots):
         if _provider(snap) == _TASTYTRADE:
+            tt_snap_count += 1
             iv = _atm_iv(snap)
             if iv is not None:
                 return iv
@@ -156,6 +159,12 @@ def _select_iv_from_snapshots(
                 if iv is not None:
                     logger.debug("Falling back to Alpaca IV %.4f (allow_alpaca_iv=True)", iv)
                     return iv
+
+    # Log one-line reason for IV unavailability
+    if tt_snap_count == 0:
+        logger.debug("IV unavailable: no tastytrade snapshots in %d visible snapshots", len(visible_snapshots))
+    else:
+        logger.debug("IV unavailable: %d tastytrade snapshots lack atm_iv and bid/ask quotes", tt_snap_count)
 
     return None
 
@@ -220,10 +229,10 @@ class VRPCreditSpreadStrategy(ReplayStrategy):
     def generate_intents(self, sim_ts_ms: int) -> List[TradeIntent]:
         intents = []
 
-        # 1. Check if we have data
+        # 1. Check if we have data — skip deterministically if IV unavailable
         if self.last_iv is None:
             if not self._logged_no_iv:
-                logger.warning("VRPCreditSpreadStrategy: no IV yet (need option snapshot with atm_iv). Snapshots may lack atm_iv or recv_ts_ms may be after sim time.")
+                logger.warning("VRPCreditSpreadStrategy: skipping trade — no IV available (provider atm_iv absent and derived IV failed)")
                 self._logged_no_iv = True
             return []
 

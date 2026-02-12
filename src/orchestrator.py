@@ -54,6 +54,7 @@ from .connectors.yahoo_client import YahooFinanceClient
 from .connectors.alpaca_client import AlpacaDataClient
 from .connectors.alpaca_options import AlpacaOptionsConnector, AlpacaOptionsConfig
 from .connectors.tastytrade_options import TastytradeOptionsConnector, TastytradeOptionsConfig
+from .core.greeks_cache import GreeksCache, enrich_snapshot_iv
 from .strategies.spread_generator import SpreadCandidateGenerator, SpreadGeneratorConfig
 from .connectors.polymarket_gamma import PolymarketGammaClient
 from .connectors.polymarket_clob import PolymarketCLOBClient
@@ -190,6 +191,7 @@ class ArgusOrchestrator:
         self.alpaca_options: Optional[AlpacaOptionsConnector] = None
         self.tastytrade_options: Optional[TastytradeOptionsConnector] = None
         self.spread_generator: Optional[SpreadCandidateGenerator] = None
+        self._greeks_cache: GreeksCache = GreeksCache()
         self.telegram: Optional[TelegramBot] = None
         
         # Off-hours monitoring
@@ -1434,6 +1436,31 @@ class ArgusOrchestrator:
 
             await asyncio.sleep(interval)
 
+    def _on_dxlink_greeks_event(self, event: Any) -> None:
+        """Handle DXLink Greeks events by caching IV and Greeks.
+
+        Called from the DXLink streamer callback. Populates the
+        in-memory GreeksCache so that subsequent snapshot polls
+        can enrich ``atm_iv`` from cached provider IV.
+
+        No DB writes — memory only.
+        """
+        event_symbol = getattr(event, "event_symbol", None)
+        volatility = getattr(event, "volatility", None)
+        if not event_symbol or volatility is None:
+            return
+
+        recv_ts_ms = getattr(event, "receipt_time", None)
+        self._greeks_cache.update(
+            event_symbol=event_symbol,
+            volatility=volatility,
+            recv_ts_ms=recv_ts_ms,
+            delta=getattr(event, "delta", None),
+            gamma=getattr(event, "gamma", None),
+            theta=getattr(event, "theta", None),
+            vega=getattr(event, "vega", None),
+        )
+
     async def _poll_tastytrade_options_chains(self) -> None:
         """Poll Tastytrade for options chain snapshots via REST.
 
@@ -1483,12 +1510,14 @@ class ArgusOrchestrator:
                             underlying_price=underlying_price,
                         )
                         for snapshot in snapshots:
+                            # Enrich snapshot with ATM IV from DXLink Greeks cache
+                            snapshot = enrich_snapshot_iv(snapshot, self._greeks_cache)
                             self.event_bus.publish(TOPIC_OPTIONS_CHAINS, snapshot)
                             self.logger.debug(
-                                "Tastytrade chain: %s exp_ms=%d puts=%d calls=%d provider=%s",
+                                "Tastytrade chain: %s exp_ms=%d puts=%d calls=%d provider=%s atm_iv=%s",
                                 snapshot.symbol, snapshot.expiration_ms,
                                 len(snapshot.puts), len(snapshot.calls),
-                                snapshot.provider,
+                                snapshot.provider, snapshot.atm_iv,
                             )
 
                         if not snapshots:
