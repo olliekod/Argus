@@ -25,7 +25,7 @@ import re
 import threading
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("argus.greeks_cache")
 
@@ -319,7 +319,7 @@ class GreeksCache:
 
 def enrich_snapshot_iv(
     snapshot: "OptionChainSnapshotEvent",
-    greeks_cache: GreeksCache,
+    greeks_cache: Any,
 ) -> "OptionChainSnapshotEvent":
     """Enrich an option chain snapshot with ATM IV from the Greeks cache.
 
@@ -343,6 +343,41 @@ def enrich_snapshot_iv(
         original snapshot if enrichment was not needed or not possible.
     """
     from .option_events import OptionChainSnapshotEvent
+
+    # Preferred path: IVConsensusEngine-compatible object
+    if hasattr(greeks_cache, "get_atm_consensus"):
+        put_res = greeks_cache.get_atm_consensus(
+            underlying=snapshot.symbol,
+            option_type="PUT",
+            expiration_ms=snapshot.expiration_ms,
+            as_of_ms=snapshot.recv_ts_ms,
+        )
+        call_res = greeks_cache.get_atm_consensus(
+            underlying=snapshot.symbol,
+            option_type="CALL",
+            expiration_ms=snapshot.expiration_ms,
+            as_of_ms=snapshot.recv_ts_ms,
+        )
+        chosen = put_res if put_res.consensus_iv is not None else call_res
+        if chosen.consensus_iv is not None:
+            return OptionChainSnapshotEvent(
+                symbol=snapshot.symbol,
+                expiration_ms=snapshot.expiration_ms,
+                underlying_price=snapshot.underlying_price,
+                underlying_bid=snapshot.underlying_bid,
+                underlying_ask=snapshot.underlying_ask,
+                puts=snapshot.puts,
+                calls=snapshot.calls,
+                n_strikes=snapshot.n_strikes,
+                atm_iv=chosen.consensus_iv,
+                timestamp_ms=snapshot.timestamp_ms,
+                source_ts_ms=snapshot.source_ts_ms,
+                recv_ts_ms=snapshot.recv_ts_ms,
+                provider=snapshot.provider,
+                snapshot_id=snapshot.snapshot_id,
+                sequence_id=snapshot.sequence_id,
+                v=snapshot.v,
+            )
 
     # Already has valid IV — no enrichment needed
     if snapshot.atm_iv is not None and snapshot.atm_iv > 0:
@@ -373,24 +408,6 @@ def enrich_snapshot_iv(
             as_of_ms=snapshot.recv_ts_ms,
             option_type="CALL",
             expiration_ms=snapshot.expiration_ms,
-        )
-
-    # Fallback: use any expiration for this underlying (we may only subscribe to one)
-    if atm_iv is None:
-        atm_iv = greeks_cache.get_atm_iv(
-            underlying=snapshot.symbol,
-            underlying_price=snapshot.underlying_price,
-            as_of_ms=snapshot.recv_ts_ms,
-            option_type="PUT",
-            expiration_ms=None,
-        )
-    if atm_iv is None:
-        atm_iv = greeks_cache.get_atm_iv(
-            underlying=snapshot.symbol,
-            underlying_price=snapshot.underlying_price,
-            as_of_ms=snapshot.recv_ts_ms,
-            option_type="CALL",
-            expiration_ms=None,
         )
 
     if atm_iv is None:

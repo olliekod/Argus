@@ -58,6 +58,7 @@ from .connectors.public_client import PublicAPIClient, PublicAPIConfig
 from .connectors.public_options import PublicOptionsConnector, PublicOptionsConfig
 from .connectors.tastytrade_streamer import TastytradeStreamer
 from .core.greeks_cache import GreeksCache, enrich_snapshot_iv
+from .core.iv_consensus import IVConsensusConfig, IVConsensusEngine
 from .strategies.spread_generator import SpreadCandidateGenerator, SpreadGeneratorConfig
 from .connectors.polymarket_gamma import PolymarketGammaClient
 from .connectors.polymarket_clob import PolymarketCLOBClient
@@ -201,6 +202,7 @@ class ArgusOrchestrator:
         self.public_options: Optional[PublicOptionsConnector] = None
         self.spread_generator: Optional[SpreadCandidateGenerator] = None
         self._greeks_cache: GreeksCache = GreeksCache()
+        self._iv_consensus = IVConsensusEngine(IVConsensusConfig(policy="prefer_dxlink"))
         self._dxlink_streamer: Optional[TastytradeStreamer] = None
         self.telegram: Optional[TelegramBot] = None
         
@@ -1627,6 +1629,30 @@ class ArgusOrchestrator:
             theta=getattr(event, "theta", None),
             vega=getattr(event, "vega", None),
         )
+        self._iv_consensus.observe_dxlink_greeks(event, recv_ts_ms=recv_ts_ms)
+
+    def get_consensus_atm_iv(self, underlying: str, option_type: str, expiration_ms: int, as_of_ms: int):
+        """Return consensus ATM IV result for strategy/risk modules."""
+        return self._iv_consensus.get_atm_consensus(
+            underlying=underlying,
+            option_type=option_type,
+            expiration_ms=expiration_ms,
+            as_of_ms=as_of_ms,
+        )
+
+    def get_consensus_contract_iv(self, underlying: str, expiration_ms: int, option_type: str, strike: float, as_of_ms: int):
+        """Return consensus per-contract IV/greeks for strategy/risk modules."""
+        from .core.iv_consensus import ContractKey
+
+        return self._iv_consensus.get_contract_consensus(
+            ContractKey(
+                underlying=underlying,
+                expiration_ms=expiration_ms,
+                option_type=option_type.upper(),
+                strike=float(strike),
+            ),
+            as_of_ms=as_of_ms,
+        )
 
     async def _poll_tastytrade_options_chains(self) -> None:
         """Poll Tastytrade for options chain snapshots via REST.
@@ -1684,8 +1710,9 @@ class ArgusOrchestrator:
                             underlying_price=underlying_price,
                         )
                         for snapshot in snapshots:
-                            # Enrich snapshot with ATM IV from DXLink Greeks cache
-                            snapshot = enrich_snapshot_iv(snapshot, self._greeks_cache)
+                            self._iv_consensus.observe_public_snapshot(snapshot, recv_ts_ms=snapshot.recv_ts_ms)
+                            # Enrich snapshot with ATM IV from consensus engine
+                            snapshot = enrich_snapshot_iv(snapshot, self._iv_consensus)
                             self.event_bus.publish(TOPIC_OPTIONS_CHAINS, snapshot)
                             self.logger.debug(
                                 "Tastytrade chain: %s exp_ms=%d puts=%d calls=%d provider=%s atm_iv=%s",
@@ -1774,7 +1801,8 @@ class ArgusOrchestrator:
                             underlying_price=underlying_price,
                         )
                         for snapshot in snapshots:
-                            snapshot = enrich_snapshot_iv(snapshot, self._greeks_cache)
+                            self._iv_consensus.observe_public_snapshot(snapshot, recv_ts_ms=snapshot.recv_ts_ms)
+                            snapshot = enrich_snapshot_iv(snapshot, self._iv_consensus)
                             self.event_bus.publish(TOPIC_OPTIONS_CHAINS, snapshot)
                             self.logger.debug(
                                 "Public chain: %s exp_ms=%d puts=%d calls=%d atm_iv=%s",
