@@ -138,3 +138,28 @@ async def test_orchestrator_wires_dxlink_streamer_callback(monkeypatch):
 
     assert captured["on_event"] == orch._on_dxlink_greeks_event
     assert "Greeks" in captured["event_types"]
+
+
+def test_discrepancy_rollup_increments_for_divergent_illiquid_symbol():
+    cfg = IVConsensusConfig(
+        policy="winner_based",
+        warn_abs_threshold=0.02,
+        warn_rel_threshold=0.10,
+        bad_abs_threshold=0.05,
+        bad_rel_threshold=0.20,
+    )
+    engine = IVConsensusEngine(cfg)
+    key = ContractKey("SPY", 1_742_515_200_000, "PUT", 595.0)
+
+    # Simulate an illiquid contract where public and dxlink diverge materially.
+    engine.observe_dxlink_greeks(_DxEvent(".SPY250321P595", 0.55, 1_000))
+    engine.observe_public_snapshot(_snap(key.expiration_ms, recv=1_050, quote_iv=0.40))
+
+    _ = engine.get_contract_consensus(key, as_of_ms=1_200)
+    rollup = engine.get_discrepancy_rollup()
+
+    assert rollup["count"] == 1
+    assert rollup["warn_count"] == 0
+    assert rollup["bad_count"] == 1
+    assert rollup["abs_p50"] is not None and rollup["abs_p50"] >= 0.15
+    assert rollup["rel_p50"] is not None and rollup["rel_p50"] >= 0.20

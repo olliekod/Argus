@@ -126,4 +126,30 @@ If the JSON has no usable prices on any put (all iv/bid/ask/mid/last zero), we c
 2. **Outcomes:** Backfill for that provider/symbol/date so the pack has `realized_vol` and `window_end_ms`.
 3. **Pack:** Use `--provider <bar_source>`, no `--snapshot-provider`, so snapshots from all providers (e.g. Alpaca + Tastytrade) are included.
 4. **Snapshots:** Either have `atm_iv` in the DB or have `quotes_json` with at least one put that has iv or mid/last/bid/ask so we can derive it; for indicative-only data, use another feed (e.g. Tastytrade) that provides greeks.
-5. **Re-run:** After backfill or pack changes, re-run the pack then the experiment so the strategy sees outcomes and (when available) IV.
+5. **Run VRP experiment:** `python scripts/run_experiment.py --strategy VRPCreditSpreadStrategy --pack <pack.json> --output logs/experiments`
+6. **Assert non-zero:** Verify trade count > 0 when IV and RV satisfy threshold (`min_vrp`). If zero, inspect snapshot IV availability and regime gating logs.
+
+
+## Cold start and illiquid symbols
+
+On cold start (fresh DB), `atm_iv` coverage is expected to be zero until first polling cycles complete. For thin/illiquid chains, provider divergence can remain elevated even after warm-up.
+
+### E2E checklist
+
+1. Run health check on an empty/new DB and confirm it reports no data:
+   - `python scripts/options_providers_health.py --db <fresh_db>`
+2. Let providers run briefly, then re-run health check and confirm snapshots appear.
+3. Compare providers over a narrow window:
+   - `python scripts/compare_options_snapshot_providers.py --symbol SPY --start YYYY-MM-DD --end YYYY-MM-DD --db <db>`
+4. If using IV consensus diagnostics from scripts/notebooks, call `IVConsensusEngine.get_discrepancy_rollup()` after feeding observations to summarize warn/bad discrepancy rates.
+
+### Known limitations
+
+- `atm_iv` may remain `0`/null until first poll results arrive.
+- DXLink timing can lag relative to REST snapshots.
+- Illiquid symbols may show persistent Public vs DXLink discrepancies.
+- Indicative-only feeds cannot always provide enough price fields for IV derivation.
+
+## Medium-Term Scope
+
+Planned but intentionally out-of-sprint: portfolio-level risk controls (exposure/correlation/drawdown), strategy lifecycle health monitoring (degradation/quarantine), and live-vs-backtest drift monitors with regression fixtures around slippage and fill-quality drift.

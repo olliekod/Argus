@@ -33,7 +33,7 @@ from src.analysis.research_loop_config import (
     ResearchLoopConfig,
     StrategySpec,
 )
-from scripts.strategy_research_loop import run_allocation
+from scripts.strategy_research_loop import run_allocation, run_cycle
 
 
 def _make_rankings() -> List[Dict[str, Any]]:
@@ -300,3 +300,52 @@ class TestRunAllocation:
         instruments = {a["strategy_id"]: a["instrument"] for a in data["allocations"]}
         assert instruments.get("VRP_v1") == "SPY"
         assert instruments.get("VRP_v2") == "QQQ"
+
+
+def test_run_cycle_writes_allocations_json_end_to_end(tmp_path, monkeypatch):
+    """run_cycle reaches Step 5 and writes allocations.json with expected schema."""
+    rankings_path = tmp_path / "rankings.json"
+    allocations_path = tmp_path / "logs" / "allocations.json"
+
+    alloc = AllocationOpts(kelly_fraction=0.25, per_play_cap=0.07, vol_target_annual=0.10)
+    config = _make_config(
+        alloc_output_path=str(allocations_path),
+        allocation=alloc,
+        equity=25_000.0,
+    )
+
+    def _fake_outcomes(_config):
+        return None
+
+    def _fake_build_packs(_config):
+        return [str(tmp_path / "pack.json")]
+
+    def _fake_run_experiments(_config, _pack_paths):
+        return None
+
+    def _fake_evaluate(_config):
+        rankings_payload = {
+            "generated_at": "2026-02-13T00:00:00Z",
+            "rankings": _make_rankings(),
+        }
+        rankings_path.write_text(json.dumps(rankings_payload), encoding="utf-8")
+        return str(rankings_path)
+
+    monkeypatch.setattr("scripts.strategy_research_loop.run_outcomes_backfill", _fake_outcomes)
+    monkeypatch.setattr("scripts.strategy_research_loop.build_packs", _fake_build_packs)
+    monkeypatch.setattr("scripts.strategy_research_loop.run_experiments", _fake_run_experiments)
+    monkeypatch.setattr("scripts.strategy_research_loop.evaluate_and_persist", _fake_evaluate)
+
+    run_cycle(config)
+
+    assert allocations_path.exists()
+    data = json.loads(allocations_path.read_text(encoding="utf-8"))
+    assert "generated_at" in data
+    assert "equity" in data
+    assert "config" in data
+    assert "allocations" in data
+    assert isinstance(data["allocations"], list)
+
+    required_fields = {"strategy_id", "instrument", "weight", "dollar_risk", "contracts"}
+    for row in data["allocations"]:
+        assert required_fields.issubset(row.keys())

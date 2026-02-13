@@ -7,6 +7,7 @@ strategy research cycle in a single command:
 2. **Replay pack build** — create packs from the database (single-symbol or universe).
 3. **Experiments** — run strategies through `ExperimentRunner` (single or parameter sweep) with optional MC/bootstrap and regime-stress.
 4. **Evaluation** — rank strategies via `StrategyEvaluator`, persist rankings, killed list, and candidate set.
+5. **Allocate** — when enabled, run `StrategyRegistry` + `AllocationEngine` and persist `allocations.json`.
 
 ## Quick start
 
@@ -35,7 +36,7 @@ edit for your environment. Key sections:
 | `outcomes` | Whether to backfill outcomes before packing, bar duration |
 | `strategies` | List of strategy classes with optional params and sweep grid |
 | `experiment` | Output dir, starting cash, MC/bootstrap settings, regime-stress toggle |
-| `evaluation` | Input dir, kill thresholds, output paths for rankings/killed/candidates |
+| `evaluation` | Input dir, kill thresholds, output paths for rankings/killed/candidates/allocations |
 | `loop` | Daemon interval, optional stale-data check |
 
 ### Date range
@@ -49,6 +50,19 @@ pack:
   # OR
   last_n_days: 7  # overrides start/end; computed from today UTC
 ```
+
+
+### Allocation config keys
+
+When `evaluation.allocation` and `evaluation.allocations_output_path` are both set, Step 5 (allocation) runs after evaluation.
+
+| Key | Purpose |
+|-----|---------|
+| `evaluation.allocation` | Allocation engine settings (`kelly_fraction`, `per_play_cap`, optional `vol_target_annual`). |
+| `evaluation.allocations_output_path` | JSON output path for allocation targets (for example `logs/allocations.json`). |
+| `evaluation.equity` | Equity base used to convert weights into dollar risk/contracts. |
+| `evaluation.min_dsr` | Candidate filter floor applied before allocation (`StrategyRegistry.load_from_rankings`). |
+| `evaluation.min_composite_score` | Additional candidate floor before allocation. |
 
 ### Parameter sweeps
 
@@ -71,6 +85,7 @@ strategies:
 | `logs/killed.json` | Strategies that failed kill thresholds (if configured) |
 | `logs/candidates.json` | Strategies that passed all kill rules (if configured) |
 | `logs/experiments/<Strategy>_regime_stress.json` | Regime-stress results (if enabled) |
+| `logs/allocations.json` | Allocation output with position sizing fields for downstream consumers |
 
 The candidate set is designed for consumption by a future StrategyLeague or
 capital allocation layer.
@@ -97,3 +112,27 @@ The loop script calls existing modules in order:
 - `src.analysis.experiment_runner.ExperimentRunner.run()` / `run_parameter_grid()`
 - `src.analysis.regime_stress.run_regime_subset_stress()`
 - `src.analysis.strategy_evaluator.StrategyEvaluator`
+
+
+### `logs/allocations.json` schema
+
+```json
+{
+  "generated_at": "...",
+  "equity": 10000.0,
+  "config": {"kelly_fraction": 0.25, "per_play_cap": 0.07, "vol_target_annual": 0.1},
+  "allocations": [
+    {"strategy_id": "...", "instrument": "SPY", "weight": 0.07, "dollar_risk": 700.0, "contracts": 2}
+  ]
+}
+```
+
+## Consuming allocations
+
+A future paper/live execution path should:
+
+1. Read `allocations.json` after each completed research cycle (poll or watch file changes).
+2. Map `(strategy_id, instrument)` into executable strategy instances/instruments in the runtime registry.
+3. Apply `weight`, `dollar_risk`, and `contracts` as sizing targets when placing paper/live orders.
+
+This keeps research/evaluation deterministic while providing a stable handoff contract for execution.
