@@ -103,6 +103,7 @@ def save_secrets(secrets: Dict[str, Any], secrets_path: str = "config/secrets.ya
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, 'w', encoding='utf-8') as f:
         yaml.safe_dump(secrets, f, sort_keys=False, default_flow_style=False)
+    path.chmod(0o600)
     return path
 
 

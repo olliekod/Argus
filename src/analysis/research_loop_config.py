@@ -92,6 +92,10 @@ class EvaluationOpts:
     candidate_set_output_path: Optional[str]
     deploy_gates: Optional[DeployGatesOpts] = None
     allocation: Optional[AllocationOpts] = None
+    allocations_output_path: Optional[str] = None
+    equity: float = 10_000.0
+    min_dsr: float = 0.0
+    min_composite_score: float = 0.0
 
 
 @dataclass
@@ -319,6 +323,12 @@ def load_research_loop_config(
         ),
         deploy_gates=deploy_gates,
         allocation=allocation,
+        allocations_output_path=_resolve_path(
+            eval_raw.get("allocations_output_path"), project_root
+        ),
+        equity=float(eval_raw.get("equity", 10_000.0)),
+        min_dsr=float(eval_raw.get("min_dsr", 0.0)),
+        min_composite_score=float(eval_raw.get("min_composite_score", 0.0)),
     )
 
     # ── Loop ───────────────────────────────────────────────────────────

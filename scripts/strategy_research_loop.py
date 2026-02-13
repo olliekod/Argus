@@ -491,6 +491,139 @@ def evaluate_and_persist(config: ResearchLoopConfig) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+#  Step 5: Allocate (optional — closes the research → allocation loop)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def run_allocation(
+    config: ResearchLoopConfig,
+    evaluator_rankings: List[Dict[str, Any]],
+) -> Optional[str]:
+    """Build Forecasts from evaluator rankings, run AllocationEngine, persist.
+
+    Returns the allocations output path, or None if allocation is skipped.
+    """
+    alloc_opts = config.evaluation.allocation
+    output_path = config.evaluation.allocations_output_path
+
+    if alloc_opts is None or output_path is None:
+        logger.info("Allocation step skipped (allocation config or output path is null).")
+        return None
+
+    from src.analysis.allocation_engine import AllocationEngine, AllocationConfig
+    from src.analysis.strategy_registry import StrategyRegistry
+    from src.analysis.sizing import Forecast
+
+    # 1. Load registry from rankings (filters by min_dsr / min_composite_score)
+    registry = StrategyRegistry()
+    registered = registry.load_from_rankings(
+        evaluator_rankings,
+        min_dsr=config.evaluation.min_dsr,
+        min_composite_score=config.evaluation.min_composite_score,
+    )
+
+    if registered == 0:
+        logger.warning("No candidates passed registry filters — skipping allocation.")
+        return None
+
+    # 2. Build Forecasts from registry entries + original ranking data
+    rankings_by_id: Dict[str, Dict[str, Any]] = {}
+    for rec in evaluator_rankings:
+        sid = rec.get("strategy_id", "")
+        if sid:
+            rankings_by_id[sid] = rec
+
+    forecasts: List[Any] = []
+    for entry in registry.candidates:
+        rec = rankings_by_id.get(entry.strategy_id, {})
+        metrics = rec.get("metrics", {})
+
+        # mu: annualized return proxy from total_return_pct
+        total_return_pct = metrics.get("total_return_pct", 0.0)
+        mu = total_return_pct / 100.0 if total_return_pct else 0.0
+
+        # sigma: use max_drawdown_pct / 2 as proxy if no rolling vol available
+        max_dd_pct = metrics.get("max_drawdown_pct", 0.0)
+        sigma = max(max_dd_pct / 200.0, 0.01)  # floor to avoid zero
+
+        # edge_score from composite_score
+        edge_score = entry.composite_score
+
+        # confidence from regime_sensitivity_score or 0.5 default
+        confidence = rec.get("regime_sensitivity_score", 0.5)
+
+        # instrument: derive from strategy_params or default
+        params = entry.params or {}
+        instrument = params.get("symbol", params.get("underlying", "UNKNOWN"))
+
+        forecast = Forecast(
+            strategy_id=entry.strategy_id,
+            instrument=instrument,
+            mu=mu,
+            sigma=sigma,
+            edge_score=edge_score,
+            cost=0.0,
+            confidence=confidence,
+            meta={
+                "run_id": entry.run_id,
+                "dsr": entry.dsr,
+                "sharpe": entry.sharpe,
+            },
+        )
+        forecasts.append(forecast)
+
+    logger.info("Built %d forecasts for allocation.", len(forecasts))
+
+    # 3. Run AllocationEngine
+    alloc_config = AllocationConfig(
+        kelly_fraction=alloc_opts.kelly_fraction,
+        per_play_cap=alloc_opts.per_play_cap,
+        vol_target_annual=alloc_opts.vol_target_annual,
+        min_edge_over_cost=alloc_opts.min_edge_over_cost,
+    )
+    engine = AllocationEngine(config=alloc_config, equity=config.evaluation.equity)
+    allocations = engine.allocate(forecasts)
+
+    # 4. Persist allocations as JSON
+    alloc_output = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "equity": config.evaluation.equity,
+        "config": {
+            "kelly_fraction": alloc_opts.kelly_fraction,
+            "per_play_cap": alloc_opts.per_play_cap,
+            "vol_target_annual": alloc_opts.vol_target_annual,
+            "min_edge_over_cost": alloc_opts.min_edge_over_cost,
+            "min_dsr": config.evaluation.min_dsr,
+            "min_composite_score": config.evaluation.min_composite_score,
+        },
+        "allocations": [
+            {
+                "strategy_id": a.strategy_id,
+                "instrument": a.instrument,
+                "weight": a.weight,
+                "dollar_risk": a.dollar_risk,
+                "kelly_raw": a.kelly_raw,
+                "vol_adjusted": a.vol_adjusted,
+                "contracts": a.contracts,
+            }
+            for a in allocations
+        ],
+    }
+
+    out = Path(output_path)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    with open(out, "w") as f:
+        json.dump(alloc_output, f, indent=2)
+
+    active = sum(1 for a in allocations if a.weight != 0)
+    logger.info(
+        "Allocations written to %s (%d active / %d total)",
+        output_path, active, len(allocations),
+    )
+    return str(out)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 #  Cycle orchestrator
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -498,8 +631,14 @@ def evaluate_and_persist(config: ResearchLoopConfig) -> str:
 def run_cycle(config: ResearchLoopConfig, dry_run: bool = False) -> None:
     """Execute one full research cycle.
 
-    Steps: resolve dates -> outcomes -> packs -> experiments -> evaluate.
+    Steps: outcomes -> packs -> experiments -> evaluate -> allocate.
     """
+    has_alloc = (
+        config.evaluation.allocation is not None
+        and config.evaluation.allocations_output_path is not None
+    )
+    n_steps = 5 if has_alloc else 4
+
     logger.info(
         "=== Research cycle starting: %s to %s, %d strategies ===",
         config.pack.start_date,
@@ -534,29 +673,43 @@ def run_cycle(config: ResearchLoopConfig, dry_run: bool = False) -> None:
             logger.info("  3. Experiment: %s sweep=%s",
                          s.strategy_class, s.sweep or "none")
         logger.info("  4. Evaluate: input=%s", config.evaluation.input_dir)
+        if has_alloc:
+            logger.info("  5. Allocate: output=%s", config.evaluation.allocations_output_path)
         logger.info("[DRY RUN] No actions taken.")
         return
 
     # Step 1: Outcomes backfill
-    logger.info("--- Step 1/4: Outcomes backfill ---")
+    logger.info("--- Step 1/%d: Outcomes backfill ---", n_steps)
     run_outcomes_backfill(config)
 
     # Step 2: Build packs
-    logger.info("--- Step 2/4: Build replay packs ---")
+    logger.info("--- Step 2/%d: Build replay packs ---", n_steps)
     pack_paths = build_packs(config)
     if not pack_paths:
         logger.error("No packs built — aborting cycle.")
         return
 
     # Step 3: Run experiments
-    logger.info("--- Step 3/4: Run experiments ---")
+    logger.info("--- Step 3/%d: Run experiments ---", n_steps)
     run_experiments(config, pack_paths)
 
     # Step 4: Evaluate and persist
-    logger.info("--- Step 4/4: Evaluate and persist ---")
+    logger.info("--- Step 4/%d: Evaluate and persist ---", n_steps)
     rankings_path = evaluate_and_persist(config)
 
-    logger.info("=== Research cycle complete. Rankings: %s ===", rankings_path)
+    # Step 5: Allocate (optional — only if allocation config + output path set)
+    alloc_path = None
+    if has_alloc and rankings_path:
+        logger.info("--- Step 5/%d: Allocate ---", n_steps)
+        # Load the rankings we just saved to get the evaluator output
+        with open(rankings_path) as f:
+            rankings_data = json.load(f)
+        alloc_path = run_allocation(config, rankings_data.get("rankings", []))
+
+    logger.info(
+        "=== Research cycle complete. Rankings: %s | Allocations: %s ===",
+        rankings_path, alloc_path or "skipped",
+    )
 
 
 # ═══════════════════════════════════════════════════════════════════════════
