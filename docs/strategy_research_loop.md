@@ -89,6 +89,49 @@ strategies:
     sweep: "config/vrp_sweep.yaml"
 ```
 
+Sweep YAML values can now be expressed as:
+- **Explicit list** (existing behavior):
+  - `max_vol_regime: ["VOL_LOW", "VOL_NORMAL"]`
+- **Range spec** (new behavior):
+  - `min_vrp: {min: 0.02, max: 0.08, step: 0.01}`
+  - `entry_threshold: {min: 0.1, max: 0.4, num_steps: 3}`
+- **Scalar convenience form** (auto-wrapped to a single-value list):
+  - `allow_alpaca_iv: true`
+
+Range spec options:
+- `min` and `max` are required.
+- Use either `step` (positive only) or `num_steps` (integer >= 1).
+- `num_steps: N` yields `N+1` points including both endpoints.
+- Optional `round: <int>` rounds each generated point.
+- If `round` is omitted, decimals are inferred from `step`; otherwise default is 4.
+
+#### VRP coarse sweep example
+
+A ready-to-copy version lives at `config/vrp_sweep.example.yaml`.
+
+```yaml
+min_vrp:
+  min: 0.02
+  max: 0.08
+  step: 0.01
+max_vol_regime: ["VOL_LOW", "VOL_NORMAL"]
+avoid_trend: ["TREND_DOWN"]
+allow_alpaca_iv: [true, false]
+```
+
+#### VRP refinement sweep example
+
+```yaml
+min_vrp:
+  min: 0.045
+  max: 0.065
+  step: 0.005
+  round: 3
+max_vol_regime: ["VOL_LOW"]
+avoid_trend: ["TREND_DOWN"]
+allow_alpaca_iv: [true]
+```
+
 ## Outputs
 
 | File | Description |

@@ -1,0 +1,8 @@
+# VRP coarse sweep defaults
+min_vrp:
+  min: 0.02
+  max: 0.08
+  step: 0.01
+max_vol_regime: ["VOL_LOW", "VOL_NORMAL"]
+avoid_trend: ["TREND_DOWN"]
+allow_alpaca_iv: [true, false]
