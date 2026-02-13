@@ -52,6 +52,7 @@ from src.analysis.research_loop_config import (
     ResearchLoopConfig,
     load_research_loop_config,
 )
+from src.analysis.sweep_grid import expand_sweep_grid
 
 logging.basicConfig(
     level=logging.INFO,
@@ -315,7 +316,7 @@ def run_experiments(config: ResearchLoopConfig, pack_paths: List[str]) -> None:
                 )
             else:
                 with open(sweep_path) as f:
-                    grid = yaml.safe_load(f)
+                    grid = expand_sweep_grid(yaml.safe_load(f))
                 logger.info(
                     "Running parameter sweep from %s", spec.sweep,
                 )
