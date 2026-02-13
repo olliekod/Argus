@@ -153,3 +153,55 @@ On cold start (fresh DB), `atm_iv` coverage is expected to be zero until first p
 ## Medium-Term Scope
 
 Planned but intentionally out-of-sprint: portfolio-level risk controls (exposure/correlation/drawdown), strategy lifecycle health monitoring (degradation/quarantine), and live-vs-backtest drift monitors with regression fixtures around slippage and fill-quality drift.
+
+
+## Sprint 2 E2E check results (2026-02-13)
+
+### Commands executed
+
+```bash
+python scripts/options_providers_health.py --symbol IBIT --hours 24
+python scripts/compare_options_snapshot_providers.py --symbol IBIT --start 2026-02-11 --end 2026-02-11
+python scripts/verify_vrp_replay.py --symbol IBIT --start 2026-02-11 --end 2026-02-11 --provider alpaca
+python scripts/verify_vrp_replay.py --symbol SPY --start 2026-02-11 --end 2026-02-11 --provider alpaca
+python -m pytest tests/test_iv_consensus_engine.py -q
+python -m pytest tests -q
+```
+
+### Output summary
+
+- Provider health (IBIT, last 24h): **NO DATA** for both Public and Tastytrade in `data/argus.db`.
+- Provider comparison (IBIT, 2026-02-11): `pair_count=0`, `atm_iv_pair_count=0`, recommendation says insufficient overlap.
+- VRP replay verify script:
+  - IBIT pack: `bars_count=0`, `outcomes_count=0`, `snapshots_count=0`, `trade_count=0` (exit code 1 with diagnostics).
+  - SPY pack: `bars_count=0`, `outcomes_count=0`, `snapshots_count=0`, `trade_count=0` (exit code 1 with diagnostics).
+- Deterministic IV consensus tests pass locally, including expiry isolation, freshness gating, discrepancy rollup metrics, and selected-source/quality behavior.
+
+### Pass criteria for this check
+
+This Sprint 2 E2E check is considered a **pass** when all of the following are true:
+
+1. `verify_vrp_replay.py` reports non-zero bars/outcomes/snapshots for the requested window.
+2. `verify_vrp_replay.py` reports `trade_count >= 1` for a window where VRP condition is expected.
+3. `options_providers_health.py` reports data present after warm-up.
+4. `compare_options_snapshot_providers.py` returns non-zero overlap (`pair_count > 0`) and usable IV comparison (`atm_iv_pair_count > 0`).
+5. IV consensus deterministic tests stay green (expiry isolation, freshness gating, discrepancy rollup).
+
+### Issues found and minimal fixes applied
+
+- Added a repeatable runner script: `scripts/verify_vrp_replay.py`.
+  - It builds a replay pack from CLI args, runs `VRPCreditSpreadStrategy`, prints counts, and emits actionable zero-trade diagnostics.
+- Added a deterministic consensus assertion in `tests/test_iv_consensus_engine.py` to verify `selected_source` and `iv_quality` in a high-discrepancy winner-based scenario.
+- In this local environment, DB data for the requested windows/providers is absent, so the script correctly fails fast with clear root-cause diagnostics instead of silently succeeding with zero trades.
+
+### How to run the new verifier
+
+```bash
+python scripts/verify_vrp_replay.py --symbol <SYMBOL> --start YYYY-MM-DD --end YYYY-MM-DD --provider <bars_provider> [--pack_out <path>] [--db data/argus.db]
+```
+
+Example:
+
+```bash
+python scripts/verify_vrp_replay.py --symbol IBIT --start 2026-02-11 --end 2026-02-11 --provider alpaca
+```
