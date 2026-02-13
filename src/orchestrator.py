@@ -123,8 +123,8 @@ class ArgusOrchestrator:
         # Recent log lines ring buffer for dashboard (must be before logger setup)
         self._recent_logs: deque = deque(maxlen=200)
 
-        # Setup logging
-        log_level = self.config.get('system', {}).get('log_level', 'INFO')
+        # Setup logging (ARGUS_LOG_LEVEL env overrides config, e.g. for: python main.py --log-level DEBUG)
+        log_level = os.environ.get('ARGUS_LOG_LEVEL') or self.config.get('system', {}).get('log_level', 'INFO')
         setup_logger('argus', level=log_level, ring_buffer=self._recent_logs)
         self.logger = get_logger('orchestrator')
 
@@ -1445,7 +1445,11 @@ class ArgusOrchestrator:
                                     detector.update_btc_iv(data.get('atm_iv', 0))
                             
             except Exception as e:
-                self.logger.error(f"Deribit polling error: {e}")
+                self.logger.error(
+                    "Deribit polling error (%s): %s",
+                    type(e).__name__, e,
+                )
+                self.logger.debug("Deribit polling error detail", exc_info=True)
                 now = time.time()
                 if (now - self._deribit_traceback_ts) >= 60:
                     self._deribit_traceback_ts = now
@@ -1536,7 +1540,11 @@ class ArgusOrchestrator:
 
             except Exception as e:
                 consecutive_errors += 1
-                self.logger.error("Alpaca options polling error (consecutive=%d): %s", consecutive_errors, e)
+                self.logger.error(
+                    "Alpaca options polling error (consecutive=%d) (%s): %s",
+                    consecutive_errors, type(e).__name__, e,
+                )
+                self.logger.debug("Alpaca options polling error detail", exc_info=True)
                 if consecutive_errors >= 3:
                     backoff = min(interval * consecutive_errors, 300)
                     self.logger.warning(
@@ -1589,7 +1597,11 @@ class ArgusOrchestrator:
         except asyncio.CancelledError:
             raise
         except Exception as exc:
-            self.logger.error("DXLink Greeks streamer failed: %s", exc)
+            self.logger.error(
+                "DXLink Greeks streamer failed (%s): %s",
+                type(exc).__name__, exc,
+            )
+            self.logger.debug("DXLink Greeks streamer failure detail", exc_info=True)
 
     def _on_dxlink_greeks_event(self, event: Any) -> None:
         """Handle DXLink Greeks events by caching IV and Greeks.
@@ -1647,14 +1659,21 @@ class ArgusOrchestrator:
 
                 for symbol in symbols:
                     try:
-                        # Fetch underlying price from Alpaca if available (for ATM IV calc)
+                        # Underlying price for ATM IV enrichment: Alpaca Options quote, else latest bar close from DB (alpaca bars)
                         underlying_price = 0.0
                         if self.alpaca_options:
                             try:
                                 price, _, _ = await self.alpaca_options.get_underlying_quote(symbol)
                                 underlying_price = price
                             except Exception:
-                                pass  # Best-effort; Tastytrade snapshots work without it
+                                pass
+                        if underlying_price <= 0 and self.db:
+                            try:
+                                close = await self.db.get_latest_bar_close("alpaca", symbol, bar_duration=60)
+                                if close and close > 0:
+                                    underlying_price = close
+                            except Exception:
+                                pass
 
                         # Run sync REST call in thread to avoid blocking event loop
                         snapshots = await asyncio.to_thread(
@@ -1687,16 +1706,21 @@ class ArgusOrchestrator:
                                 warning_count = 0
 
                     except Exception as e:
-                        self.logger.error("Tastytrade polling error for %s: %s", symbol, e)
+                        self.logger.error(
+                            "Tastytrade polling error for %s (%s): %s",
+                            symbol, type(e).__name__, e,
+                        )
+                        self.logger.debug("Tastytrade polling error detail for %s", symbol, exc_info=True)
 
                 consecutive_errors = 0
 
             except Exception as e:
                 consecutive_errors += 1
                 self.logger.error(
-                    "Tastytrade options polling loop error (consecutive=%d): %s",
-                    consecutive_errors, e,
+                    "Tastytrade options polling loop error (consecutive=%d) (%s): %s",
+                    consecutive_errors, type(e).__name__, e,
                 )
+                self.logger.debug("Tastytrade options loop error detail", exc_info=True)
                 # Back off if we're getting repeated failures
                 if consecutive_errors >= 3:
                     backoff = min(interval * consecutive_errors, 300)
@@ -1729,12 +1753,28 @@ class ArgusOrchestrator:
 
                 for symbol in symbols:
                     try:
+                        underlying_price = 0.0
+                        if self.alpaca_options:
+                            try:
+                                p, _, _ = await self.alpaca_options.get_underlying_quote(symbol)
+                                underlying_price = p
+                            except Exception:
+                                pass
+                        if underlying_price <= 0 and self.db:
+                            try:
+                                close = await self.db.get_latest_bar_close("alpaca", symbol, bar_duration=60)
+                                if close and close > 0:
+                                    underlying_price = close
+                            except Exception:
+                                pass
                         snapshots = await self.public_options.build_snapshots_for_symbol(
                             symbol,
                             min_dte=min_dte,
                             max_dte=max_dte,
+                            underlying_price=underlying_price,
                         )
                         for snapshot in snapshots:
+                            snapshot = enrich_snapshot_iv(snapshot, self._greeks_cache)
                             self.event_bus.publish(TOPIC_OPTIONS_CHAINS, snapshot)
                             self.logger.debug(
                                 "Public chain: %s exp_ms=%d puts=%d calls=%d atm_iv=%s",
@@ -1745,16 +1785,20 @@ class ArgusOrchestrator:
                                 snapshot.atm_iv,
                             )
                     except Exception as exc:
-                        self.logger.error("Public options polling error for %s: %s", symbol, exc)
+                        self.logger.error(
+                            "Public options polling error for %s (%s): %s",
+                            symbol, type(exc).__name__, exc,
+                        )
+                        self.logger.debug("Public options polling error detail for %s", symbol, exc_info=True)
 
                 consecutive_errors = 0
             except Exception as exc:
                 consecutive_errors += 1
                 self.logger.error(
-                    "Public options polling loop error (consecutive=%d): %s",
-                    consecutive_errors,
-                    exc,
+                    "Public options polling loop error (consecutive=%d) (%s): %s",
+                    consecutive_errors, type(exc).__name__, exc,
                 )
+                self.logger.debug("Public options loop error detail", exc_info=True)
                 if consecutive_errors >= 3:
                     backoff = min(interval * consecutive_errors, 300)
                     await asyncio.sleep(backoff)
@@ -2835,7 +2879,7 @@ class ArgusOrchestrator:
                     getattr(self, "_tastytrade_options_symbols", []),
                     getattr(self, "_tastytrade_options_min_dte", 7),
                     getattr(self, "_tastytrade_options_max_dte", 21),
-                    80,
+                    10_000,  # dxFeed allows 100k; distribute equally among equities for IV enrichment
                 )
                 self._dxlink_greeks_symbols = dxlink_symbols if dxlink_symbols else getattr(self, "_tastytrade_options_symbols", [])
                 if dxlink_symbols:
@@ -2943,7 +2987,11 @@ class ArgusOrchestrator:
 
                 await asyncio.sleep(interval)
             except Exception as e:
-                self.logger.error(f"Yahoo market-hours poll error: {e}")
+                self.logger.error(
+                    "Yahoo market-hours poll error (%s): %s",
+                    type(e).__name__, e,
+                )
+                self.logger.debug("Yahoo market-hours poll error detail", exc_info=True)
                 await asyncio.sleep(60)
 
     async def _poll_alpaca_market_hours_aware(self) -> None:
@@ -2974,7 +3022,11 @@ class ArgusOrchestrator:
 
                 await asyncio.sleep(interval)
             except Exception as e:
-                self.logger.error(f"Alpaca market-hours poll error: {e}")
+                self.logger.error(
+                    "Alpaca market-hours poll error (%s): %s",
+                    type(e).__name__, e,
+                )
+                self.logger.debug("Alpaca market-hours poll error detail", exc_info=True)
                 await asyncio.sleep(60)
 
     # ── Heartbeat publisher ───────────────────────────────

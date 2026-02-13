@@ -338,7 +338,8 @@ class AlpacaDataClient:
                     )
                 
             except Exception as e:
-                logger.error("Error polling %s: %s", symbol, e)
+                logger.error("Error polling %s (%s): %s", symbol, type(e).__name__, e)
+                logger.debug("Alpaca poll_once error detail for %s", symbol, exc_info=True)
             
             # Small delay between symbols to avoid rate limits
             await asyncio.sleep(0.5)
@@ -370,7 +371,8 @@ class AlpacaDataClient:
                 if emitted > 0:
                     logger.info("Alpaca poll: emitted %d new bars", emitted)
             except Exception as e:
-                logger.error("Alpaca polling error: %s", e)
+                logger.error("Alpaca polling error (%s): %s", type(e).__name__, e)
+                logger.debug("Alpaca polling error detail", exc_info=True)
             
             await asyncio.sleep(self._poll_interval)
     

@@ -280,6 +280,7 @@ class BybitWebSocket:
             await self._handle_ticker(data)
 
     async def _handle_ticker(self, data: Dict[str, Any]) -> None:
+        """Handle ticker message. Only publish a quote when current message has valid bid and ask (no filling from stale data)."""
         try:
             ticker_data = data.get('data', {})
             symbol = ticker_data.get('symbol', '')
@@ -289,18 +290,21 @@ class BybitWebSocket:
             bid, bid_err = self._coerce_float(bid_raw)
             ask, ask_err = self._coerce_float(ask_raw)
             last, last_err = self._coerce_float(last_raw)
+            # Require both bid and ask in this message for a valid quote (no synthetic/stale fill)
             invalid_reason = None
-            if bid_err or ask_err or last_err:
-                if "missing" in (bid_err, ask_err, last_err):
+            if bid_err or ask_err:
+                if bid_err == "missing" or ask_err == "missing":
                     invalid_reason = "missing_fields"
                 else:
                     invalid_reason = "non_numeric"
-            else:
+            elif last_err and last_err != "missing":
+                invalid_reason = "non_numeric"
+            elif bid is not None and ask is not None:
                 if bid <= 0 or ask <= 0:
                     invalid_reason = "zero_bidask"
                 elif bid > ask:
                     invalid_reason = "crossed"
-                elif last <= 0 and (bid <= 0 or ask <= 0):
+                elif last is not None and last <= 0 and (bid <= 0 or ask <= 0):
                     invalid_reason = "zero_bidask"
             if invalid_reason:
                 self._record_invalid_quote(
@@ -312,7 +316,8 @@ class BybitWebSocket:
                 )
             bid = bid if bid is not None else 0.0
             ask = ask if ask is not None else 0.0
-            last = last if last is not None else 0.0
+            # Use mid for last only when we have both bid and ask in this message (same-message derivation, not stale)
+            last = last if last is not None else ((bid + ask) / 2 if (bid and ask) else 0.0)
             parsed = {
                 'symbol': symbol,
                 'timestamp': datetime.now(timezone.utc).isoformat(),
@@ -344,7 +349,8 @@ class BybitWebSocket:
                     else:
                         self.on_ticker(parsed)
                 except Exception as e:
-                    logger.error(f"Ticker callback error: {e}")
+                    logger.error("Ticker callback error (%s): %s", type(e).__name__, e)
+                    logger.debug("Bybit ticker callback error detail", exc_info=True)
             if self.on_funding and parsed['funding_rate'] != 0:
                 try:
                     if asyncio.iscoroutinefunction(self.on_funding):
@@ -352,7 +358,8 @@ class BybitWebSocket:
                     else:
                         self.on_funding(self.funding_rates[symbol])
                 except Exception as e:
-                    logger.error(f"Funding callback error: {e}")
+                    logger.error("Funding callback error (%s): %s", type(e).__name__, e)
+                    logger.debug("Bybit funding callback error detail", exc_info=True)
 
             # Publish QuoteEvent to the event bus (price-only)
             if self._event_bus is not None:
@@ -399,9 +406,11 @@ class BybitWebSocket:
                             value=oi, timestamp=now, source='bybit',
                         ))
                 except Exception as e:
-                    logger.error(f"QuoteEvent publish error: {e}")
+                    logger.error("QuoteEvent publish error (%s): %s", type(e).__name__, e)
+                    logger.debug("Bybit QuoteEvent publish error detail", exc_info=True)
         except Exception as e:
-            logger.error(f"Error parsing ticker: {e}")
+            logger.error("Error parsing ticker (%s): %s", type(e).__name__, e)
+            logger.debug("Bybit ticker parse error detail", exc_info=True)
 
     @staticmethod
     def _coerce_float(value: Any) -> Tuple[Optional[float], Optional[str]]:

@@ -374,6 +374,7 @@ class TastytradeStreamer:
 
         if is_error(frame):
             logger.error("DXLink error: %s", raw)
+            logger.debug("DXLink error frame (raw): %s", raw)
             return
 
         logger.debug("Unhandled frame type: %s", frame.msg_type)

@@ -5,9 +5,10 @@ Argus Logger Module
 Structured logging with size-based rotating file handlers,
 configurable console/file levels, and uptime tracking.
 
-Config variables (env or config.yaml):
+Config: env vars, or config.yaml system.log_level, or:  python main.py --log-level DEBUG
   LOG_LEVEL_CONSOLE  (default INFO)
   LOG_LEVEL_FILE     (default DEBUG)
+  ARGUS_LOG_LEVEL    (overrides both when set, e.g. by main.py --log-level)
   LOG_DIR            (default data/logs)
   LOG_MAX_BYTES      (default 50MB)
   LOG_BACKUP_COUNT   (default 10)
@@ -136,8 +137,9 @@ def setup_logger(
         return logger
 
     log_dir = log_dir or LOG_DIR
-    console_level = console_level or LOG_LEVEL_CONSOLE
-    file_level = file_level or LOG_LEVEL_FILE
+    # Single 'level' sets both console and file when console_level/file_level not explicitly set
+    console_level = (console_level or level or LOG_LEVEL_CONSOLE).upper()
+    file_level = (file_level or level or LOG_LEVEL_FILE).upper()
     max_bytes = max_bytes or LOG_MAX_BYTES
     backup_count = backup_count or LOG_BACKUP_COUNT
 
@@ -145,7 +147,7 @@ def setup_logger(
 
     # --- Console (less verbose by default) ---
     console_handler = logging.StreamHandler(sys.stdout)
-    console_handler.setLevel(getattr(logging, console_level.upper(), logging.INFO))
+    console_handler.setLevel(getattr(logging, console_level, logging.INFO))
     console_handler.setFormatter(ColoredFormatter(
         '%(asctime)s [%(uptime)s] %(levelname)s %(name)s  %(message)s',
         datefmt='%H:%M:%S',
@@ -162,7 +164,7 @@ def setup_logger(
         backupCount=backup_count,
         encoding='utf-8',
     )
-    file_handler.setLevel(getattr(logging, file_level.upper(), logging.DEBUG))
+    file_handler.setLevel(getattr(logging, file_level, logging.DEBUG))
     file_handler.setFormatter(StructuredFormatter(
         '%(asctime)s [%(uptime)s] %(levelname)-8s %(name)s  %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S',

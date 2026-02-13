@@ -529,7 +529,8 @@ class DeribitClient:
                         extra={'sample_size': len(atm_iv_values)},
                     ))
             except Exception as e:
-                logger.error(f"QuoteEvent publish error: {e}")
+                logger.error("QuoteEvent publish error (%s): %s", type(e).__name__, e)
+                logger.debug("Deribit QuoteEvent publish error detail", exc_info=True)
 
         return result
     
@@ -558,7 +559,8 @@ class DeribitClient:
                     else:
                         callback(data)
             except Exception as e:
-                logger.error(f"Error polling IV: {e}")
+                logger.error("Error polling IV (%s): %s", type(e).__name__, e)
+                logger.debug("Deribit IV polling error detail", exc_info=True)
             
             await asyncio.sleep(interval_seconds)
 

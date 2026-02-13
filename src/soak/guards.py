@@ -56,7 +56,7 @@ _DEFAULTS: Dict[str, Any] = {
     # Bar flush failures
     "bar_flush_failure_threshold": 1,
 
-    # Log flood
+    # Log flood (rate = errors_last_hour / 60; keep threshold; fix source errors in hot paths)
     "log_error_flood_threshold_per_min": 50,
     "log_error_flood_window_min": 5,
 
@@ -405,6 +405,7 @@ class SoakGuardian:
     def _check_bar_flush_failures(
         self, persist_status: Dict, now: float
     ) -> List[Dict[str, Any]]:
+        """Alert when persistence has bar flush failures. error_count is cumulative (lifetime)."""
         guard = "bar_flush_failures"
         error_count = persist_status.get("counters", {}).get("error_count", 0)
         last_error = persist_status.get("last_error")
@@ -421,13 +422,15 @@ class SoakGuardian:
     def _check_log_flood(
         self, resource: Dict, now: float
     ) -> List[Dict[str, Any]]:
+        """Alert when ERROR log rate (last hour / 60) exceeds threshold.
+        Recoverable/hot-path failures should be logged as WARNING to avoid flooding."""
         guard = "log_flood"
         log = resource.get("log_entropy", {})
         errors_last_hour = log.get("errors_last_hour", 0)
         threshold = self._cfg["log_error_flood_threshold_per_min"]
         window_min = self._cfg["log_error_flood_window_min"]
 
-        # Approximate: errors in last hour, check rate
+        # Rate = errors in last hour / 60 (per-minute average)
         rate_per_min = errors_last_hour / 60.0
         if rate_per_min > threshold:
             return self._fire(

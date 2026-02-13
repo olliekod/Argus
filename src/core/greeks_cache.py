@@ -366,13 +366,31 @@ def enrich_snapshot_iv(
     )
 
     if atm_iv is None:
-        # Try calls as secondary
+        # Try calls as secondary (same expiration)
         atm_iv = greeks_cache.get_atm_iv(
             underlying=snapshot.symbol,
             underlying_price=snapshot.underlying_price,
             as_of_ms=snapshot.recv_ts_ms,
             option_type="CALL",
             expiration_ms=snapshot.expiration_ms,
+        )
+
+    # Fallback: use any expiration for this underlying (we may only subscribe to one)
+    if atm_iv is None:
+        atm_iv = greeks_cache.get_atm_iv(
+            underlying=snapshot.symbol,
+            underlying_price=snapshot.underlying_price,
+            as_of_ms=snapshot.recv_ts_ms,
+            option_type="PUT",
+            expiration_ms=None,
+        )
+    if atm_iv is None:
+        atm_iv = greeks_cache.get_atm_iv(
+            underlying=snapshot.symbol,
+            underlying_price=snapshot.underlying_price,
+            as_of_ms=snapshot.recv_ts_ms,
+            option_type="CALL",
+            expiration_ms=None,
         )
 
     if atm_iv is None:

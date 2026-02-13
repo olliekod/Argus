@@ -108,6 +108,7 @@ class PublicOptionsConnector:
         *,
         min_dte: int = 7,
         max_dte: int = 21,
+        underlying_price: float = 0.0,
     ) -> List[OptionChainSnapshotEvent]:
         """Build Public-based snapshots using Alpaca or Tastytrade structure."""
         snapshots: List[OptionChainSnapshotEvent] = []
@@ -153,7 +154,7 @@ class PublicOptionsConnector:
                 symbol,
                 exp_date,
                 normalized,
-                0.0,
+                underlying_price,
             )
             if not structure_snapshot:
                 continue

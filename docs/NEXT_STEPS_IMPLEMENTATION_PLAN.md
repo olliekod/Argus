@@ -2,7 +2,7 @@
 
 **Source:** MASTER_PLAN.md §8.4, §8.1, §8.3  
 **Created:** 2026-02-13  
-**Status:** Draft
+**Status:** Implemented (verified 2026-02-13)
 
 This document translates the Master Plan’s recommended next steps into a concrete implementation plan. It covers: (1) closing the research–allocation loop, (2) P1 audit items, (3) P2 quick wins, and (4) future phases.
 
@@ -63,9 +63,9 @@ From each ranking record:
 
 ### 1.5 Acceptance Criteria
 
-- [ ] Running `strategy_research_loop.py --once` with `evaluation.allocation` and `allocations_output_path` produces `allocations.json`.
-- [ ] Allocations include strategy_id, instrument, weight, dollar_risk, contracts where applicable.
-- [ ] No allocation step runs if `evaluation.allocation` is null or `allocations_output_path` is null (backward compatible).
+- [x] Running `strategy_research_loop.py --once` with `evaluation.allocation` and `allocations_output_path` produces `allocations.json`.
+- [x] Allocations include strategy_id, instrument, weight, dollar_risk, contracts where applicable.
+- [x] No allocation step runs if `evaluation.allocation` is null or `allocations_output_path` is null (backward compatible).
 
 ---
 
@@ -74,24 +74,24 @@ From each ranking record:
 ### 2.1 10.2 Deribit Rate Limiter (`.total_seconds()`)
 
 **File:** `src/connectors/deribit_client.py`  
-**Status:** Verify — codebase shows `total_seconds()` at lines 79, 84. Audit may be outdated.
+**Status:** Verified — codebase uses `total_seconds()` at lines 79, 84; no `.seconds` on timedelta.
 
-| # | Task | Description |
-|---|------|-------------|
-| 2.1a | Audit deribit_client.py | Grep for `.seconds` on timedelta; replace with `.total_seconds()` if any remain. |
-| 2.1b | Add unit test | `tests/test_deribit_client.py`: Test that rate limiter correctly waits when limit exceeded (mock time). |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 2.1a | Audit deribit_client.py | Grep for `.seconds` on timedelta; replace with `.total_seconds()` if any remain. | Yes — none remain |
+| 2.1b | Add unit test | `tests/test_deribit_client.py`: Test that rate limiter correctly waits when limit exceeded (mock time). | Yes — `tests/test_deribit_rate_limiter.py` |
 
 ### 2.2 10.4 Orchestrator Task Tracking
 
 **File:** `src/orchestrator.py`  
 **Goal:** Ensure every `asyncio.create_task()` used for long-running work is appended to `self._tasks` and that `stop()` cancels and awaits them.
 
-| # | Task | Description |
-|---|------|-------------|
-| 2.2a | Inventory create_task call sites | List all `create_task` in `orchestrator.py`. Exclude signal_handler’s `create_task(argus.stop())` — that one triggers shutdown, not a tracked task. |
-| 2.2b | Verify run() tasks | Confirm all tasks created in `run()` are appended to `self._tasks`. |
-| 2.2c | Verify stop() behavior | Ensure `stop()` cancels and awaits `self._tasks` (e.g. `asyncio.gather(*self._tasks, return_exceptions=True)` or equivalent). |
-| 2.2d | Document findings | Add a short comment or docstring in orchestrator describing the task-tracking invariant. |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 2.2a | Inventory create_task call sites | List all `create_task` in `orchestrator.py`. Exclude signal_handler’s `create_task(argus.stop())` — that one triggers shutdown, not a tracked task. | Yes — all run() tasks appended; only 3118 is excluded |
+| 2.2b | Verify run() tasks | Confirm all tasks created in `run()` are appended to `self._tasks`. | Yes |
+| 2.2c | Verify stop() behavior | Ensure `stop()` cancels and awaits `self._tasks` (e.g. `asyncio.gather(*self._tasks, return_exceptions=True)` or equivalent). | Yes — stop() cancels and gathers _tasks; telegram stopped explicitly |
+| 2.2d | Document findings | Add a short comment or docstring in orchestrator describing the task-tracking invariant. | Yes — lines 221–223 |
 
 ---
 
@@ -104,20 +104,20 @@ From each ranking record:
 
 **Note:** ExperimentRunner creates a fresh harness and execution model per run, so accumulation is unlikely. This is a defensive fix. ExecutionModel already has `reset()` — we only need to call it.
 
-| # | Task | Description |
-|---|------|-------------|
-| 3.1a | Call reset at start of run | `replay_harness.py`: At top of `run()`, call `self.execution_model.reset()`. |
-| 3.1b | Add test | Verify that two consecutive `harness.run()` calls produce independent results (no cross-run state). |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 3.1a | Call reset at start of run | `replay_harness.py`: At top of `run()`, call `self.execution_model.reset()`. | Yes — `self._exec.reset()` at start of `run()` |
+| 3.1b | Add test | Verify that two consecutive `harness.run()` calls produce independent results (no cross-run state). | Yes — `tests/test_replay_reset.py` |
 
 ### 3.2 10.8 Secrets File Permissions
 
 **File:** `src/core/config.py`  
 **Task:** After writing the secrets file, set permissions to `0o600` so only the owner can read.
 
-| # | Task | Description |
-|---|------|-------------|
-| 3.2a | Add chmod after write | `path.chmod(0o600)` after writing secrets. |
-| 3.2b | Add test | `tests/test_config.py`: Verify that a written secrets file has mode `0o600`. |
+| # | Task | Description | Done |
+|---|------|-------------|------|
+| 3.2a | Add chmod after write | `path.chmod(0o600)` after writing secrets. | Yes — `config.py` line 106 |
+| 3.2b | Add test | `tests/test_config.py`: Verify that a written secrets file has mode `0o600`. | Yes — `tests/test_secrets_permissions.py` |
 
 ---
 
@@ -152,7 +152,19 @@ These will be scoped in separate implementation plans when prioritized.
 
 ---
 
-## 6. References
+## 6. Verification Summary (2026-02-13)
+
+All items in §§1–3 were verified against the codebase:
+
+- **§1 Research–Allocation loop:** `scripts/strategy_research_loop.py` defines `run_allocation()`, calls `registry.load_from_rankings()`, builds `Forecast`s, runs `AllocationEngine`, writes JSON to `allocations_output_path`. Cycle calls it when `evaluation.allocation` and `allocations_output_path` are set. Config: `research_loop_config.py` has `allocations_output_path`, `equity`, `min_dsr`, `min_composite_score`; `research_loop.example.yaml` documents them.
+- **§2.1 Deribit:** `deribit_client.py` uses `.total_seconds()` only; `tests/test_deribit_rate_limiter.py` covers rate limiter.
+- **§2.2 Orchestrator:** All `create_task()` in `run()` are appended to `self._tasks`; `stop()` calls `telegram.stop_polling()` then cancels and awaits `self._tasks`. Invariant documented at lines 221–223.
+- **§3.1 Replay reset:** `replay_harness.py` calls `self._exec.reset()` at start of `run()`; `tests/test_replay_reset.py` verifies reset is called.
+- **§3.2 Secrets:** `config.save_secrets()` calls `path.chmod(0o600)`; `tests/test_secrets_permissions.py` asserts mode `0o600`.
+
+---
+
+## 7. References
 
 - [MASTER_PLAN.md](../MASTER_PLAN.md) §8.4 Next steps and recommended route
 - [strategy_research_loop.md](strategy_research_loop.md) — Research loop usage

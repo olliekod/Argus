@@ -271,9 +271,11 @@ class YahooFinanceClient:
                             )
                             self._event_bus.publish(TOPIC_MARKET_QUOTES, quote)
                         except Exception as e:
-                            logger.error(f"QuoteEvent publish error: {e}")
+                            logger.error("QuoteEvent publish error (%s): %s", type(e).__name__, e)
+                            logger.debug("Yahoo QuoteEvent publish error detail", exc_info=True)
             except Exception as e:
-                logger.error(f"Yahoo poll_once error for {symbol}: {e}")
+                logger.error("Yahoo poll_once error for %s (%s): %s", symbol, type(e).__name__, e)
+                logger.debug("Yahoo poll_once error detail for %s", symbol, exc_info=True)
             await asyncio.sleep(1)
 
     async def poll(self, interval_seconds: int = 60) -> None:
@@ -290,7 +292,8 @@ class YahooFinanceClient:
             try:
                 await self.poll_once()
             except Exception as e:
-                logger.error(f"Yahoo polling error: {e}")
+                logger.error("Yahoo polling error (%s): %s", type(e).__name__, e)
+                logger.debug("Yahoo polling error detail", exc_info=True)
 
             await asyncio.sleep(interval_seconds)
     

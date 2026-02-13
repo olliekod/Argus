@@ -15,7 +15,7 @@ from typing import Any, Callable, Dict, List, Optional
 import httpx
 from telegram import Bot, Update
 from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
-from telegram.error import TelegramError, NetworkError, TimedOut
+from telegram.error import TelegramError, NetworkError, TimedOut, Conflict
 
 from ..core.logger import get_alert_logger
 from ..core.status import build_status
@@ -278,6 +278,9 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
 
             if self._polling_stop_event.is_set():
                 break
+            # Post-shutdown delay so Telegram API can release the getUpdates
+            # connection before we start again (reduces Conflict / ReadTimeout).
+            await self._sleep_with_stop(3.0)
 
     async def _wait_for_polling_signal(self) -> None:
         stop_task = asyncio.create_task(self._polling_stop_event.wait())
@@ -309,7 +312,15 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
 
     @staticmethod
     def _polling_retry_exceptions():
-        return (NetworkError, TimedOut, httpx.RemoteProtocolError, httpx.TimeoutException, asyncio.TimeoutError, TimeoutError)
+        return (
+            NetworkError,
+            TimedOut,
+            Conflict,
+            httpx.RemoteProtocolError,
+            httpx.TimeoutException,
+            asyncio.TimeoutError,
+            TimeoutError,
+        )
 
     @staticmethod
     def _compute_backoff(attempt: int) -> float:
@@ -329,6 +340,9 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         if error is not None:
             self._polling_last_error = str(error)
         delay = self._compute_backoff(attempt)
+        # Conflict = another getUpdates in flight; use longer backoff so only one instance runs
+        if isinstance(error, Conflict):
+            delay = max(delay, 10.0)
         self._rate_limited_polling_warning(error, delay)
         await self._sleep_with_stop(delay)
         return delay

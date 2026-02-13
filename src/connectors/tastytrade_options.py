@@ -341,6 +341,9 @@ class TastytradeOptionsConnector:
         samples streamer_symbol (e.g. .SPY250321P590) for near-ATM options in
         the given DTE range.
 
+        max_total is an application cap only. dxFeed allows up to 100,000
+        concurrent subscriptions; typical use is a few hundred symbols.
+
         Returns:
             List of symbols suitable for TastytradeStreamer(symbols=..., event_types=["Greeks"]).
         """
@@ -378,8 +381,9 @@ class TastytradeOptionsConnector:
             # Prefer puts for ATM IV; sample by unique (expiry, strike) and streamer symbol
             # Sort by expiry then strike so we get front month and a spread of strikes
             in_range.sort(key=lambda x: (x.get("expiry") or "", x.get("strike") or 0))
-            # Take up to max_per underlying, favoring variety of strikes
-            per_underlying = max(20, (max_total - len(result)) // max(1, len(underlyings)))
+            # Distribute max_total equally among underlyings
+            n_underlyings = len(underlyings)
+            per_underlying = max(4, max_total // max(1, n_underlyings))
             added = 0
             for c in in_range:
                 if len(result) >= max_total or added >= per_underlying:

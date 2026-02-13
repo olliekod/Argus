@@ -1641,6 +1641,26 @@ class Database:
             return int(dt.timestamp() * 1000)
         return None
 
+    async def get_latest_bar_close(
+        self, source: str, symbol: str, bar_duration: int = 60
+    ) -> Optional[float]:
+        """Get the close price of the most recent bar for a source+symbol (e.g. for underlying price in IV enrichment).
+        Returns None if no bars exist.
+        """
+        cursor = await self._connection.execute(
+            """
+            SELECT close FROM market_bars
+            WHERE source = ? AND symbol = ? AND bar_duration = ?
+            ORDER BY timestamp DESC
+            LIMIT 1
+            """,
+            (source, symbol, bar_duration),
+        )
+        row = await cursor.fetchone()
+        if row and row['close'] is not None:
+            return float(row['close'])
+        return None
+
     async def get_db_stats(self) -> Dict[str, Any]:
         """Get database size and table row counts."""
         import os

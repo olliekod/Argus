@@ -897,6 +897,7 @@ class PersistenceManager:
 
         start = time.perf_counter()
         success = False
+        last_exc = None
         for attempt in range(_BAR_FLUSH_MAX_RETRIES):
             try:
                 future = asyncio.run_coroutine_threadsafe(
@@ -905,11 +906,18 @@ class PersistenceManager:
                 future.result(timeout=30.0)
                 success = True
                 break
-            except Exception:
+            except Exception as e:
+                last_exc = e
                 logger.warning(
-                    "Bar flush attempt %d/%d failed for %d bars",
+                    "Bar flush attempt %d/%d failed for %d bars: %s: %s",
                     attempt + 1, _BAR_FLUSH_MAX_RETRIES, len(batch),
+                    type(e).__name__, e,
                     exc_info=True,
+                )
+                logger.debug(
+                    "Bar flush failure detail: attempt=%d batch_sample=%s",
+                    attempt + 1,
+                    [(b.symbol, b.source, b.timestamp) for b in batch[:5]],
                 )
                 if attempt < _BAR_FLUSH_MAX_RETRIES - 1:
                     with self._status_lock:
@@ -994,11 +1002,24 @@ class PersistenceManager:
                 self._consecutive_failures += 1
                 self._bar_flush_failure_total += 1
                 self._last_error = "bar_flush_failed"
+            exc_type = type(last_exc).__name__ if last_exc else "Unknown"
+            exc_msg = str(last_exc) if last_exc else "no exception captured"
             logger.error(
                 "All %d bar flush retries exhausted for %d bars — "
-                "returned to buffer for next cycle",
-                _BAR_FLUSH_MAX_RETRIES, len(batch),
+                "returned to buffer for next cycle. Last error: %s: %s",
+                _BAR_FLUSH_MAX_RETRIES, len(batch), exc_type, exc_msg,
             )
+            sample = [(b.symbol, b.source, b.timestamp) for b in batch[:10]]
+            logger.debug(
+                "Bar flush exhausted: batch_sample (symbol, source, timestamp)=%s",
+                sample,
+            )
+            if last_exc is not None and getattr(last_exc, "__traceback__", None) is not None:
+                import traceback as _tb
+                logger.debug(
+                    "Bar flush last exception traceback:\n%s",
+                    "".join(_tb.format_exception(type(last_exc), last_exc, last_exc.__traceback__)),
+                )
 
     # ── async DB writers ────────────────────────────────────
 
@@ -1031,14 +1052,23 @@ class PersistenceManager:
         ]
         if not rows:
             return
-        await self._db.execute_many(
-            """INSERT OR REPLACE INTO market_bars
-               (timestamp, symbol, source, open, high, low, close, volume,
-                tick_count, n_ticks, first_source_ts, last_source_ts,
-                late_ticks_dropped, close_reason, bar_duration)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-            rows,
-        )
+        try:
+            await self._db.execute_many(
+                """INSERT OR REPLACE INTO market_bars
+                   (timestamp, symbol, source, open, high, low, close, volume,
+                    tick_count, n_ticks, first_source_ts, last_source_ts,
+                    late_ticks_dropped, close_reason, bar_duration)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                rows,
+            )
+        except Exception as e:
+            logger.debug(
+                "Bar write failed: %s: %s; row_count=%d; first_row_symbol=%s",
+                type(e).__name__, e, len(rows),
+                rows[0][1] if rows else None,
+                exc_info=True,
+            )
+            raise
         now = time.time()
         with self._status_lock:
             self._bars_writes_total += len(rows)
