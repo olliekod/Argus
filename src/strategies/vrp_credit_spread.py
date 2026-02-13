@@ -15,8 +15,7 @@ IV Source Selection (data-source policy):
 - PRIMARY: Tastytrade snapshots (``atm_iv`` / surface fields).
 - FALLBACK: Derived IV computed from Tastytrade bid/ask quotes
   when ``atm_iv`` is missing.
-- Alpaca snapshots are structural cross-check only and are NOT
-  used for IV unless explicitly enabled via ``allow_alpaca_iv``.
+- Alpaca is bars and outcomes only; it is never used for IV or options data.
 """
 
 import logging
@@ -118,18 +117,16 @@ def _derive_iv_from_quotes(snapshot: Any) -> Optional[float]:
         return None
 
 
-def _select_iv_from_snapshots(
-    visible_snapshots: List[Any],
-    allow_alpaca_iv: bool = False,
-) -> Optional[float]:
+def _select_iv_from_snapshots(visible_snapshots: List[Any]) -> Optional[float]:
     """Select the best IV value from visible snapshots.
 
     Selection order:
     1. Latest Tastytrade snapshot with non-null ``atm_iv``.
     2. Derived IV from latest Tastytrade snapshot's bid/ask quotes.
-    3. If ``allow_alpaca_iv`` is True, latest Alpaca snapshot with
-       non-null ``atm_iv`` (structural cross-check only).
+    3. Latest snapshot from any other allowed provider with ``atm_iv`` (replay fallback).
     4. None — logs one-line reason and strategy skips deterministically.
+
+    Alpaca is never used for IV (bars/outcomes only).
     """
     if not visible_snapshots:
         return None
@@ -174,17 +171,10 @@ def _select_iv_from_snapshots(
             logger.debug("Using derived IV %.4f from Tastytrade quotes", iv)
             return iv
 
-    # Pass 3: Alpaca IV (only if explicitly allowed)
-    if allow_alpaca_iv:
-        for snap in reversed(visible_snapshots):
-            if _provider(snap) == _ALPACA:
-                iv = _atm_iv(snap)
-                if iv is not None:
-                    logger.debug("Falling back to Alpaca IV %.4f (allow_alpaca_iv=True)", iv)
-                    return iv
-
-    # Pass 4: Any provider with atm_iv (replay fallback when partial IV exists)
-    any_with_iv = [(s, _atm_iv(s)) for s in visible_snapshots if _atm_iv(s) is not None and _atm_iv(s) > 0]
+    # Pass 3: Any allowed provider with atm_iv (replay fallback). Alpaca is never used for IV.
+    # Exclude Alpaca: bars/outcomes only, never IV or options
+    non_alpaca = [s for s in visible_snapshots if _provider(s) != _ALPACA]
+    any_with_iv = [(s, _atm_iv(s)) for s in non_alpaca if _atm_iv(s) is not None and _atm_iv(s) > 0]
     if any_with_iv:
         best = max(any_with_iv, key=lambda x: _recv_ts(x[0]))
         logger.debug("Using IV %.4f from %s (replay fallback)", best[1], _provider(best[0]))
@@ -224,8 +214,7 @@ class VRPCreditSpreadStrategy(ReplayStrategy):
     Uses Tastytrade snapshots as the authoritative IV source.
     Falls back to derived IV (Brenner-Subrahmanyam approximation)
     from Tastytrade bid/ask when ``atm_iv`` is absent.
-    Alpaca IV is only used if ``allow_alpaca_iv`` is explicitly
-    set in thresholds.
+    Alpaca is never used for IV (bars and outcomes only).
     """
 
     def __init__(self, thresholds: Optional[Dict[str, Any]] = None):
@@ -234,10 +223,9 @@ class VRPCreditSpreadStrategy(ReplayStrategy):
             "max_vol_regime": "VOL_NORMAL",
             "avoid_trend": "TREND_DOWN",
         }
-        self._allow_alpaca_iv = bool(self._thresholds.get("allow_alpaca_iv", False))
         self.last_close = 0.0
         self.last_iv = None
-        self.last_iv_source = None  # "tastytrade", "derived", or "alpaca"
+        self.last_iv_source = None  # "tastytrade", "derived", or other allowed provider
         self.last_rv = None
         self._logged_no_iv = False
         self._logged_no_rv = False
@@ -260,11 +248,8 @@ class VRPCreditSpreadStrategy(ReplayStrategy):
         self.last_close = bar.close
         self.visible_regimes = visible_regimes or {}
 
-        # Extract IV using provider-aware selection
-        iv = _select_iv_from_snapshots(
-            visible_snapshots or [],
-            allow_alpaca_iv=self._allow_alpaca_iv,
-        )
+        # Extract IV using provider-aware selection (Alpaca never used for IV)
+        iv = _select_iv_from_snapshots(visible_snapshots or [])
         if iv is not None:
             self.last_iv = iv
             if not getattr(self, "_logged_iv_ok", False):

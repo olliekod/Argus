@@ -37,7 +37,9 @@ _DEFAULT_OPTIONS_SNAPSHOTS_SECONDARY: List[str] = ["public"]
 _DEFAULT_OPTIONS_STREAM_PRIMARY = "tastytrade_dxlink"
 _DEFAULT_BARS_SECONDARY: List[str] = ["yahoo"]
 
-_ALLOWED_OPTIONS_SNAPSHOT_PROVIDERS = {"tastytrade", "alpaca", "public"}
+# Alpaca is bars and outcomes only; it does not provide IV/greeks/option data.
+# Options snapshot primary must be tastytrade or public, never alpaca.
+_ALLOWED_OPTIONS_SNAPSHOT_PROVIDERS = {"tastytrade", "public"}
 
 
 @dataclass(frozen=True)

@@ -128,7 +128,7 @@ async def test_orchestrator_wires_dxlink_streamer_callback(monkeypatch):
             return None
 
     monkeypatch.setattr("src.orchestrator.TastytradeStreamer", FakeStreamer)
-    monkeypatch.setenv("ARGUS_SECRETS", "config/secrets.example.yaml")
+    monkeypatch.setenv("ARGUS_SECRETS", "config/secrets.yaml")
 
     orch = ArgusOrchestrator(config_dir="config")
     orch.tastytrade_options = FakeOptions()

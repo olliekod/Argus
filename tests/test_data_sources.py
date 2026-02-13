@@ -8,7 +8,7 @@ Verifies:
 - Replay pack composition follows data_sources policy
 - VRP strategy chooses Tastytrade IV by default
 - VRP strategy falls back to derived IV when atm_iv is missing
-- VRP strategy ignores Alpaca IV unless explicitly enabled
+- VRP strategy never uses Alpaca for IV (Alpaca is bars/outcomes only)
 """
 
 from __future__ import annotations
@@ -215,23 +215,14 @@ class TestVRPIVSourceSelection:
         iv = _select_iv_from_snapshots(snaps)
         assert iv == 0.20
 
-    def test_tastytrade_iv_none_alpaca_blocked(self):
-        """If Tastytrade has no IV and allow_alpaca_iv=False, return None."""
+    def test_alpaca_iv_never_used(self):
+        """Alpaca is bars/outcomes only; IV from Alpaca snapshots is never selected."""
         snaps = [
             self._make_snapshot(provider="alpaca", atm_iv=0.30),
             self._make_snapshot(provider="tastytrade", atm_iv=None),
         ]
-        iv = _select_iv_from_snapshots(snaps, allow_alpaca_iv=False)
+        iv = _select_iv_from_snapshots(snaps)
         assert iv is None
-
-    def test_alpaca_iv_allowed_when_flag_set(self):
-        """If allow_alpaca_iv=True, Alpaca IV is used as last resort."""
-        snaps = [
-            self._make_snapshot(provider="alpaca", atm_iv=0.30),
-            self._make_snapshot(provider="tastytrade", atm_iv=None),
-        ]
-        iv = _select_iv_from_snapshots(snaps, allow_alpaca_iv=True)
-        assert iv == 0.30
 
     def test_empty_snapshots_returns_none(self):
         iv = _select_iv_from_snapshots([])
@@ -239,12 +230,16 @@ class TestVRPIVSourceSelection:
 
     def test_latest_tastytrade_wins(self):
         """Most recent Tastytrade snapshot with IV should be used."""
-        snaps = [
-            self._make_snapshot(provider="tastytrade", atm_iv=0.15),
-            self._make_snapshot(provider="tastytrade", atm_iv=0.25),
-        ]
-        iv = _select_iv_from_snapshots(snaps)
-        assert iv == 0.25  # last in list = most recent
+        older = MarketDataSnapshot(
+            symbol="SPY", recv_ts_ms=1_700_000_060_000,
+            underlying_price=450.0, atm_iv=0.15, source="tastytrade",
+        )
+        newer = MarketDataSnapshot(
+            symbol="SPY", recv_ts_ms=1_700_000_120_000,
+            underlying_price=450.0, atm_iv=0.25, source="tastytrade",
+        )
+        iv = _select_iv_from_snapshots([older, newer])
+        assert iv == 0.25
 
     def test_dict_snapshots_work(self):
         """IV selection should also work with dict-format snapshots."""
@@ -328,7 +323,8 @@ class TestVRPStrategyIVIntegration:
         )
         assert strategy.last_iv == 0.20
 
-    def test_strategy_ignores_alpaca_iv_by_default(self):
+    def test_strategy_never_uses_alpaca_iv(self):
+        """Alpaca is bars/outcomes only; strategy never uses Alpaca for IV."""
         strategy = VRPCreditSpreadStrategy()
         snap_alp = MarketDataSnapshot(
             symbol="SPY", recv_ts_ms=100, underlying_price=450.0,
@@ -343,21 +339,3 @@ class TestVRPStrategyIVIntegration:
             visible_snapshots=[snap_alp],
         )
         assert strategy.last_iv is None
-
-    def test_strategy_uses_alpaca_iv_when_allowed(self):
-        strategy = VRPCreditSpreadStrategy(
-            thresholds={"min_vrp": 0.05, "allow_alpaca_iv": True}
-        )
-        snap_alp = MarketDataSnapshot(
-            symbol="SPY", recv_ts_ms=100, underlying_price=450.0,
-            atm_iv=0.35, source="alpaca",
-        )
-        bar = self._make_bar()
-        strategy.on_bar(
-            bar,
-            sim_ts_ms=bar.timestamp_ms + 60000,
-            session_regime="RTH",
-            visible_outcomes={},
-            visible_snapshots=[snap_alp],
-        )
-        assert strategy.last_iv == 0.35

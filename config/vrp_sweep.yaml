@@ -5,4 +5,3 @@ min_vrp:
   step: 0.01
 max_vol_regime: ["VOL_LOW", "VOL_NORMAL"]
 avoid_trend: ["TREND_DOWN"]
-allow_alpaca_iv: [true, false]

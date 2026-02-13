@@ -7,14 +7,14 @@ def test_mixed_list_range_and_scalar_expands():
     raw = {
         "max_vol_regime": ["VOL_LOW", "VOL_NORMAL"],
         "min_vrp": {"min": 0.02, "max": 0.08, "step": 0.01},
-        "allow_alpaca_iv": True,
+        "max_vol_regime_single": "VOL_LOW",
     }
 
     expanded = expand_sweep_grid(raw)
 
     assert expanded["max_vol_regime"] == ["VOL_LOW", "VOL_NORMAL"]
     assert expanded["min_vrp"] == [0.02, 0.03, 0.04, 0.05, 0.06, 0.07, 0.08]
-    assert expanded["allow_alpaca_iv"] == [True]
+    assert expanded["max_vol_regime_single"] == ["VOL_LOW"]
 
 
 def test_step_mode_includes_max_when_exact():
