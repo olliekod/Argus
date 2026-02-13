@@ -78,6 +78,8 @@ def extract_metrics(experiment: Dict[str, Any]) -> Dict[str, Any]:
     portfolio = result.get("portfolio", {})
     execution = result.get("execution", {})
     manifest = experiment.get("manifest", {})
+    mc_bootstrap = manifest.get("mc_bootstrap") or {}
+    mc_metrics = mc_bootstrap.get("metrics") if isinstance(mc_bootstrap, dict) else {}
 
     total_pnl = _safe_float(portfolio.get("total_realized_pnl"))
     starting_cash = _safe_float(portfolio.get("starting_cash"), 10_000.0)
@@ -124,6 +126,12 @@ def extract_metrics(experiment: Dict[str, Any]) -> Dict[str, Any]:
         "fill_rate": fill_rate,
         "bars_replayed": bars_replayed,
         "regime_breakdown": regime_breakdown,
+        "mc_bootstrap": mc_bootstrap if isinstance(mc_bootstrap, dict) else {},
+        "mc_median_return": _safe_float((mc_metrics or {}).get("median_return"), default=0.0),
+        "mc_p5_max_drawdown": _safe_float((mc_metrics or {}).get("p5_max_drawdown"), default=0.0),
+        "mc_p95_max_drawdown": _safe_float((mc_metrics or {}).get("p95_max_drawdown"), default=0.0),
+        "mc_ruin_probability": _safe_float((mc_metrics or {}).get("ruin_probability"), default=0.0),
+        "mc_fraction_positive": _safe_float((mc_metrics or {}).get("fraction_positive"), default=0.0),
     }
 
 
@@ -458,6 +466,10 @@ class StrategyEvaluator:
             "walk_forward_penalty": 0.6,
             "regime_dependency_penalty": 0.7,
             "composite_score_min": 0.1,
+            "mc_median_return_min": -1.0,
+            "mc_p5_drawdown_max": 2.0,
+            "mc_ruin_prob_max": 2.0,
+            "mc_fraction_positive_min": -1.0,
         }
         self._experiments: List[Dict[str, Any]] = []
         self._metrics: List[Dict[str, Any]] = []
@@ -541,6 +553,10 @@ class StrategyEvaluator:
                     "fill_rate": metrics["fill_rate"],
                     "fills": metrics["fills"],
                     "rejects": metrics["rejects"],
+                    "mc_median_return": metrics["mc_median_return"],
+                    "mc_p95_max_drawdown": metrics["mc_p95_max_drawdown"],
+                    "mc_ruin_probability": metrics["mc_ruin_probability"],
+                    "mc_fraction_positive": metrics["mc_fraction_positive"],
                 },
                 "regime_scores": regime_scores,
                 "manifest_ref": self._experiments[i].get("manifest", {}),
@@ -614,6 +630,56 @@ class StrategyEvaluator:
                     "reason": "composite_score_min",
                     "value": round(record.get("composite_score", 0.0), 6),
                     "threshold": thresholds.get("composite_score_min"),
+                }
+            )
+
+
+        mc_block = record.get("manifest_ref", {}).get("mc_bootstrap")
+        if isinstance(mc_block, dict):
+            for reason in mc_block.get("reasons", []):
+                if isinstance(reason, dict) and {"reason", "value", "threshold"}.issubset(reason.keys()):
+                    reasons.append(
+                        {
+                            "reason": str(reason.get("reason")),
+                            "value": round(_safe_float(reason.get("value")), 6),
+                            "threshold": _safe_float(reason.get("threshold")),
+                        }
+                    )
+
+        metrics = record.get("metrics", {})
+        if metrics.get("mc_median_return", 0.0) < thresholds.get("mc_median_return_min", -1.0):
+            reasons.append(
+                {
+                    "reason": "mc_median_return",
+                    "value": round(metrics.get("mc_median_return", 0.0), 6),
+                    "threshold": thresholds.get("mc_median_return_min"),
+                }
+            )
+
+        if metrics.get("mc_p95_max_drawdown", 0.0) > thresholds.get("mc_p5_drawdown_max", 2.0):
+            reasons.append(
+                {
+                    "reason": "mc_p5_drawdown",
+                    "value": round(metrics.get("mc_p95_max_drawdown", 0.0), 6),
+                    "threshold": thresholds.get("mc_p5_drawdown_max"),
+                }
+            )
+
+        if metrics.get("mc_ruin_probability", 0.0) > thresholds.get("mc_ruin_prob_max", 2.0):
+            reasons.append(
+                {
+                    "reason": "mc_ruin_prob",
+                    "value": round(metrics.get("mc_ruin_probability", 0.0), 6),
+                    "threshold": thresholds.get("mc_ruin_prob_max"),
+                }
+            )
+
+        if metrics.get("mc_fraction_positive", 0.0) < thresholds.get("mc_fraction_positive_min", -1.0):
+            reasons.append(
+                {
+                    "reason": "mc_fraction_positive",
+                    "value": round(metrics.get("mc_fraction_positive", 0.0), 6),
+                    "threshold": thresholds.get("mc_fraction_positive_min"),
                 }
             )
 

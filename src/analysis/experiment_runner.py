@@ -25,6 +25,7 @@ from src.analysis.replay_harness import (
 from src.analysis.execution_model import ExecutionModel, ExecutionConfig
 from src.core.outcome_engine import BarData
 from src.core.data_sources import get_data_source_policy
+from src.analysis.mc_bootstrap import run_mc_paths, evaluate_mc_kill
 
 logger = logging.getLogger("argus.experiment_runner")
 
@@ -38,6 +39,13 @@ class ExperimentConfig:
     execution_config: Optional[ExecutionConfig] = None
     output_dir: str = "logs/experiments"
     tag: str = "default"
+    mc_bootstrap_enabled: bool = False
+    mc_paths: int = 1000
+    mc_method: str = "bootstrap"
+    mc_block_size: Optional[int] = None
+    mc_random_seed: Optional[int] = 42
+    mc_ruin_level: float = 0.2
+    mc_kill_thresholds: Dict[str, float] = field(default_factory=dict)
 
 class ExperimentRunner:
     """Standardized handler for strategy research experiments."""
@@ -124,9 +132,14 @@ class ExperimentRunner:
         
         # 4. Execute
         result = harness.run()
-        
+
+        mc_bootstrap = None
+        if config.mc_bootstrap_enabled:
+            mc_bootstrap = self._compute_mc_bootstrap(config, result.trade_pnls)
+
         # 5. Save Artifact
-        self._save_result(config, result)
+        manifest_overrides = {"mc_bootstrap": mc_bootstrap} if mc_bootstrap is not None else None
+        self._save_result(config, result, manifest_overrides=manifest_overrides)
         
         return result
 
@@ -149,7 +162,14 @@ class ExperimentRunner:
                 replay_pack_paths=base_config.replay_pack_paths,
                 starting_cash=base_config.starting_cash,
                 execution_config=base_config.execution_config,
-                tag=f"sweep_{i}"
+                tag=f"sweep_{i}",
+                mc_bootstrap_enabled=base_config.mc_bootstrap_enabled,
+                mc_paths=base_config.mc_paths,
+                mc_method=base_config.mc_method,
+                mc_block_size=base_config.mc_block_size,
+                mc_random_seed=base_config.mc_random_seed,
+                mc_ruin_level=base_config.mc_ruin_level,
+                mc_kill_thresholds=dict(base_config.mc_kill_thresholds),
             )
             results.append(self.run(config))
         return results
@@ -179,6 +199,26 @@ class ExperimentRunner:
             "bars_providers": sorted(bars_providers),
             "options_snapshot_providers": sorted(options_snapshot_providers),
             "secondary_options_included": secondary_included,
+        }
+
+
+    def _compute_mc_bootstrap(self, config: ExperimentConfig, trade_pnls: List[float]) -> Dict[str, Any]:
+        mc_summary = run_mc_paths(
+            trade_pnls=list(trade_pnls),
+            starting_cash=float(config.starting_cash),
+            n_paths=int(config.mc_paths),
+            method=config.mc_method,
+            block_size=config.mc_block_size,
+            random_seed=config.mc_random_seed,
+            ruin_level=config.mc_ruin_level,
+        )
+        kill_info = evaluate_mc_kill(mc_summary, config.mc_kill_thresholds)
+        return {
+            "enabled": True,
+            "metrics": mc_summary,
+            "killed": kill_info.get("killed", False),
+            "reasons": kill_info.get("reasons", []),
+            "thresholds": dict(config.mc_kill_thresholds),
         }
 
     def _save_result(
@@ -359,6 +399,27 @@ class ExperimentRunner:
 
             res = harness.run()
 
+            mc_bootstrap = None
+            if config.mc_bootstrap_enabled:
+                mc_seed = None if config.mc_random_seed is None else int(config.mc_random_seed) + i
+                mc_cfg = ExperimentConfig(
+                    strategy_class=config.strategy_class,
+                    strategy_params=config.strategy_params,
+                    replay_pack_paths=config.replay_pack_paths,
+                    starting_cash=config.starting_cash,
+                    execution_config=config.execution_config,
+                    output_dir=config.output_dir,
+                    tag=config.tag,
+                    mc_bootstrap_enabled=True,
+                    mc_paths=config.mc_paths,
+                    mc_method=config.mc_method,
+                    mc_block_size=config.mc_block_size,
+                    mc_random_seed=mc_seed,
+                    mc_ruin_level=config.mc_ruin_level,
+                    mc_kill_thresholds=dict(config.mc_kill_thresholds),
+                )
+                mc_bootstrap = self._compute_mc_bootstrap(mc_cfg, res.trade_pnls)
+
             if persist_windows:
                 manifest_overrides = {
                     "walk_forward": {
@@ -370,7 +431,8 @@ class ExperimentRunner:
                         "test_bars": len(test_bars),
                         "window_start_ms": start_ms,
                         "window_end_ms": end_ms,
-                    }
+                    },
+                    "mc_bootstrap": mc_bootstrap,
                 }
                 self._save_result(
                     config=config,
@@ -385,6 +447,7 @@ class ExperimentRunner:
                 "sharpe": res.portfolio_summary["sharpe_annualized_proxy"],
                 "win_rate": res.portfolio_summary["win_rate"],
                 "run_summary": res.summary(),
+                "mc_bootstrap": mc_bootstrap,
             })
 
         return results
