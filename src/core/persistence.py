@@ -723,36 +723,53 @@ class PersistenceManager:
 
     def _on_option_chain(self, event: OptionChainSnapshotEvent) -> None:
         """Persist option chain snapshot via idempotent upsert.
-        
+
         Writes directly to DB (async-safe via futures).
         Uses upsert_option_chain_snapshot for restart idempotency.
+        Retries up to 3 times with exponential backoff on failure.
         """
         if not self._running:
             return
-        
+
         # Serialize quotes to JSON for storage
         import json
         quotes_json = json.dumps(option_chain_to_dict(event), sort_keys=True)
-        
-        # Schedule async write
-        future = asyncio.run_coroutine_threadsafe(
-            self._db.upsert_option_chain_snapshot(
-                snapshot_id=event.snapshot_id,
-                symbol=event.symbol,
-                expiration_ms=event.expiration_ms,
-                underlying_price=event.underlying_price,
-                n_strikes=event.n_strikes,
-                atm_iv=event.atm_iv,
-                timestamp_ms=event.timestamp_ms,
-                source_ts_ms=event.source_ts_ms,
-                recv_ts_ms=event.recv_ts_ms,  # Local arrival time
-                provider=event.provider,
-                quotes_json=quotes_json,
-            ),
-            self._loop,
-        )
-        # Fire-and-forget (errors logged in db method)
-        future.add_done_callback(lambda f: f.exception() if f.exception() else None)
+
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                future = asyncio.run_coroutine_threadsafe(
+                    self._db.upsert_option_chain_snapshot(
+                        snapshot_id=event.snapshot_id,
+                        symbol=event.symbol,
+                        expiration_ms=event.expiration_ms,
+                        underlying_price=event.underlying_price,
+                        n_strikes=event.n_strikes,
+                        atm_iv=event.atm_iv,
+                        timestamp_ms=event.timestamp_ms,
+                        source_ts_ms=event.source_ts_ms,
+                        recv_ts_ms=event.recv_ts_ms,
+                        provider=event.provider,
+                        quotes_json=quotes_json,
+                    ),
+                    self._loop,
+                )
+                future.result(timeout=15.0)
+                return  # success
+            except Exception:
+                if attempt < max_retries - 1:
+                    backoff = 0.5 * (2 ** attempt)
+                    logger.warning(
+                        "Option chain write attempt %d/%d failed for %s; "
+                        "retrying in %.1fs",
+                        attempt + 1, max_retries, event.symbol, backoff,
+                    )
+                    time.sleep(backoff)
+                else:
+                    logger.error(
+                        "Option chain write failed after %d retries for %s",
+                        max_retries, event.symbol,
+                    )
 
     def _on_symbol_regime(self, event: SymbolRegimeEvent) -> None:
         """Persist a symbol regime event via fire-and-forget async write.

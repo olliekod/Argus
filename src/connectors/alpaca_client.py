@@ -51,12 +51,19 @@ DEFAULT_OVERLAP_SECONDS = 120
 def _parse_rfc3339_to_ms(ts_str: str) -> int:
     """
     Parse RFC3339 timestamp to UTC epoch milliseconds (int).
-    
+
     Alpaca returns timestamps like: 2024-01-15T14:30:00Z
+
+    If the parsed datetime is naive (no timezone info), it is assumed
+    to be UTC.  This prevents .timestamp() from silently using the
+    local timezone.
     """
     if ts_str.endswith("Z"):
         ts_str = ts_str[:-1] + "+00:00"
     dt = datetime.fromisoformat(ts_str)
+    # Assume UTC for naive datetimes (missing timezone offset)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
     return int(dt.timestamp() * 1000)
 
 
