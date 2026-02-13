@@ -13,7 +13,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import yaml
 
@@ -81,6 +81,7 @@ class AllocationOpts:
     per_play_cap: float = 0.07
     vol_target_annual: Optional[float] = 0.10
     min_edge_over_cost: float = 0.0
+    max_loss_per_contract: Optional[Union[float, Dict[str, float]]] = None
 
 
 @dataclass
@@ -302,11 +303,18 @@ def load_research_loop_config(
             vol_target_annual = None
         else:
             vol_target_annual = float(vol_raw if vol_raw is not None else 0.10)
+        max_loss_cfg = alloc_raw.get("max_loss_per_contract")
+        if isinstance(max_loss_cfg, dict):
+            max_loss_cfg = {str(k): float(v) for k, v in max_loss_cfg.items()}
+        elif max_loss_cfg is not None:
+            max_loss_cfg = float(max_loss_cfg)
+
         allocation = AllocationOpts(
             kelly_fraction=float(alloc_raw.get("kelly_fraction", 0.25)),
             per_play_cap=float(alloc_raw.get("per_play_cap", 0.07)),
             vol_target_annual=vol_target_annual,
             min_edge_over_cost=float(alloc_raw.get("min_edge_over_cost", 0.0)),
+            max_loss_per_contract=max_loss_cfg,
         )
 
     evaluation = EvaluationOpts(

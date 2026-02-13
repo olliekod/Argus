@@ -58,11 +58,24 @@ When `evaluation.allocation` and `evaluation.allocations_output_path` are both s
 
 | Key | Purpose |
 |-----|---------|
-| `evaluation.allocation` | Allocation engine settings (`kelly_fraction`, `per_play_cap`, optional `vol_target_annual`). |
+| `evaluation.allocation` | Allocation engine settings (`kelly_fraction`, `per_play_cap`, optional `vol_target_annual`, optional `max_loss_per_contract`). |
 | `evaluation.allocations_output_path` | JSON output path for allocation targets (for example `logs/allocations.json`). |
 | `evaluation.equity` | Equity base used to convert weights into dollar risk/contracts. |
 | `evaluation.min_dsr` | Candidate filter floor applied before allocation (`StrategyRegistry.load_from_rankings`). |
 | `evaluation.min_composite_score` | Additional candidate floor before allocation. |
+
+
+`evaluation.allocation.max_loss_per_contract` supports both of the following forms:
+
+- Single float default applied to all strategies that do not provide an override.
+- Dict map of `strategy_id -> float` for strategy-specific risk-per-contract assumptions.
+
+Override order used by `run_allocation()` (highest priority first):
+1. Ranking row field `max_loss_per_contract` (if present).
+2. Ranking `strategy_params.max_loss_per_contract` (if present).
+3. Config `evaluation.allocation.max_loss_per_contract` (dict entry for strategy_id, then float default).
+
+If none are provided, allocation behavior is unchanged (contract counts remain null while weights/dollar risk are still produced).
 
 ### Parameter sweeps
 

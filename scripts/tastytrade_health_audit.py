@@ -2,9 +2,11 @@ import sys
 import asyncio
 import time
 import argparse
+import sqlite3
 import requests
 from pathlib import Path
 from datetime import date, datetime, timezone
+from statistics import median
 from typing import Any, Tuple, Literal
 
 # Add project root
@@ -18,6 +20,166 @@ from src.core.liquid_etf_universe import LIQUID_ETF_UNIVERSE
 from src.core.options_normalize import normalize_tastytrade_nested_chain
 from src.connectors.tastytrade_dxlink_parser import QuoteEvent, GreeksEvent
 from src.analysis.greeks_engine import GreeksEngine
+
+
+def _ensure_snapshot_table(db_path: Path) -> None:
+    """Create option_quote_snapshots table and indexes if missing."""
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(db_path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS option_quote_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts_utc TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                underlying TEXT NOT NULL,
+                option_symbol TEXT NOT NULL,
+                expiry TEXT,
+                strike REAL,
+                right TEXT,
+                bid REAL,
+                ask REAL,
+                mid REAL,
+                event_ts REAL,
+                recv_ts REAL
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_option_quote_snapshots_underlying_ts "
+            "ON option_quote_snapshots(underlying, ts_utc)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_option_quote_snapshots_symbol_ts "
+            "ON option_quote_snapshots(option_symbol, ts_utc)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_option_quote_snapshots_provider "
+            "ON option_quote_snapshots(provider)"
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_option_quote_snapshots_contract "
+            "ON option_quote_snapshots(underlying, expiry, strike, right)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _prune_snapshots_sql(days: int) -> tuple[str, tuple]:
+    return (
+        "DELETE FROM option_quote_snapshots WHERE ts_utc < datetime('now', ?)",
+        (f"-{days} days",),
+    )
+
+
+def select_spot(
+    dxlink_quote: dict | None,
+    cli_spot: float | None,
+    strike_medians: list[float],
+) -> dict[str, Any]:
+    """Select spot using dxlink -> CLI -> median strike fallback."""
+    if dxlink_quote:
+        bid = dxlink_quote.get("bidPrice", dxlink_quote.get("bid"))
+        ask = dxlink_quote.get("askPrice", dxlink_quote.get("ask"))
+        if bid is not None and ask is not None:
+            return {"spot_source": "dxlink", "spot_value": (float(bid) + float(ask)) / 2.0}
+        if bid is not None:
+            return {"spot_source": "dxlink", "spot_value": float(bid)}
+        if ask is not None:
+            return {"spot_source": "dxlink", "spot_value": float(ask)}
+
+    if cli_spot is not None:
+        return {"spot_source": "cli", "spot_value": float(cli_spot)}
+
+    fallback = float(median(strike_medians)) if strike_medians else 0.0
+    return {
+        "spot_source": "median_strike",
+        "spot_value": fallback,
+        "warning": "WARNING: DXLink/CLI spot unavailable; using median strike fallback.",
+    }
+
+
+def _select_sampled_contracts(
+    chain: list[dict[str, Any]],
+    spot_value: float | None,
+    now_utc: datetime,
+    expiry_count: int = 2,
+    strike_window: int = 5,
+    max_contracts: int = 40,
+) -> list[dict[str, Any]]:
+    """Deterministically sample contracts near spot from nearest expiries."""
+    if not chain:
+        return []
+
+    today = now_utc.date()
+    candidates: list[dict[str, Any]] = []
+    for c in chain:
+        expiry_raw = c.get("expiry")
+        strike = c.get("strike")
+        symbol = c.get("option_symbol")
+        if not expiry_raw or strike is None or not symbol:
+            continue
+        try:
+            expiry_dt = datetime.fromisoformat(str(expiry_raw)).date()
+            strike_val = float(strike)
+        except (TypeError, ValueError):
+            continue
+        if expiry_dt < today:
+            continue
+        candidates.append({**c, "_expiry_dt": expiry_dt, "_strike_val": strike_val})
+
+    if not candidates:
+        return []
+
+    expiries = sorted({c["_expiry_dt"] for c in candidates})[: max(0, int(expiry_count))]
+    if not expiries:
+        return []
+
+    if spot_value is None:
+        spot_used = float(median([c["_strike_val"] for c in candidates]))
+    else:
+        spot_used = float(spot_value)
+
+    selected: list[dict[str, Any]] = []
+    for expiry in expiries:
+        exp_contracts = [c for c in candidates if c["_expiry_dt"] == expiry]
+        strikes = sorted({c["_strike_val"] for c in exp_contracts})
+        if not strikes:
+            continue
+
+        center_idx = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot_used))
+        low = max(0, center_idx - max(0, int(strike_window)))
+        high = min(len(strikes), center_idx + max(0, int(strike_window)) + 1)
+        keep = set(strikes[low:high])
+        selected.extend([c for c in exp_contracts if c["_strike_val"] in keep])
+
+    right_order = {"C": 0, "P": 1}
+    selected.sort(
+        key=lambda c: (
+            c["_expiry_dt"],
+            c["_strike_val"],
+            right_order.get(str(c.get("right", "")).upper(), 9),
+            c.get("option_symbol", ""),
+        )
+    )
+
+    deduped: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for c in selected:
+        sym = str(c.get("option_symbol", ""))
+        if not sym or sym in seen:
+            continue
+        seen.add(sym)
+        out = dict(c)
+        out.pop("_expiry_dt", None)
+        out.pop("_strike_val", None)
+        deduped.append(out)
+        if len(deduped) >= max_contracts:
+            break
+
+    return deduped
 
 
 def _is_placeholder(value: str) -> bool:
