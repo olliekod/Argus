@@ -155,10 +155,13 @@ class ExperimentRunner:
         results = []
         print(f"Starting sweep: {len(combinations)} combinations.")
         for i, params in enumerate(combinations):
-            print(f"Sweep {i+1}/{len(combinations)}: {params}")
+            # Merge base params with sweep entry so sweeps that vary only a subset
+            # of parameters inherit the rest from spec.params.
+            merged_params = {**base_config.strategy_params, **params}
+            print(f"Sweep {i+1}/{len(combinations)}: {merged_params}")
             config = ExperimentConfig(
                 strategy_class=strategy_cls,
-                strategy_params=params,
+                strategy_params=merged_params,
                 replay_pack_paths=base_config.replay_pack_paths,
                 starting_cash=base_config.starting_cash,
                 execution_config=base_config.execution_config,

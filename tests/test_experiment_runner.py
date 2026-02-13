@@ -69,6 +69,31 @@ def test_parameter_sweep(tmp_path):
     ids = [r.strategy_state["params"]["id"] for r in results]
     assert sorted(ids) == [1, 2, 3]
 
+
+def test_parameter_sweep_merges_base_params(tmp_path):
+    """Verify sweep grid entries are merged with base strategy_params (P1 badge fix)."""
+    pack_path = tmp_path / "test_pack.json"
+    pack = {"bars": [{"timestamp_ms": 1000, "open": 100, "high": 101, "low": 99, "close": 100, "symbol": "SPY"}], "outcomes": [], "regimes": []}
+    with open(pack_path, "w") as f:
+        json.dump(pack, f)
+
+    runner = ExperimentRunner(output_dir=str(tmp_path / "logs"))
+    base_config = ExperimentConfig(
+        strategy_class=MockStrategy,
+        strategy_params={"base_key": "fixed", "id": 0},  # id=0 gets overridden by sweep
+        replay_pack_paths=[str(pack_path)],
+    )
+
+    # Sweep varies only id; base_key should be inherited in every run
+    param_grid = {"id": [1, 2]}
+    results = runner.run_parameter_grid(MockStrategy, base_config, param_grid)
+
+    assert len(results) == 2
+    for r in results:
+        assert r.strategy_state["params"]["base_key"] == "fixed"
+    ids = [r.strategy_state["params"]["id"] for r in results]
+    assert sorted(ids) == [1, 2]
+
 def test_walk_forward_splitting():
     runner = ExperimentRunner()
     # 5 days of data

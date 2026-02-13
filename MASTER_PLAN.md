@@ -51,7 +51,8 @@ flowchart LR
 | 0–3B | **Done.** Event bus, bars, indicators, regime detection, strategy infra, timing filters, options pipeline, spread generation, tape, replay. |
 | 4A Outcome Engine | **Done.** Bar outcomes, forward returns, run-up/drawdown, multi-horizon; deterministic backfills; `python -m src.outcomes`. |
 | 4B Backtesting / Replay | **Done.** Replay harness, experiment runner, conservative execution model; replay packs with bars, outcomes, regimes, option snapshots. |
-| 4C and beyond | **Not started.** Parameter search, portfolio risk, execution engine, strategy expansion, etc. |
+| 4C Parameter search & robustness lab | **Done.** Parameter sweeps; regime sensitivity scoring (`compute_regime_sensitivity_score`); parameter stability auto-kill (`compute_robustness_penalty`, `compute_walk_forward_penalty`); MC/bootstrap on realized trades (`mc_bootstrap.run_mc_paths`, `evaluate_mc_kill`); regime-subset stress (`run_regime_subset_stress`); Strategy Research Loop (outcomes → packs → experiments → evaluation, DB pass-through, base-params merge, `require_recent_bars_hours`). Integrated in ExperimentRunner and StrategyEvaluator. |
+| 4C optional (deploy gates) | **Backlog.** Deflated Sharpe, Reality Check/SPA-style comparison, slippage sensitivity sweeps (baseline, +25%, +50% costs). |
 
 ### IV / snapshot / replay truth map
 
@@ -78,7 +79,7 @@ flowchart LR
 | **3B** | Options pipeline | Done | Options ingestion, chain normalization, spread generation, liquidity filtering, deterministic persistence, tape capture, replay validation. |
 | **4A** | Outcome engine | Done | Forward returns, run-up, drawdown, multi-horizon outcomes, outcome DB storage, deterministic backfills. |
 | **4B** | Backtesting engine | Done | Replay harness, position simulator, entry/exit modeling, transaction costs, slippage (conservative execution model). |
-| **4C** | Parameter search & robustness lab | **In progress** | Parameter sweeps; **regime sensitivity scoring**; **parameter stability auto-kill**; **MC/bootstrap on realized trades** (replay → trade list → resample/reorder paths → distribution of outcomes → kill if median bad, worst 5–10% paths unacceptable, or ruin risk; block bootstrap preferred; see §1). Plus regime-subset stress replays. Optional: Deflated Sharpe, slippage sensitivity sweeps. |
+| **4C** | Parameter search & robustness lab | **Done** | Parameter sweeps; regime sensitivity scoring; parameter stability auto-kill (robustness/walk-forward penalties); MC/bootstrap on realized trades (block bootstrap, kill rules); regime-subset stress; Strategy Research Loop (outcomes → packs → experiments → evaluation). Optional deploy gates: Deflated Sharpe, Reality Check, slippage sensitivity — backlog. |
 | **5** | Portfolio risk engine | Future | Position sizing (fractional Kelly with caps; see §9.3), exposure limits, **per-play cap (e.g. ≤7% of equity)**, drawdown controls, correlation awareness, strategy budgets. Black–Scholes (or existing Greeks): delta/vega for exposure and implementation shortfall, not a separate phase. |
 | **6** | Execution engine | Future | Broker integration, order routing, fill simulation, paper then live trading. TCA ledger (decision price, arrival, NBBO, executed, spread paid). |
 | **7** | Strategy expansion | Future | Put spread selling, volatility plays, panic snapback, FVG, session momentum, crypto–ETF relationships, Polymarket. |
@@ -86,7 +87,7 @@ flowchart LR
 | **9** | Intelligence API product | Future | Expose bars, regimes, options intelligence, spread candidates, signals for subscription revenue. |
 | **10** | Self-improving system | Future | Automatic idea testing, strategy mutation, performance pruning, adaptive weighting. |
 
-**Current status:** Research engine complete through 4B. Public options/Greeks integration done (second IV source, health script, Tastytrade-as-structure path). **Active focus:** Phase 4C — regime sensitivity scoring, parameter stability auto-kill, then **MC/bootstrap on realized trades** (replay → trade list → path distribution → kill unstable) plus regime-stress; not GPU/option-pricing Monte Carlo.
+**Current status:** Research engine complete through **4C**. Phase 4C robustness lab is done: parameter sweeps, regime sensitivity scoring, parameter stability auto-kill (robustness/walk-forward penalties), MC/bootstrap on realized trades, regime-subset stress, Strategy Research Loop (with DB pass-through, base-params merge, require_recent_bars_hours). Public options/Greeks integration done. **Next:** Phase 5 (portfolio risk engine), P1 audit fixes, or optional 4C deploy gates (DSR, slippage sensitivity).
 
 ---
 
@@ -195,13 +196,20 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 - **Config and secrets** — `public.api_secret`, `public.account_id`; `public.rate_limit_rps`; validation when `public_options.enabled`.
 - **Health and comparison** — `scripts/options_providers_health.py` (pre-check both providers); `compare_options_snapshot_providers.py`. Tests and data_sources docs updated.
 
-### 8.2b Kill bad strategies fast (Phase 4C — next)
+### 8.2a Phase 4C — **Done** (verified 2026-02-12)
 
-- **Regime sensitivity scoring** — Score strategy/parameter sets by performance across regimes (e.g. trend vs range, low-vol vs high-vol); flag or down-rank sets that only work in one regime.
-- **Parameter stability auto-kill** — Automatic flagging or removal of parameter sets that are unstable (e.g. small change in params → large change in outcome, or walk-forward failure). Integrate with experiment evaluator; output explicit `killed` list (run_id + reason).
-- **MC / bootstrap on realized trades (Phase 4C completion):** For each strategy/parameter set: **run replay → get trade list (or PnL path) → run MC/bootstrap on trades.** (1) **Monte Carlo:** Resample or reorder trades to generate many alternative paths; compute distribution of max drawdown, median return, ruin probability, worst 5–10% paths. (2) **Bootstrap (preferred):** Block sampling of trade sequences to preserve regime/vol clustering. **Kill** if: strategy survives only a low fraction of paths (e.g. &lt;20%), worst paths unacceptable, or ruin risk present. Survival rule: MC median good AND worst 5–10% paths acceptable AND no ruin risk. (3) **Regime-stress** (complement): Replay per regime bucket; kill if strategy collapses in &gt;50% of buckets. Implement in experiment_runner / regime_stress / strategy_evaluator path. Not option pricing; MC over **realized outcomes** only.
-- **Selection gate (Phase 4C optional, then mandatory for deploy):** Deflated Sharpe Ratio (DSR) as deploy gate; Reality Check / SPA-style benchmark comparison; PBO-style penalty in ranking. Multiple-testing correction so “best of many” does not pass by chance. Regression test: random strategy family must not frequently pass (e.g. tests/test_false_discovery_rate.py).
-- **Slippage sensitivity (mandatory for deploy):** Every experiment reports performance under cost inflation (baseline, +25%, +50%). Auto-fail if edge disappears at reasonable slippage. Tests: e.g. test_vrp_cost_sensitivity.py, test_iv_time_gating.py.
+- **Regime sensitivity scoring** — `compute_regime_sensitivity_score()` in `strategy_evaluator.py`; integrated into composite score.
+- **Parameter stability auto-kill** — `compute_robustness_penalty()` (parameter fragility across sweeps), `compute_walk_forward_penalty()` (walk-forward instability); kill thresholds in StrategyEvaluator.
+- **MC/bootstrap on realized trades** — `src/analysis/mc_bootstrap.py` (`run_mc_paths`, `evaluate_mc_kill`); ExperimentRunner runs MC after replay, attaches to manifest; StrategyEvaluator applies MC kill reasons.
+- **Regime-subset stress** — `run_regime_subset_stress()` in `regime_stress.py`; run_experiment.py `--regime-stress`; Strategy Research Loop runs it per strategy.
+- **Strategy Research Loop** — `scripts/strategy_research_loop.py`; outcomes → packs → experiments → evaluation; DB pass-through, base-params merge, require_recent_bars_hours.
+
+### 8.2b Phase 4C optional (deploy gates — backlog)
+
+- **Deflated Sharpe Ratio (DSR)** — Multiple-testing correction; not yet implemented.
+- **Reality Check / SPA-style benchmark comparison** — Not yet implemented.
+- **Slippage sensitivity sweeps** — Run experiments at baseline, +25%, +50% costs; auto-fail if edge disappears; mandatory for deploy; not yet implemented.
+- **Selection gate** Deflated Sharpe Ratio (DSR) as deploy gate; Reality Check / SPA-style benchmark comparison; PBO-style penalty in ranking. Multiple-testing correction so “best of many” does not pass by chance. Regression test: random strategy family must not frequently pass (e.g. tests/test_false_discovery_rate.py).
 
 ### 8.3 Strategic / product TODOs
 
@@ -220,7 +228,7 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 **Assessment (codebase vs Master Plan):**
 
 - **Phases 0–4B:** In place. Event bus, bars, regimes, options pipeline, outcome engine, replay harness, experiment runner, execution model, and (after audit fixes) DXLink Greeks + cross-expiration IV are the backbone. Replay packs with bars + outcomes + regimes + snapshots work; VRP strategy can consume `atm_iv` and `realized_vol` in replay.
-- **Phase 4C:** In progress. `run_experiment.py --sweep` and `ExperimentRunner` support parameter grids; Optimizer variants exist. **Next:** regime-sensitivity scoring, parameter stability auto-kill, MC/bootstrap stress over regimes — unified with strategy evaluator to kill bad strategies fast.
+- **Phase 4C:** Done. Regime sensitivity scoring, parameter stability auto-kill (robustness/walk-forward penalties), MC/bootstrap on realized trades, regime-subset stress, Strategy Research Loop — all integrated in ExperimentRunner and StrategyEvaluator. **Optional backlog:** Deflated Sharpe, Reality Check, slippage sensitivity sweeps.
 - **Audit:** Two critical bugs fixed. P1–P3 items (timestamp parsing, rate limiter, snapshot retry, task tracking check, bar lock, DXLink errors, ExecutionModel reset, secrets permissions, VRP RV, etc.) are still open and affect correctness or operational safety.
 - **Public API:** Done. Second IV/Greeks source; health script and provider comparison; reduces dependence on DXLink alone.
 - **Strategic gaps:** No strategy allocation engine, no portfolio risk engine, no sizing layer, no strategy lifecycle/kill engine, no live vs backtest drift monitor. These block safe scaling and live deployment.
@@ -242,14 +250,13 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
    - Use existing `--sweep` and evaluator for parameter robustness and regime sensitivity.  
    - Document what works and what doesn’t; feed results into strategy priority (Master Plan §4) and into future allocation/sizing design.
 
-4. **Phase 4C — (current focus)**  
-   - **Regime sensitivity scoring:** Score strategy/parameter sets by performance across regimes; flag sets that only work in one regime.  
-   - **Parameter stability auto-kill:** Auto-flag or kill parameter sets that are unstable (walk-forward failure, high sensitivity to param changes); output explicit `killed` list.  
-   - **Regime-subset stress:** Replay per regime bucket; kill if strategy collapses in too many buckets (done).  
-   - **MC/bootstrap on realized trades (4C completion):** For each strategy/param set: replay → trade list → MC/bootstrap on trades (reorder or block-resample) → distribution of outcomes (median return, 5% worst drawdown, ruin probability) → kill if unstable (e.g. survives only 20% of paths, worst paths bad, ruin risk). Block bootstrap preferred. See §1 terminology.  
-   - Optional: BOCPD or similar as regime gate for VRP (Master Plan §5).  
-   - Later in 4C or deploy gate: DSR, Reality Check/SPA-style comparison, slippage sensitivity sweeps (baseline, +25%, +50% costs).  
-   - Outcome: Only strategies and parameter sets that survive robust testing get capital later.
+4. **Phase 4C — Done**  
+   - **Strategy Research Loop:** Config-driven full cycle; outcomes backfill with DB pass-through; base-params merge in sweeps; require_recent_bars_hours guard.  
+   - **Regime sensitivity scoring:** Done (`compute_regime_sensitivity_score`).  
+   - **Parameter stability auto-kill:** Done (`compute_robustness_penalty`, `compute_walk_forward_penalty`).  
+   - **Regime-subset stress:** Done (`run_regime_subset_stress`).  
+   - **MC/bootstrap on realized trades:** Done (`mc_bootstrap.run_mc_paths`, `evaluate_mc_kill`; block bootstrap; integrated in ExperimentRunner and StrategyEvaluator).  
+   - **Optional (backlog):** DSR, Reality Check/SPA-style comparison, slippage sensitivity sweeps; BOCPD as regime gate.
 
 5. **Strategy allocation and sizing (Phase 5 prelude)**   
    - Introduce a small **strategy allocation engine:** registry, forecast normalization (μ̂, σ̂, confidence), and a single-instrument sizing rule (e.g. vol-targeted fractional Kelly with caps). No broker execution yet; output is target exposure or “risk budget” per strategy/symbol.  
@@ -266,7 +273,7 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 
 **Best route going forward:**
 
-- **Short term:** **Phase 4C —** Implement regime sensitivity scoring, parameter stability auto-kill, and MC/bootstrap stress over regimes; integrate with experiment evaluator. Keep P1/P2 audit items in backlog; E2E IV check when running both providers.  
+- **Short term:** **Phase 4C done.** Next: Phase 5 (portfolio risk engine), P1 audit fixes (Alpaca UTC, Deribit rate limiter, options snapshot retry, task tracking), or optional 4C deploy gates (DSR, slippage sensitivity). E2E IV check when running both providers.  
 - **Medium term:** Use the replay and experiment pipeline to **validate VRP (and session ideas)** on multiple packs and regimes with the new kill criteria. Add a **minimal allocation/sizing layer** that consumes strategy forecasts and outputs risk budgets under caps, without execution.  
 - **Long term:** Add **portfolio risk engine** and **strategy lifecycle**, then paper trading and live execution. Keep the Master Plan order: allocation → lifecycle → risk engine → monitoring → paper → live → strategy expansion.
 
@@ -365,6 +372,7 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 | [docs/outcome_semantics.md](docs/outcome_semantics.md) | Bar outcome window definition, metrics, statuses, quantization, CLI for backfill and coverage. |
 | [docs/replay_pack_and_iv_summary.md](docs/replay_pack_and_iv_summary.md) | Replay pack contents, IV from provider vs derived, checklist for replay + IV + non-zero experiments. |
 | [docs/AUDIT_CODEBASE.md](docs/AUDIT_CODEBASE.md) | Full codebase audit: bugs fixed, risks ranked, concrete patch plan (P1–P3). |
+| [docs/strategy_research_loop.md](docs/strategy_research_loop.md) | Strategy Research Loop: quick start, config, outputs, invariants. |
 | [docs/strategy_evaluation.md](docs/strategy_evaluation.md) | Strategy evaluator metrics, composite scoring, penalties, deployability interpretation. |
 | [ONBOARDING_ROADMAP.md](ONBOARDING_ROADMAP.md) | Learning path through the codebase: architecture, data flow, config, soak/tape, glossary. |
 | [argus_strategy_backlog.md](argus_strategy_backlog.md) | Idea parking lot and strategy evaluation framework; master plan is authoritative for priority order. |

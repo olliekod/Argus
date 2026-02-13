@@ -179,7 +179,7 @@ def _print_gap_table(gaps: List[GapInfo], indent: str = "    ") -> None:
 
 async def _open_db(args) -> Database:
     config = load_config(args.config)
-    db_path = config.get("database", {}).get("path", "data/argus.db")
+    db_path = getattr(args, "db", None) or config.get("database", {}).get("path", "data/argus.db")
     db = Database(db_path)
     await db.connect()
     return db
@@ -888,6 +888,10 @@ def main():
     parser.add_argument(
         "--config", default="config/config.yaml",
         help="Path to config.yaml (default: config/config.yaml)",
+    )
+    parser.add_argument(
+        "--db", default=None,
+        help="Override database path (overrides database.path from config)",
     )
     sub = parser.add_subparsers(dest="command")
 

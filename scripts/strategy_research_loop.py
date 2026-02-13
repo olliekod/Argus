@@ -36,7 +36,7 @@ import logging
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Type
 
@@ -104,6 +104,7 @@ def run_outcomes_backfill(config: ResearchLoopConfig) -> None:
     if config.pack.mode == "universe":
         cmd = [
             sys.executable, "-m", "src.outcomes",
+            "--db", config.pack.db_path,
             "backfill-all",
             "--start", start,
             "--end", end,
@@ -119,6 +120,7 @@ def run_outcomes_backfill(config: ResearchLoopConfig) -> None:
         for symbol in config.pack.symbols:
             cmd = [
                 sys.executable, "-m", "src.outcomes",
+                "--db", config.pack.db_path,
                 "backfill",
                 "--provider", bars_provider,
                 "--symbol", symbol,
@@ -155,6 +157,50 @@ def _run_subprocess(cmd: List[str]) -> None:
         raise RuntimeError(
             f"Subprocess failed (exit {result.returncode}): {' '.join(cmd)}"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Recent-bars freshness check (loop.require_recent_bars_hours)
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+def _check_recent_bars_freshness(db_path: str, max_age_hours: float) -> bool:
+    """Return True if the most recent bar in the DB is within max_age_hours of now.
+
+    Queries market_bars via get_bar_inventory and parses max_ts (ISO format).
+    Returns False if the DB has no bars or the newest bar is older than max_age_hours.
+    """
+    async def _check() -> bool:
+        from src.core.database import Database
+        db = Database(db_path)
+        await db.connect()
+        try:
+            inv = await db.get_bar_inventory()
+            if not inv:
+                return False
+            latest_ts: Optional[datetime] = None
+            for row in inv:
+                max_ts_str = row.get("max_ts")
+                if not max_ts_str:
+                    continue
+                try:
+                    dt = datetime.fromisoformat(
+                        str(max_ts_str).replace("Z", "+00:00")
+                    )
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=timezone.utc)
+                    if latest_ts is None or dt > latest_ts:
+                        latest_ts = dt
+                except (ValueError, TypeError):
+                    continue
+            if latest_ts is None:
+                return False
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=max_age_hours)
+            return latest_ts >= cutoff
+        finally:
+            await db.close()
+
+    return asyncio.run(_check())
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -460,6 +506,19 @@ def run_cycle(config: ResearchLoopConfig, dry_run: bool = False) -> None:
         config.pack.end_date,
         len(config.strategies),
     )
+
+    # Enforce require_recent_bars_hours guard before running cycle
+    if config.loop.require_recent_bars_hours is not None and not dry_run:
+        if not _check_recent_bars_freshness(
+            config.pack.db_path, config.loop.require_recent_bars_hours
+        ):
+            logger.warning(
+                "Skipping cycle: most recent bars in %s are older than "
+                "require_recent_bars_hours=%.1f — data may be stale.",
+                config.pack.db_path,
+                config.loop.require_recent_bars_hours,
+            )
+            return
 
     if dry_run:
         logger.info("[DRY RUN] Config validated. Steps that would run:")
