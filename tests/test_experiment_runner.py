@@ -90,3 +90,36 @@ def test_walk_forward_splitting():
 
 if __name__ == "__main__":
     pytest.main([__file__])
+
+def test_experiment_runner_persists_mc_bootstrap(tmp_path):
+    pack_path = tmp_path / "test_pack_mc.json"
+    pack = {
+        "bars": [
+            {"timestamp_ms": 1000, "open": 100, "high": 101, "low": 99, "close": 100, "symbol": "SPY"},
+            {"timestamp_ms": 2000, "open": 100, "high": 101, "low": 99, "close": 100, "symbol": "SPY"},
+        ],
+        "outcomes": [],
+        "regimes": [],
+    }
+    with open(pack_path, "w") as f:
+        json.dump(pack, f)
+
+    runner = ExperimentRunner(output_dir=str(tmp_path / "logs"))
+    config = ExperimentConfig(
+        strategy_class=MockStrategy,
+        strategy_params={"id": 2},
+        replay_pack_paths=[str(pack_path)],
+        starting_cash=10000.0,
+        mc_bootstrap_enabled=True,
+        mc_paths=100,
+        mc_method="bootstrap",
+        mc_random_seed=9,
+        mc_kill_thresholds={"mc_fraction_positive_min": 0.0},
+    )
+    runner.run(config)
+
+    artifacts = list((tmp_path / "logs").glob("*.json"))
+    assert artifacts
+    data = json.loads(artifacts[0].read_text())
+    assert "mc_bootstrap" in data["manifest"]
+    assert "metrics" in data["manifest"]["mc_bootstrap"]

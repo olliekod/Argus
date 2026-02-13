@@ -55,6 +55,13 @@ def main():
     parser.add_argument("--output", default="logs/experiments", help="Output directory for results")
     parser.add_argument("--cash", type=float, default=10000.0, help="Starting cash")
     parser.add_argument("--regime-stress", action="store_true", default=False, help="Run regime subset stress test after the main run")
+    parser.add_argument("--mc-bootstrap", action="store_true", default=False, help="Enable MC/bootstrap path stress over realized trades")
+    parser.add_argument("--mc-paths", type=int, default=1000, help="Number of MC paths when --mc-bootstrap is enabled")
+    parser.add_argument("--mc-method", default="bootstrap", choices=["bootstrap", "iid"], help="MC resampling method")
+    parser.add_argument("--mc-block-size", type=int, default=None, help="Optional fixed block size for bootstrap method")
+    parser.add_argument("--mc-seed", type=int, default=42, help="Random seed for MC bootstrap reproducibility")
+    parser.add_argument("--mc-ruin-level", type=float, default=0.2, help="Ruin threshold as fraction of starting cash")
+    parser.add_argument("--mc-kill-thresholds", default=None, help="JSON string or YAML file path with MC kill thresholds")
 
     args = parser.parse_args()
 
@@ -63,6 +70,16 @@ def main():
     if args.config:
         with open(args.config, "r") as f:
             params.update(yaml.safe_load(f))
+
+    mc_kill_thresholds: Dict[str, float] = {}
+    if args.mc_kill_thresholds:
+        candidate = Path(args.mc_kill_thresholds)
+        if candidate.exists():
+            with open(candidate, "r") as f:
+                loaded = yaml.safe_load(f) or {}
+                mc_kill_thresholds = dict(loaded)
+        else:
+            mc_kill_thresholds = dict(json.loads(args.mc_kill_thresholds))
 
     # 2. Resolve Strategy
     try:
@@ -83,7 +100,14 @@ def main():
             strategy_class=strat_cls,
             strategy_params=params,
             replay_pack_paths=args.pack,
-            starting_cash=args.cash
+            starting_cash=args.cash,
+            mc_bootstrap_enabled=args.mc_bootstrap,
+            mc_paths=args.mc_paths,
+            mc_method=args.mc_method,
+            mc_block_size=args.mc_block_size,
+            mc_random_seed=args.mc_seed,
+            mc_ruin_level=args.mc_ruin_level,
+            mc_kill_thresholds=mc_kill_thresholds,
         )
         
         results = runner.run_parameter_grid(strat_cls, base_config, grid)
@@ -97,7 +121,14 @@ def main():
             strategy_class=strat_cls,
             strategy_params=params,
             replay_pack_paths=args.pack,
-            starting_cash=args.cash
+            starting_cash=args.cash,
+            mc_bootstrap_enabled=args.mc_bootstrap,
+            mc_paths=args.mc_paths,
+            mc_method=args.mc_method,
+            mc_block_size=args.mc_block_size,
+            mc_random_seed=args.mc_seed,
+            mc_ruin_level=args.mc_ruin_level,
+            mc_kill_thresholds=mc_kill_thresholds,
         )
         
         result = runner.run(config)
@@ -115,6 +146,8 @@ def main():
         print(f"Max DD:        {p['max_drawdown']:>10}")
         print("-" * 40)
         print(f"Output saved to: {args.output}")
+        if args.mc_bootstrap:
+            print("MC/bootstrap summary persisted in experiment artifact manifest.mc_bootstrap")
         if args.regime_stress:
             packs = [runner.load_pack(p) for p in args.pack]
             bars = []

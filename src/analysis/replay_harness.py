@@ -420,6 +420,7 @@ class VirtualPortfolio:
             "open_positions": len(self._positions),
             "equity_curve_points": len(self._equity_curve),
             "regime_breakdown": self.get_regime_breakdown(),
+            "trade_pnls": [round(p.realized_pnl, 6) for p in self._closed_positions],
         }
 
     def get_regime_breakdown(self) -> Dict[str, Dict[str, Any]]:
@@ -483,6 +484,7 @@ class ReplayResult:
     outcomes_used: int
     session_distribution: Dict[str, int]
     regimes_loaded: int = 0
+    trade_pnls: List[float] = field(default_factory=list)
 
     def summary(self) -> Dict[str, Any]:
         return {
@@ -493,6 +495,7 @@ class ReplayResult:
             "portfolio": self.portfolio_summary,
             "execution": self.execution_summary,
             "sessions": self.session_distribution,
+            "trade_pnls": list(self.trade_pnls),
         }
 
 
@@ -680,6 +683,7 @@ class ReplayHarness:
             outcomes_used=outcomes_used,
             session_distribution=dict(self._session_counts),
             regimes_loaded=len(self._regimes_sorted),
+            trade_pnls=[float(p.realized_pnl) for p in self._portfolio.closed_positions],
         )
 
         logger.info(
