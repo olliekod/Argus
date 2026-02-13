@@ -1,0 +1,78 @@
+# =============================================================================
+# ARGUS - Strategy Research Loop Configuration
+# =============================================================================
+# This config drives the strategy_research_loop.py script.
+# Copy to research_loop.yaml and customize for your environment.
+#
+# Usage:
+#   python scripts/strategy_research_loop.py --config config/research_loop.yaml --once
+# =============================================================================
+
+# ── Pack specification ─────────────────────────────────────────────────────
+# How to build replay packs for this cycle.
+pack:
+  # One of: "single" (use symbols list) or "universe" (liquid ETF universe).
+  mode: "single"
+  # For mode=single: list of symbols to pack.
+  symbols: ["SPY"]
+  # Date range: either fixed or "last_n_days" (computed at run time).
+  # Option A: fixed range
+  start_date: "2026-02-01"
+  end_date: "2026-02-11"
+  # Option B: use last_n_days (optional; overrides start/end if set)
+  # last_n_days: 7
+  # Bars provider override (null = use data_sources.bars_primary from config).
+  bars_provider: null
+  # Options snapshot provider override (null = use config default).
+  options_snapshot_provider: null
+  # Output directory for built packs.
+  packs_output_dir: "data/packs"
+  # DB path for replay_pack and outcomes.
+  db_path: "data/argus.db"
+
+# ── Outcomes ───────────────────────────────────────────────────────────────
+# Ensure outcomes exist before building packs.
+outcomes:
+  # If true, run outcomes backfill for pack date range before building packs.
+  ensure_before_pack: true
+  # Bar duration in seconds (must match bars in DB).
+  bar_duration: 60
+
+# ── Strategies and experiments ──────────────────────────────────────────────
+strategies:
+  - strategy_class: "VRPCreditSpreadStrategy"
+    # Base params (merged with sweep if present).
+    params: {}
+    # Optional: path to YAML param grid (same format as run_experiment.py --sweep).
+    sweep: null
+  # - strategy_class: "AnotherStrategy"
+  #   params: {}
+  #   sweep: "config/another_sweep.yaml"
+
+# ── Experiment runner options ───────────────────────────────────────────────
+experiment:
+  output_dir: "logs/experiments"
+  starting_cash: 10000.0
+  regime_stress: true
+  mc_bootstrap: true
+  mc_paths: 1000
+  mc_method: "bootstrap"
+  mc_block_size: null
+  mc_seed: 42
+  mc_ruin_level: 0.2
+  mc_kill_thresholds: null
+
+# ── Evaluation ──────────────────────────────────────────────────────────────
+evaluation:
+  # Where evaluator reads experiment outputs from.
+  input_dir: null   # null => use experiment.output_dir
+  kill_thresholds: null   # path to YAML or null for defaults
+  rankings_output_dir: "logs"
+  killed_output_path: null
+  candidate_set_output_path: null
+
+# ── Loop (daemon) ───────────────────────────────────────────────────────────
+# Only used when running without --once.
+loop:
+  interval_hours: 24
+  require_recent_bars_hours: null
