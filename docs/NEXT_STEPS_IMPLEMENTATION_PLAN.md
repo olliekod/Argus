@@ -161,6 +161,7 @@ All items in §§1–3 were verified against the codebase:
 - **§2.2 Orchestrator:** All `create_task()` in `run()` are appended to `self._tasks`; `stop()` calls `telegram.stop_polling()` then cancels and awaits `self._tasks`. Invariant documented at lines 221–223.
 - **§3.1 Replay reset:** `replay_harness.py` calls `self._exec.reset()` at start of `run()`; `tests/test_replay_reset.py` verifies reset is called.
 - **§3.2 Secrets:** `config.save_secrets()` calls `path.chmod(0o600)`; `tests/test_secrets_permissions.py` asserts mode `0o600`.
+- **IV consensus (2026-02-13):** IVConsensusEngine implemented; snapshot enrichment uses consensus when available; legacy `get_atm_iv` path only used when the cache object supports it. Enrichment fallback bug (AttributeError when consensus returned no IV) fixed. Truth map and next steps updated in MASTER_PLAN §2 and §8.4.
 
 ---
 

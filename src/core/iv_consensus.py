@@ -75,6 +75,11 @@ _OCC_PATTERN = re.compile(r"^\.?([A-Z]+)(\d{6})([CP])(\d+(?:\.\d+)?)$")
 
 
 def normalize_iv(iv: Optional[float]) -> Optional[float]:
+    """Normalize IV to decimal (e.g. 0.22 = 22%). Rejects None/NaN/<=0 or >10.
+
+    If the raw value is > 1.5, it is interpreted as percent (e.g. 47.0 → 0.47).
+    Logged at DEBUG as normalize_iv_percent_interpreted so we don't flood WARNING.
+    """
     if iv is None:
         return None
     try:
@@ -88,7 +93,10 @@ def normalize_iv(iv: Optional[float]) -> Optional[float]:
     if x > 1.5:
         maybe = x / 100.0
         if maybe <= 1.5:
-            logger.warning("normalize_iv_percent_interpreted", extra={"raw_iv": x, "normalized": maybe})
+            logger.debug(
+                "normalize_iv_percent_interpreted raw_iv=%.4f normalized=%.4f (feed sent percent, converted to decimal)",
+                x, maybe,
+            )
             return maybe
     return x
 

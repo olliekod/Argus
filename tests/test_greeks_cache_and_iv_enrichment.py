@@ -28,6 +28,7 @@ from src.core.greeks_cache import (
     _parse_option_symbol,
     enrich_snapshot_iv,
 )
+from src.core.iv_consensus import IVConsensusEngine
 from src.core.option_events import (
     OptionChainSnapshotEvent,
     OptionQuoteEvent,
@@ -390,6 +391,14 @@ class TestEnrichSnapshotIV:
         enriched = enrich_snapshot_iv(snapshot, cache)
 
         # Must NOT enrich with March IV for an April snapshot
+        assert enriched.atm_iv is None
+
+    def test_consensus_engine_with_no_iv_returns_snapshot_no_attribute_error(self):
+        """When greeks_cache is IVConsensusEngine and consensus has no data, must not call get_atm_iv (engine has no such method)."""
+        engine = IVConsensusEngine()
+        snapshot = _make_snapshot(atm_iv=None, recv_ts_ms=1_700_000_060_000)
+        enriched = enrich_snapshot_iv(snapshot, engine)
+        assert enriched is snapshot
         assert enriched.atm_iv is None
 
 

@@ -390,6 +390,15 @@ def enrich_snapshot_iv(
         )
         return snapshot
 
+    # Legacy path: only when caller passed a GreeksCache (has get_atm_iv).
+    # When greeks_cache is IVConsensusEngine-only, we already tried consensus above.
+    if not hasattr(greeks_cache, "get_atm_iv"):
+        logger.debug(
+            "No consensus IV for %s at recv_ts=%d; no legacy cache, skipping enrichment",
+            snapshot.symbol, snapshot.recv_ts_ms,
+        )
+        return snapshot
+
     # Try provider IV from DXLink Greeks cache (match expiration to prevent
     # cross-expiration contamination)
     atm_iv = greeks_cache.get_atm_iv(

@@ -59,12 +59,14 @@ flowchart LR
 
 - **Bars and outcomes:** Alpaca (or configured bar provider).
 - **Options snapshots:** Tastytrade REST (primary); **Public.com** (secondary when `public_options.enabled`). Structure can come from Tastytrade when Alpaca options is off; Public provides greeks/IV via batch API.
-- **IV source:** Tastytrade: DXLink Greeks → GreeksCache → snapshot `atm_iv`. Public: Get option greeks API → snapshot `atm_iv` (canonical OSI matching, optional second source).
+- **IV consolidation:** A single **IVConsensusEngine** ([src/core/iv_consensus.py](src/core/iv_consensus.py)) consolidates IV and Greeks from (1) DXLink streamed events and (2) public/Tastytrade snapshots. It is expiry-aware (no cross-expiration bleed), time-gated by `recv_ts_ms`, and exposes configurable policies: `prefer_dxlink` (default), `winner_based`, `blended`. Discrepancy scoring and structured logs surface quality and provenance for monitoring.
+- **Enrichment path:** Snapshot enrichment ([src/core/greeks_cache.py](src/core/greeks_cache.py) `enrich_snapshot_iv`) prefers the consensus engine when the passed object has `get_atm_consensus`; returns ATM IV from consensus. Legacy path (GreeksCache `get_atm_iv`) is used only when the object has `get_atm_iv` (e.g. tests or a dual cache); orchestrator passes the engine only, so no cross-expiration fallback and no use of legacy cache in production.
+- **Orchestrator:** Instantiates `IVConsensusEngine`, feeds DXLink via `observe_dxlink_greeks`, public/Tastytrade snapshots via `observe_public_snapshot`, and enriches with consensus. Strategy-facing helpers: `get_consensus_atm_iv`, `get_consensus_contract_iv`.
 - **Replay:** Uses snapshot `atm_iv`; no lookahead (gating by `recv_ts_ms`).
 - **Storage:** Only ATM IV persisted; no DB bloat from tick-level Greeks.
 - **Health and comparison:** `scripts/options_providers_health.py` pre-checks both providers (snapshots, atm_iv %, symbols); `compare_options_snapshot_providers.py` for post-close comparison.
 
-**Remaining risk (ordering/timing):** Outcomes depend on GreeksCache (Tastytrade) or Public greeks response being correct before snapshot publish. Cold start and illiquid symbols: E2E metrics should show `atm_iv` presence climbing after warmup. Public 0% atm_iv historically was addressed with OSI canonical matching and IV key fallback; re-validate after all-day Public runs.
+**Remaining risk (ordering/timing):** Cold start and illiquid symbols still benefit from E2E checks; discrepancy rollup (`get_discrepancy_rollup`) is available for monitoring. Public 0% atm_iv historically was addressed with OSI canonical matching and IV key fallback; re-validate after all-day Public runs.
 
 ---
 
@@ -88,7 +90,7 @@ flowchart LR
 | **9** | Intelligence API product | Future | Expose bars, regimes, options intelligence, spread candidates, signals for subscription revenue. |
 | **10** | Self-improving system | Future | Automatic idea testing, strategy mutation, performance pruning, adaptive weighting. |
 
-**Where we are now:** Phase 4C including deploy gates is done. Phase 5 prelude (sizing, registry, allocation engine) is done. The research loop still stops at rankings/candidate set and does not run allocation. **Next priorities:** (1) Close the research–allocation loop, (2) P1 audit (10.2, 10.4), (3) Portfolio risk engine (Phase 5 full), (4) Strategy lifecycle.
+**Where we are now:** Phase 4C including deploy gates is done. Phase 5 prelude (sizing, registry, allocation engine) is done. **IV consolidation is done:** deterministic, expiry-aware IV/greeks from DXLink + public snapshots via `IVConsensusEngine`; enrichment and replay are time-gated by `recv_ts_ms`; strategies can use `get_consensus_atm_iv` / `get_consensus_contract_iv`. **Next priorities:** (1) Close the research–allocation loop, (2) P1 audit (10.2, 10.4), (3) Portfolio risk engine (Phase 5 full), (4) Strategy lifecycle.
 
 ---
 
@@ -163,7 +165,7 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 ## 8. Current TODOs
 
 
-**Audit summary:** The codebase audit (2026-02-12) identified two **critical bugs (fixed):** (1) cross-expiration IV contamination in `greeks_cache` (ATM IV could mix expirations); (2) DXLink Greeks streamer was never started, so `_greeks_cache` stayed empty. It also listed **10 ranked risks:** items 1–2 fixed; 3–10 open (Alpaca UTC, Deribit rate limiter, options snapshot fire-and-forget, task tracking verification, bar lock + fsync, DXLink error handling, ExecutionModel reset, secrets permissions, plus P3 backlog). One audit claim is outdated: orchestrator **does** append polling/streaming tasks to `self._tasks` in `run()`; the remaining action is to verify all `create_task` call sites are tracked and shutdown is clean (TODO 10.4).
+**Audit summary:** The codebase audit (2026-02-12) identified three **critical bugs (fixed):** (1) cross-expiration IV contamination in `greeks_cache` (ATM IV could mix expirations); (2) DXLink Greeks streamer was never started, so `_greeks_cache` stayed empty; (3) enrichment fallback crash: when the orchestrator passed `IVConsensusEngine` to `enrich_snapshot_iv` and consensus returned no IV for both put and call, the code called `greeks_cache.get_atm_iv()` which the engine does not implement, causing `AttributeError` — fixed by gating the legacy path on `hasattr(greeks_cache, "get_atm_iv")`. It also listed **10 ranked risks:** items 1–2 fixed; 3–10 open (Alpaca UTC, Deribit rate limiter, options snapshot fire-and-forget, task tracking verification, bar lock + fsync, DXLink error handling, ExecutionModel reset, secrets permissions, plus P3 backlog). One audit claim is outdated: orchestrator **does** append polling/streaming tasks to `self._tasks` in `run()`; the remaining action is to verify all `create_task` call sites are tracked and shutdown is clean (TODO 10.4).
 
 ### 8.1 Audit-derived fixes 
 
@@ -234,11 +236,11 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 
 **Assessment (codebase vs Master Plan):**
 
-- **Phases 0–4B:** In place. Event bus, bars, regimes, options pipeline, outcome engine, replay harness, experiment runner, execution model, and (after audit fixes) DXLink Greeks + cross-expiration IV are the backbone. Replay packs with bars + outcomes + regimes + snapshots work; VRP strategy can consume `atm_iv` and `realized_vol` in replay.
+- **Phases 0–4B:** In place. Event bus, bars, regimes, options pipeline, outcome engine, replay harness, experiment runner, execution model, and (after audit fixes) DXLink Greeks + IV consensus are the backbone. IV consensus is the single source for snapshot IV in live/replay when using the engine. Replay packs with bars + outcomes + regimes + snapshots work; VRP strategy can consume `atm_iv` and `realized_vol` in replay.
 - **Phase 4C:** Done. Regime sensitivity scoring, parameter stability auto-kill (robustness/walk-forward penalties), MC/bootstrap on realized trades, regime-subset stress, Strategy Research Loop, and deploy gates (DSR, Reality Check, slippage sensitivity) — all integrated in ExperimentRunner and StrategyEvaluator.
-- **Audit:** Two critical bugs fixed. P1: 10.1 and 10.3 fixed; 10.2 and 10.4 remain. P2–P3 items (bar lock, DXLink errors, ExecutionModel reset, secrets permissions, VRP RV, etc.) still open.
+- **Audit:** Three critical bugs fixed (cross-expiration IV, DXLink streamer not started, enrichment fallback AttributeError). P1: 10.1 and 10.3 fixed; 10.2 and 10.4 remain. P2–P3 items (bar lock, DXLink errors, ExecutionModel reset, secrets permissions, VRP RV, etc.) still open.
 - **Public API:** Done. Second IV/Greeks source; health script and provider comparison; reduces dependence on DXLink alone.
-- **Strategic gaps:** Allocation **prelude** and sizing are in place; research loop is **not yet wired** to StrategyRegistry or AllocationEngine (no step that builds forecasts from rankings and runs allocation). Still missing: full portfolio risk engine, strategy lifecycle/kill engine, live vs backtest drift monitor.
+- **Strategic gaps:** Allocation **prelude** and sizing are in place; research loop **can** run allocation and persist allocations when config is set (loop wiring implemented). Still missing: full portfolio risk engine, strategy lifecycle/kill engine, live vs backtest drift monitor.
 
 **Recommended next steps (ordered):**
 
@@ -369,4 +371,5 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 | [docs/strategy_evaluation.md](docs/strategy_evaluation.md) | Strategy evaluator metrics, composite scoring, penalties, deployability interpretation. |
 | [ONBOARDING_ROADMAP.md](ONBOARDING_ROADMAP.md) | Learning path through the codebase: architecture, data flow, config, soak/tape, glossary. |
 | [argus_strategy_backlog.md](argus_strategy_backlog.md) | Idea parking lot and strategy evaluation framework; master plan is authoritative for priority order. |
+| [src/core/iv_consensus.py](src/core/iv_consensus.py) | IVConsensusEngine: expiry-aware consolidation of DXLink + public snapshot IV/greeks, policies (prefer_dxlink, winner_based, blended), discrepancy rollup. |
 | Phase 4C implementation plan  | Regime sensitivity, parameter stability auto-kill, MC/bootstrap (regime-stress + bootstrap) implementation details; clarifies that “MC/bootstrap” here is not the GPU Heston Monte Carlo. |
