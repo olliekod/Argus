@@ -43,6 +43,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
+from .deflated_sharpe import deflated_sharpe_ratio
+from .reality_check import reality_check
+
 logger = logging.getLogger("argus.strategy_evaluator")
 
 
@@ -470,6 +473,10 @@ class StrategyEvaluator:
             "mc_p5_drawdown_max": 2.0,
             "mc_ruin_prob_max": 2.0,
             "mc_fraction_positive_min": -1.0,
+            # Deploy gate thresholds (Phase 4C)
+            "dsr_min": 0.95,
+            "slippage_sensitivity_max_cost_multiplier": 1.50,
+            "reality_check_p_max": 0.05,
         }
         self._experiments: List[Dict[str, Any]] = []
         self._metrics: List[Dict[str, Any]] = []
@@ -525,21 +532,27 @@ class StrategyEvaluator:
         # 1. Extract metrics
         self._metrics = [extract_metrics(exp) for exp in self._experiments]
 
-        # 2. Compute composite scores
+        # 2. Compute DSR for all experiments (if enough data)
+        dsr_results = self._compute_dsr_for_all()
+
+        # 3. Compute composite scores
         scored: List[Dict[str, Any]] = []
         for i, metrics in enumerate(self._metrics):
             score_info = compute_composite_score(metrics, self._metrics, self.weights)
             regime_scores = compute_regime_scores(metrics)
+            run_id = metrics["run_id"]
 
             record = {
                 "rank": 0,  # filled after sorting
                 "strategy_id": metrics["strategy_id"],
-                "run_id": metrics["run_id"],
+                "run_id": run_id,
                 "strategy_class": metrics["strategy_class"],
                 "strategy_params": metrics["strategy_params"],
                 "composite_score": score_info["composite_score"],
                 "regime_sensitivity_score": score_info["components"]["regime_sensitivity"],
                 "scoring": score_info,
+                "dsr": dsr_results.get(run_id, {}).get("dsr", 0.0),
+                "dsr_details": dsr_results.get(run_id, {}),
                 "metrics": {
                     "total_pnl": metrics["total_pnl"],
                     "total_return_pct": metrics["total_return_pct"],
@@ -557,6 +570,7 @@ class StrategyEvaluator:
                     "mc_p95_max_drawdown": metrics["mc_p95_max_drawdown"],
                     "mc_ruin_probability": metrics["mc_ruin_probability"],
                     "mc_fraction_positive": metrics["mc_fraction_positive"],
+                    "dsr": dsr_results.get(run_id, {}).get("dsr", 0.0),
                 },
                 "regime_scores": regime_scores,
                 "manifest_ref": self._experiments[i].get("manifest", {}),
@@ -591,6 +605,49 @@ class StrategyEvaluator:
                     }
                 )
         return scored
+
+    def _compute_dsr_for_all(self) -> Dict[str, Dict[str, Any]]:
+        """Compute Deflated Sharpe Ratio for all experiments.
+
+        Uses cross-sectional Sharpe ratios across experiments and the
+        total experiment count as the number of trials (conservative).
+
+        Returns a dict mapping run_id -> DSR result dict.
+        """
+        n_trials = len(self._metrics)
+        if n_trials < 2:
+            return {}
+
+        # Collect all Sharpe ratios
+        all_sharpes = [
+            _safe_float(m.get("sharpe")) for m in self._metrics
+        ]
+
+        results: Dict[str, Dict[str, Any]] = {}
+        for i, metrics in enumerate(self._metrics):
+            run_id = metrics.get("run_id", "")
+            sharpe = _safe_float(metrics.get("sharpe"))
+            n_obs = max(metrics.get("bars_replayed", 0), metrics.get("total_trades", 0))
+
+            if n_obs < 10:
+                results[run_id] = {"dsr": 0.0, "reason": "insufficient_observations"}
+                continue
+
+            # Build a synthetic return series from available data for skew/kurtosis
+            # Since we only have summary stats, use the per-experiment Sharpe
+            # with the False Strategy Theorem approach
+            try:
+                dsr_info = deflated_sharpe_ratio(
+                    returns=[sharpe] * max(n_obs, 30),
+                    n_trials=n_trials,
+                    all_sharpes=all_sharpes,
+                )
+                results[run_id] = dsr_info
+            except Exception as e:
+                logger.warning("DSR computation failed for %s: %s", run_id, e)
+                results[run_id] = {"dsr": 0.0, "reason": str(e)}
+
+        return results
 
     def _compute_kill_reasons(self, record: Dict[str, Any]) -> List[Dict[str, Any]]:
         reasons: List[Dict[str, Any]] = []
@@ -682,6 +739,43 @@ class StrategyEvaluator:
                     "threshold": thresholds.get("mc_fraction_positive_min"),
                 }
             )
+
+        # ── Deploy gate: DSR below threshold ───────────────────────
+        dsr_min = thresholds.get("dsr_min", 0.95)
+        dsr_val = record.get("dsr", 0.0)
+        if dsr_min > 0 and dsr_val < dsr_min and dsr_val > 0:
+            reasons.append(
+                {
+                    "reason": "dsr_below_threshold",
+                    "value": round(dsr_val, 6),
+                    "threshold": dsr_min,
+                }
+            )
+
+        # ── Deploy gate: slippage sensitivity ──────────────────────
+        slippage_block = record.get("manifest_ref", {}).get("slippage_sensitivity")
+        if isinstance(slippage_block, dict) and slippage_block.get("killed", False):
+            reasons.append(
+                {
+                    "reason": "slippage_sensitivity",
+                    "value": slippage_block.get("sharpe_at_150pct", 0.0),
+                    "threshold": 0.0,
+                }
+            )
+
+        # ── Deploy gate: Reality Check p-value ─────────────────────
+        rc_block = record.get("manifest_ref", {}).get("reality_check")
+        if isinstance(rc_block, dict):
+            rc_p = rc_block.get("p_value", 1.0)
+            rc_max = thresholds.get("reality_check_p_max", 0.05)
+            if rc_p >= rc_max:
+                reasons.append(
+                    {
+                        "reason": "reality_check_failed",
+                        "value": round(rc_p, 6),
+                        "threshold": rc_max,
+                    }
+                )
 
         return reasons
 

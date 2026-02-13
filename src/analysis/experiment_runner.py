@@ -177,6 +177,102 @@ class ExperimentRunner:
             results.append(self.run(config))
         return results
 
+    def run_cost_sensitivity_sweep(
+        self,
+        config: ExperimentConfig,
+        cost_multipliers: Optional[List[float]] = None,
+    ) -> Dict[str, Any]:
+        """Run experiments at multiple cost multipliers.
+
+        Tests whether a strategy's edge survives reasonable cost
+        inflation.  Kills if edge disappears at +50% costs.
+
+        Parameters
+        ----------
+        config : ExperimentConfig
+            Base experiment configuration.
+        cost_multipliers : list of float, optional
+            Cost multipliers to test (default [1.0, 1.25, 1.50]).
+
+        Returns
+        -------
+        dict
+            ``killed``: bool, ``results``: list of per-multiplier dicts,
+            ``sharpe_at_100pct``, ``sharpe_at_125pct``, ``sharpe_at_150pct``,
+            ``mean_return_at_150pct``.
+        """
+        if cost_multipliers is None:
+            cost_multipliers = [1.0, 1.25, 1.50]
+
+        base_exec_config = config.execution_config or ExecutionConfig()
+        results = []
+
+        for cm in cost_multipliers:
+            # Create a new ExecutionConfig with scaled costs
+            scaled_config = ExecutionConfig(
+                slippage_per_contract=base_exec_config.slippage_per_contract,
+                min_bid_size=base_exec_config.min_bid_size,
+                min_ask_size=base_exec_config.min_ask_size,
+                max_stale_ms=base_exec_config.max_stale_ms,
+                max_spread_pct=base_exec_config.max_spread_pct,
+                commission_per_contract=base_exec_config.commission_per_contract,
+                allow_partial_fills=base_exec_config.allow_partial_fills,
+                cost_multiplier=cm,
+            )
+
+            sweep_config = ExperimentConfig(
+                strategy_class=config.strategy_class,
+                strategy_params=dict(config.strategy_params),
+                replay_pack_paths=list(config.replay_pack_paths),
+                starting_cash=config.starting_cash,
+                execution_config=scaled_config,
+                output_dir=config.output_dir,
+                tag=f"cost_{int(cm * 100)}pct",
+                mc_bootstrap_enabled=False,
+            )
+
+            result = self.run(sweep_config)
+            summary = result.summary()
+            portfolio = summary.get("portfolio", {})
+
+            results.append({
+                "cost_multiplier": cm,
+                "sharpe": portfolio.get("sharpe_annualized_proxy", 0.0),
+                "total_pnl": portfolio.get("total_realized_pnl", 0.0),
+                "total_return_pct": portfolio.get("total_return_pct", 0.0),
+                "mean_return_per_trade": (
+                    portfolio.get("total_realized_pnl", 0.0)
+                    / max(portfolio.get("total_trades", 1), 1)
+                ),
+                "total_trades": portfolio.get("total_trades", 0),
+            })
+
+        # Evaluate: kill if edge disappears at +50%
+        sharpe_at_150 = 0.0
+        mean_ret_at_150 = 0.0
+        sharpe_at_100 = 0.0
+        sharpe_at_125 = 0.0
+
+        for r in results:
+            if r["cost_multiplier"] == 1.0:
+                sharpe_at_100 = r["sharpe"]
+            elif r["cost_multiplier"] == 1.25:
+                sharpe_at_125 = r["sharpe"]
+            elif r["cost_multiplier"] == 1.50:
+                sharpe_at_150 = r["sharpe"]
+                mean_ret_at_150 = r["mean_return_per_trade"]
+
+        killed = sharpe_at_150 < 0 or mean_ret_at_150 <= 0
+
+        return {
+            "killed": killed,
+            "results": results,
+            "sharpe_at_100pct": sharpe_at_100,
+            "sharpe_at_125pct": sharpe_at_125,
+            "sharpe_at_150pct": sharpe_at_150,
+            "mean_return_at_150pct": mean_ret_at_150,
+        }
+
     def _extract_pack_data_sources(self, pack_paths: List[str]) -> Dict[str, Any]:
         """Extract data-source metadata from loaded packs."""
         bars_providers = set()

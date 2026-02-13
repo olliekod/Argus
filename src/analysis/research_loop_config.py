@@ -64,12 +64,34 @@ class ExperimentOpts:
 
 
 @dataclass
+class DeployGatesOpts:
+    """Configuration for Phase 4C deploy gates."""
+    dsr_min: float = 0.95
+    dsr_trials_mode: str = "count"  # "count" or "clustered"
+    slippage_sweep: bool = True
+    slippage_sweep_kill_if_edge_disappears: bool = True
+    reality_check_benchmark: Optional[str] = "buy_and_hold"  # or None to skip
+    reality_check_p_max: float = 0.05
+
+
+@dataclass
+class AllocationOpts:
+    """Configuration for Phase 5 allocation engine."""
+    kelly_fraction: float = 0.25
+    per_play_cap: float = 0.07
+    vol_target_annual: Optional[float] = 0.10
+    min_edge_over_cost: float = 0.0
+
+
+@dataclass
 class EvaluationOpts:
     input_dir: str
     kill_thresholds: Optional[str]  # path to YAML or None
     rankings_output_dir: str
     killed_output_path: Optional[str]
     candidate_set_output_path: Optional[str]
+    deploy_gates: Optional[DeployGatesOpts] = None
+    allocation: Optional[AllocationOpts] = None
 
 
 @dataclass
@@ -251,6 +273,36 @@ def load_research_loop_config(
     if kill_thresh_path:
         kill_thresh_path = _resolve_path(kill_thresh_path, project_root)
 
+    # ── Deploy gates (Phase 4C) ──────────────────────────────────
+    gates_raw = eval_raw.get("deploy_gates", {})
+    deploy_gates = None
+    if gates_raw:
+        deploy_gates = DeployGatesOpts(
+            dsr_min=float(gates_raw.get("dsr_min", 0.95)),
+            dsr_trials_mode=gates_raw.get("dsr_trials_mode", "count"),
+            slippage_sweep=bool(gates_raw.get("slippage_sweep", True)),
+            slippage_sweep_kill_if_edge_disappears=bool(
+                gates_raw.get("slippage_sweep_kill_if_edge_disappears", True)
+            ),
+            reality_check_benchmark=gates_raw.get("reality_check_benchmark", "buy_and_hold"),
+            reality_check_p_max=float(gates_raw.get("reality_check_p_max", 0.05)),
+        )
+
+    # ── Allocation (Phase 5 prelude) ──────────────────────────────
+    alloc_raw = eval_raw.get("allocation") or raw.get("allocation", {})
+    allocation = None
+    if alloc_raw:
+        allocation = AllocationOpts(
+            kelly_fraction=float(alloc_raw.get("kelly_fraction", 0.25)),
+            per_play_cap=float(alloc_raw.get("per_play_cap", 0.07)),
+            vol_target_annual=(
+                float(alloc_raw["vol_target_annual"])
+                if alloc_raw.get("vol_target_annual") is not None
+                else 0.10
+            ),
+            min_edge_over_cost=float(alloc_raw.get("min_edge_over_cost", 0.0)),
+        )
+
     evaluation = EvaluationOpts(
         input_dir=eval_input,
         kill_thresholds=kill_thresh_path,
@@ -263,6 +315,8 @@ def load_research_loop_config(
         candidate_set_output_path=_resolve_path(
             eval_raw.get("candidate_set_output_path"), project_root
         ),
+        deploy_gates=deploy_gates,
+        allocation=allocation,
     )
 
     # ── Loop ───────────────────────────────────────────────────────────

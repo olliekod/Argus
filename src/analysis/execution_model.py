@@ -70,6 +70,11 @@ class ExecutionConfig:
     # Whether to allow partial fills (False = all-or-nothing)
     allow_partial_fills: bool = False
 
+    # Cost multiplier for slippage-sensitivity sweeps.
+    # 1.0 = baseline; 1.25 = +25% costs; 1.50 = +50% costs.
+    # Scales slippage_per_contract and commission_per_contract.
+    cost_multiplier: float = 1.0
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Fill / Rejection types
@@ -244,7 +249,9 @@ class ExecutionModel:
             return reject
 
         # ── Compute fill price ───────────────────────────────────────
-        slip = self._cfg.slippage_per_contract
+        # Apply cost_multiplier for slippage-sensitivity sweeps
+        cm = self._cfg.cost_multiplier
+        slip = self._cfg.slippage_per_contract * cm
         if side == "SELL":
             raw_price = quote.bid
             fill_price = raw_price - slip
@@ -255,7 +262,7 @@ class ExecutionModel:
         # Floor at zero (can't pay negative)
         fill_price = max(fill_price, 0.0)
 
-        commission = self._cfg.commission_per_contract * quantity
+        commission = self._cfg.commission_per_contract * cm * quantity
 
         result = FillResult(
             filled=True,
