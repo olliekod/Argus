@@ -76,6 +76,11 @@ evaluation:
     kelly_fraction: 0.25
     per_play_cap: 0.07
     vol_target_annual: 0.10
+    # Optional options-risk sizing override; either a single float or per-strategy map.
+    # max_loss_per_contract: 300.0
+    # max_loss_per_contract:
+    #   VRP_v1: 300.0
+    #   VRP_v2: 450.0
   allocations_output_path: null   # e.g. "logs/allocations.json"
   equity: 10000.0
   min_dsr: 0.0

@@ -192,6 +192,32 @@ class TestConfigLoader:
         config = load_research_loop_config(cfg_path, project_root=tmp_path)
         assert config.strategies[0].sweep == str(tmp_path / "config" / "vrp_sweep.yaml")
 
+    def test_allocation_max_loss_per_contract_float(self, tmp_path):
+        raw = _minimal_config()
+        raw["evaluation"]["allocation"] = {
+            "kelly_fraction": 0.25,
+            "per_play_cap": 0.07,
+            "max_loss_per_contract": 250.0,
+        }
+        cfg_path = _write_yaml(tmp_path / "config.yaml", raw)
+
+        config = load_research_loop_config(cfg_path, project_root=tmp_path)
+        assert config.evaluation.allocation is not None
+        assert config.evaluation.allocation.max_loss_per_contract == 250.0
+
+    def test_allocation_max_loss_per_contract_dict(self, tmp_path):
+        raw = _minimal_config()
+        raw["evaluation"]["allocation"] = {
+            "kelly_fraction": 0.25,
+            "per_play_cap": 0.07,
+            "max_loss_per_contract": {"VRP_v1": 300.0, "VRP_v2": 450.0},
+        }
+        cfg_path = _write_yaml(tmp_path / "config.yaml", raw)
+
+        config = load_research_loop_config(cfg_path, project_root=tmp_path)
+        assert config.evaluation.allocation is not None
+        assert config.evaluation.allocation.max_loss_per_contract == {"VRP_v1": 300.0, "VRP_v2": 450.0}
+
     def test_multiple_strategies(self, tmp_path):
         raw = _minimal_config()
         raw["strategies"] = [

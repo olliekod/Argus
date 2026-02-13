@@ -209,6 +209,19 @@ class TestRunAllocation:
         assert "allocations" in data
         assert isinstance(data["allocations"], list)
 
+    def test_behavior_unchanged_without_max_loss_config(self, tmp_path):
+        """Without max_loss_per_contract, allocations still run and contracts are null."""
+        output = str(tmp_path / "allocations.json")
+        alloc = AllocationOpts(kelly_fraction=0.25, per_play_cap=0.07)
+        config = _make_config(alloc_output_path=output, allocation=alloc)
+        run_allocation(config, _make_rankings())
+
+        with open(output) as f:
+            data = json.load(f)
+
+        assert data["config"].get("max_loss_per_contract") is None
+        assert len(data["allocations"]) > 0
+
     def test_allocation_fields(self, tmp_path):
         """Each allocation entry has required fields."""
         output = str(tmp_path / "allocations.json")
@@ -286,6 +299,43 @@ class TestRunAllocation:
         )
         result = run_allocation(config, _make_rankings())
         assert result is None
+
+    def test_max_loss_per_contract_from_allocation_config_reduces_contracts(self, tmp_path):
+        """Higher configured max loss should reduce contracts for a strategy."""
+        output = str(tmp_path / "allocations.json")
+        alloc = AllocationOpts(
+            kelly_fraction=0.25,
+            per_play_cap=0.07,
+            max_loss_per_contract={"VRP_v1": 1000.0, "VRP_v2": 100.0},
+        )
+        config = _make_config(alloc_output_path=output, allocation=alloc)
+        run_allocation(config, _make_rankings())
+
+        with open(output) as f:
+            data = json.load(f)
+
+        contracts = {a["strategy_id"]: a["contracts"] for a in data["allocations"]}
+        assert contracts["VRP_v1"] < contracts["VRP_v2"]
+
+    def test_max_loss_per_contract_strategy_params_override_config(self, tmp_path):
+        """strategy_params max_loss_per_contract should override allocation defaults."""
+        output = str(tmp_path / "allocations.json")
+        rankings = _make_rankings()
+        rankings[0]["strategy_params"]["max_loss_per_contract"] = 1200.0
+
+        alloc = AllocationOpts(
+            kelly_fraction=0.25,
+            per_play_cap=0.07,
+            max_loss_per_contract=100.0,
+        )
+        config = _make_config(alloc_output_path=output, allocation=alloc)
+        run_allocation(config, rankings)
+
+        with open(output) as f:
+            data = json.load(f)
+
+        contracts = {a["strategy_id"]: a["contracts"] for a in data["allocations"]}
+        assert contracts["VRP_v1"] < contracts["VRP_v2"]
 
     def test_instrument_from_params(self, tmp_path):
         """Instrument should be derived from strategy_params."""

@@ -534,6 +534,16 @@ def run_allocation(
             rankings_by_id[sid] = rec
 
     forecasts: List[Any] = []
+    max_loss_per_contract: Dict[str, float] = {}
+
+    alloc_max_loss_cfg = alloc_opts.max_loss_per_contract
+    alloc_default_max_loss: Optional[float] = None
+    alloc_by_strategy: Dict[str, float] = {}
+    if isinstance(alloc_max_loss_cfg, dict):
+        alloc_by_strategy = {str(k): float(v) for k, v in alloc_max_loss_cfg.items()}
+    elif alloc_max_loss_cfg is not None:
+        alloc_default_max_loss = float(alloc_max_loss_cfg)
+
     for entry in registry.candidates:
         rec = rankings_by_id.get(entry.strategy_id, {})
         metrics = rec.get("metrics", {})
@@ -555,6 +565,21 @@ def run_allocation(
         # instrument: derive from strategy_params or default
         params = entry.params or {}
         instrument = params.get("symbol", params.get("underlying", "UNKNOWN"))
+
+        strategy_max_loss = rec.get("max_loss_per_contract")
+        if strategy_max_loss is None:
+            strategy_max_loss = params.get("max_loss_per_contract")
+        if strategy_max_loss is None:
+            strategy_max_loss = alloc_by_strategy.get(entry.strategy_id, alloc_default_max_loss)
+        if strategy_max_loss is not None:
+            try:
+                max_loss_per_contract[entry.strategy_id] = float(strategy_max_loss)
+            except (TypeError, ValueError):
+                logger.warning(
+                    "Invalid max_loss_per_contract for %s: %r",
+                    entry.strategy_id,
+                    strategy_max_loss,
+                )
 
         forecast = Forecast(
             strategy_id=entry.strategy_id,
@@ -582,7 +607,10 @@ def run_allocation(
         min_edge_over_cost=alloc_opts.min_edge_over_cost,
     )
     engine = AllocationEngine(config=alloc_config, equity=config.evaluation.equity)
-    allocations = engine.allocate(forecasts)
+    allocations = engine.allocate(
+        forecasts,
+        max_loss_per_contract=max_loss_per_contract or None,
+    )
 
     # 4. Persist allocations as JSON
     alloc_output = {
@@ -593,6 +621,7 @@ def run_allocation(
             "per_play_cap": alloc_opts.per_play_cap,
             "vol_target_annual": alloc_opts.vol_target_annual,
             "min_edge_over_cost": alloc_opts.min_edge_over_cost,
+            "max_loss_per_contract": alloc_opts.max_loss_per_contract,
             "min_dsr": config.evaluation.min_dsr,
             "min_composite_score": config.evaluation.min_composite_score,
         },
