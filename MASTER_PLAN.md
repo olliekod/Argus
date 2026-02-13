@@ -53,7 +53,7 @@ flowchart LR
 | 4B Backtesting / Replay | **Done.** Replay harness, experiment runner, conservative execution model; replay packs with bars, outcomes, regimes, option snapshots. |
 | 4C Parameter search & robustness lab | **Done.** Parameter sweeps; regime sensitivity scoring (`compute_regime_sensitivity_score`); parameter stability auto-kill (`compute_robustness_penalty`, `compute_walk_forward_penalty`); MC/bootstrap on realized trades (`mc_bootstrap.run_mc_paths`, `evaluate_mc_kill`); regime-subset stress (`run_regime_subset_stress`); Strategy Research Loop (outcomes → packs → experiments → evaluation, DB pass-through, base-params merge, `require_recent_bars_hours`). Integrated in ExperimentRunner and StrategyEvaluator. |
 | 4C optional (deploy gates) | **Done.** Deflated Sharpe (`deflated_sharpe.py`), Reality Check (`reality_check.py`), slippage sensitivity (`run_cost_sensitivity_sweep` + manifest integration); kill reasons in StrategyEvaluator; config via `DeployGatesOpts` / `evaluation.deploy_gates`. |
-| 5 Prelude (sizing and allocation) | **Done.** Forecast/sizing (`sizing.py`: fractional Kelly, vol-target overlay, `contracts_from_risk_budget`, confidence shrinkage); StrategyRegistry (`strategy_registry.py`); AllocationEngine (`allocation_engine.py`: per-play cap 7%, aggregate cap, optional vol target); config via `AllocationOpts` / `evaluation.allocation`. Research loop does not yet call registry or allocation engine. |
+| 5 Prelude (sizing and allocation) | **Done.** Forecast/sizing (`sizing.py`: fractional Kelly, vol-target overlay, `contracts_from_risk_budget`, confidence shrinkage); StrategyRegistry (`strategy_registry.py`); AllocationEngine (`allocation_engine.py`: per-play cap 7%, aggregate cap, optional vol target); config via `AllocationOpts` / `evaluation.allocation`. Research loop calls registry and allocation when config set; persists `allocations.json`. Optional `max_loss_per_contract` (float or per-strategy map) for options sizing. |
 
 ### IV / snapshot / replay truth map
 
@@ -65,8 +65,9 @@ flowchart LR
 - **Replay:** Uses snapshot `atm_iv`; no lookahead (gating by `recv_ts_ms`).
 - **Storage:** Only ATM IV persisted; no DB bloat from tick-level Greeks.
 - **Health and comparison:** `scripts/options_providers_health.py` pre-checks both providers (snapshots, atm_iv %, symbols); `compare_options_snapshot_providers.py` for post-close comparison.
+- **Sprint 2 E2E verifier:** `scripts/verify_vrp_replay.py` builds a replay pack, runs VRPCreditSpreadStrategy, prints bars/outcomes/snapshots/trade counts, and exits non-zero with actionable diagnostics when trade count is zero (missing outcomes/IV/snapshots, provider mismatch, gating). [docs/replay_pack_and_iv_summary.md](docs/replay_pack_and_iv_summary.md) documents the Sprint 2 E2E checklist and results (2026-02-13).
 
-**Remaining risk (ordering/timing):** Cold start and illiquid symbols still benefit from E2E checks; discrepancy rollup (`get_discrepancy_rollup`) is available for monitoring. Public 0% atm_iv historically was addressed with OSI canonical matching and IV key fallback; re-validate after all-day Public runs.
+**Remaining risk (ordering/timing):** Cold start and illiquid symbols are covered by the E2E verifier and checklist; discrepancy rollup (`get_discrepancy_rollup`) is available for monitoring. Public 0% atm_iv historically was addressed with OSI canonical matching and IV key fallback; re-validate after all-day Public runs.
 
 ---
 
@@ -90,7 +91,7 @@ flowchart LR
 | **9** | Intelligence API product | Future | Expose bars, regimes, options intelligence, spread candidates, signals for subscription revenue. |
 | **10** | Self-improving system | Future | Automatic idea testing, strategy mutation, performance pruning, adaptive weighting. |
 
-**Where we are now:** Phase 4C including deploy gates is done. Phase 5 prelude (sizing, registry, allocation engine) is done. **IV consolidation is done:** deterministic, expiry-aware IV/greeks from DXLink + public snapshots via `IVConsensusEngine`; enrichment and replay are time-gated by `recv_ts_ms`; strategies can use `get_consensus_atm_iv` / `get_consensus_contract_iv`. **Next priorities:** (1) Close the research–allocation loop, (2) P1 audit (10.2, 10.4), (3) Portfolio risk engine (Phase 5 full), (4) Strategy lifecycle.
+**Where we are now:** Phase 4C including deploy gates is done. Phase 5 prelude (sizing, registry, allocation engine, research–allocation loop, max_loss_per_contract) is done. IV consolidation is done. P1/P2 audit items (10.2, 10.4, 10.7, 10.8) verified. Sprint 2 E2E check done: repeatable verifier script, E2E doc section, IV consensus high-discrepancy test; secrets-permissions test fixed for Windows. **Next:** Ongoing research (VRP/Overnight experiments); then execution/slippage roadmap and future phases per §8.4.
 
 ---
 
@@ -99,7 +100,7 @@ flowchart LR
 ### Primary (chosen direction)
 
 1. **Overnight Session Momentum / Seasonality** — *Top priority starter.*  
-   Capture predictable returns across session transitions (US close → Asia open, Asia → Europe, weekend effects, crypto handovers). Fits existing session classification, deterministic bars, replay, outcome engine. Assets: BTC, BTC ETFs (IBIT, BITO), possibly SPY overnight. Simple, robust, hard to overfit.
+   Capture predictable returns across session transitions (US close → Asia open, Asia → Europe, weekend effects, crypto handovers). Fits existing session classification, deterministic bars, replay, outcome engine. Assets: BTC, BTC ETFs (IBIT), liquid ETF universe, SPY overnight. Simple, robust, hard to overfit.
 
 2. **VRP — Volatility Risk Premium / Put Spread Selling** — *Core options income.*  
    Sell put spreads when IV > realized vol, market not in risk-off collapse, liquidity acceptable. Theta decay and vol overpricing. IV now injected into snapshots; replay IV parity fixed. Target: IBIT, SPY, QQQ.
@@ -131,6 +132,18 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 ---
 
 ## 5. Regime and Signal Methodologies
+
+### 5.0 Feature inputs to regime detection
+
+Regime detection consumes **feature layers**, not raw market data alone:
+
+```
+Raw market data → Features (session returns, FX moves, vol, global risk flow) → Regime detection → Strategy selection & sizing
+```
+
+**Global risk flow** is a compressed summary of how Asia + Europe + FX moved before the US session. It answers “where does pressure come from?” rather than “what did SPY do?” — e.g. Asia sold overnight, Europe flat, USD/JPY falling (risk-off) → global risk flow &lt; 0 → US open likely weak, vol higher. Implement as a feature input to the regime engine (see [OVERNIGHT_SESSION_STRATEGY_PLAN.md](docs/OVERNIGHT_SESSION_STRATEGY_PLAN.md) §5). Helps VRP timing (vol overpriced after risk-off) and overnight strategy gating.
+
+### 5.1 Regime methods
 
 | Method | Role | Priority / caution |
 |-------|------|---------------------|
@@ -180,8 +193,8 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 
 - **10.5 Disk I/O outside `_bar_lock`** — `src/core/persistence.py`: Serialize bar to JSON under lock; perform file write and `os.fsync()` outside lock to avoid blocking the bar topic worker.
 - **10.6 DXLink error frame handling** — `src/connectors/tastytrade_streamer.py`: On error frame, increment counter; if persistent (>3 in 60s), trigger reconnect instead of continuing silently.
-- **10.7 ExecutionModel reset in replay** — `src/analysis/replay_harness.py`: Call `self._exec.reset()` at the start of `run()` so ledger does not accumulate across runs.
-- **10.8 Secrets file permissions** — `src/core/config.py`: After writing secrets file, `path.chmod(0o600)`. Add test for mode 0600.
+- **10.7 ExecutionModel reset in replay** — **Done.** `replay_harness.py` calls `self._exec.reset()` at start of `run()`; `tests/test_replay_reset.py` verifies.
+- **10.8 Secrets file permissions** — **Done.** `config.py` calls `path.chmod(0o600)` after writing secrets; `tests/test_secrets_permissions.py` verifies (Windows-accepting 0o666 where chmod does not change st_mode).
 
 **P3 — Medium / Backlog**
 
@@ -227,59 +240,68 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 
 ### 8.4 Next steps and recommended route
 
-**Next steps (summary):**
+**Status (as of 2026-02-13)**
 
-1. **Close the research–allocation loop** — In `strategy_research_loop.py`, after `evaluate_and_persist`: load rankings into StrategyRegistry (with DSR/score filters), build `Forecast`s from evaluator output (or candidate set), run AllocationEngine, persist allocations (e.g. JSON) so a future paper/live path can consume them. This completes "test strategies → filter → allocate" without execution.
-2. **P1 audit** — Finish 10.2 (Deribit `.total_seconds()`), 10.4 (orchestrator task tracking verification).
-3. **Portfolio risk engine** — Correlation awareness, drawdown containment, full exposure limits (Phase 5 full).
-4. **Strategy lifecycle** — Rolling metrics, degradation detection, quarantine/kill in production.
+- **Sprint 1:** Done + verified (research–allocation loop, P1 audit 10.2/10.4, config/allocation/max_loss_per_contract).
+- **Sprint 2 code tasks:** Done + verified (ExecutionModel reset, secrets file permissions; secrets-permissions test fixed for Windows).
+- **Sprint 2 E2E check:** Done + verified. Repeatable verifier `scripts/verify_vrp_replay.py`; [docs/replay_pack_and_iv_summary.md](docs/replay_pack_and_iv_summary.md) Sprint 2 E2E section (commands, pass criteria, usage); IV consensus deterministic test for high-discrepancy `winner_based` (selected_source + iv_quality).
 
 **Assessment (codebase vs Master Plan):**
 
 - **Phases 0–4B:** In place. Event bus, bars, regimes, options pipeline, outcome engine, replay harness, experiment runner, execution model, and (after audit fixes) DXLink Greeks + IV consensus are the backbone. IV consensus is the single source for snapshot IV in live/replay when using the engine. Replay packs with bars + outcomes + regimes + snapshots work; VRP strategy can consume `atm_iv` and `realized_vol` in replay.
 - **Phase 4C:** Done. Regime sensitivity scoring, parameter stability auto-kill (robustness/walk-forward penalties), MC/bootstrap on realized trades, regime-subset stress, Strategy Research Loop, and deploy gates (DSR, Reality Check, slippage sensitivity) — all integrated in ExperimentRunner and StrategyEvaluator.
-- **Audit:** Three critical bugs fixed (cross-expiration IV, DXLink streamer not started, enrichment fallback AttributeError). P1: 10.1 and 10.3 fixed; 10.2 and 10.4 remain. P2–P3 items (bar lock, DXLink errors, ExecutionModel reset, secrets permissions, VRP RV, etc.) still open.
-- **Public API:** Done. Second IV/Greeks source; health script and provider comparison; reduces dependence on DXLink alone.
-- **Strategic gaps:** Allocation **prelude** and sizing are in place; research loop **can** run allocation and persist allocations when config is set (loop wiring implemented). Still missing: full portfolio risk engine, strategy lifecycle/kill engine, live vs backtest drift monitor.
+- **Audit:** Three critical bugs fixed (cross-expiration IV, DXLink streamer not started, enrichment fallback AttributeError). P1 (10.2, 10.4) and P2 (10.7, 10.8) verified. Research loop runs allocation and persists allocations when config is set.
+- **Public API:** Done. Second IV/Greeks source; health script and provider comparison.
+- **Strategic gaps:** Full portfolio risk engine, strategy lifecycle/kill engine, live vs backtest drift monitor, execution/slippage measurement (see below).
 
-**Recommended next steps (ordered):**
+---
 
-1. **Close the research–allocation loop**  
-   - In `strategy_research_loop.py`, after `evaluate_and_persist`: load rankings into StrategyRegistry (with DSR/score filters), build `Forecast`s from evaluator output (or candidate set), run AllocationEngine, persist allocations (e.g. JSON). Outcome: one cycle "test → filter → allocate" without execution; paper/live can consume allocations later.
+**1) Sprint 2 E2E check — Done (2026-02-13)**
 
-2. **Harden data and replay (1–2 sprints)**  
-   - **P1 audit:** Deribit rate limiter (10.2), orchestrator task tracking (10.4). (10.1 and 10.3 fixed.)  
-   - **P2 quick wins:** ExecutionModel reset at start of replay `run()` (10.7), secrets file permissions (10.8).  
-   - **E2E check:** Confirm IV truth map in practice (cold start, illiquid symbols); ensure replay experiments produce non-zero VRP trades where expected.
+- **Delivered:** `scripts/verify_vrp_replay.py` (--symbol, --start, --end, --provider, --pack_out, --db); builds pack, runs VRP, prints bars/outcomes/snapshots/trade_count; exits 1 with actionable diagnostics when trade_count is zero. [docs/replay_pack_and_iv_summary.md](docs/replay_pack_and_iv_summary.md) updated with Sprint 2 E2E results: commands, output summary, pass criteria, issues/fixes, verifier usage. Deterministic IV consensus test in `tests/test_iv_consensus_engine.py` for high-discrepancy winner_based (selected_source=dxlink, iv_quality=bad).
 
-3. **Use the research engine to prove edge (ongoing)**  
-   - Run VRP and (when ready) Overnight Session experiments on replay packs (multiple symbols, date ranges).  
-   - Use existing `--sweep` and evaluator for parameter robustness and regime sensitivity.  
-   - Document what works and what doesn’t; feed results into strategy priority (Master Plan §4) and into future allocation/sizing design.
+- **Goals met:** (A) IV truth map — cold start, illiquid discrepancy, DXLink path covered by verifier and consensus tests. (B) Replay VRP — verifier fails fast with clear reasons when bars/outcomes/snapshots/IV or gating cause zero trades.
 
-4. **Portfolio risk engine (Phase 5 full)**  
-   - Exposure limits, correlation awareness, drawdown containment, and (later) covariance shrinkage and portfolio-level vol target.  
-   - Required before paper/live with real capital.
+---
 
+**2) Next: Ongoing research (continuous)**
 
-5. **Strategy lifecycle and monitoring**  
-   - Rolling performance, degradation detection, quarantine, and automatic strategy death.  
-   - Live vs backtest drift monitor when paper or live is in use.
+Use the research engine to prove edge: VRP experiments (IBIT/SPY/QQQ), Overnight/session experiments. Document findings and feed into strategy priority and allocation design (and later portfolio risk). No new implementation required beyond iterative strategy research + writeups.
 
-**Best route going forward:**
+---
 
-- **Short term:** Close the research–allocation loop (registry + allocation in research loop). Then remaining P1 (10.2, 10.4).  
-- **Medium term:** Portfolio risk engine, strategy lifecycle.  
-- **Long term:** Paper → live → strategy expansion.
+**3) Future phases (separate plans when prioritized)**
 
-Public API is done (second IV source); focus is on killing bad strategies fast so only robust parameter sets get capital later.
+- **Portfolio risk engine (Phase 5 full):** Exposure limits, correlation, drawdown containment, cov shrinkage, portfolio vol target.
+- **Strategy lifecycle:** Rolling health, degradation detection, quarantine/kill.
+- **Live vs backtest drift monitor:** Slippage drift alerts.
+- **StrategyLeague enhancements:** Capital budgeting, diversity-aware ranking, lifecycle integration.
+
+High-level scope remains in [docs/MEDIUM_TERM_SCOPE.md](docs/MEDIUM_TERM_SCOPE.md).
+
+---
+
+**4) Execution and slippage measurement roadmap (paper-first, broker-backed)**
+
+So that paper trading produces calibratable costs, not just “broker paper fills”:
+
+- **Phase 4A — Execution interface (minimal abstraction)**  
+  Add/confirm a stable interface: `place_order(order) -> order_id`, `cancel(order_id)`, `poll_events() -> fills/rejects`, `get_positions()`. Implementations: PaperBroker (optional internal), AlpacaPaperBroker (recommended first), (later) other broker adapters.
+
+- **Phase 4B — Independent slippage measurement (required even with broker paper)**  
+  For every order: capture quote at order time (bid/ask snapshot, recv_ts_ms); capture broker fill price and fill timestamp; compute slippage vs expected model (mid, bid/ask, etc.); persist as structured events + daily rollups.
+
+- **Phase 4C — Backtest calibration loop**  
+  Feed measured slippage distributions back into execution model assumptions; re-run replay experiments with calibrated costs.
+
+Broker paper is useful for lifecycle and constraints, but paper fills are often optimistic. Independent measurement turns it into real signal.
 
 ### 8.5 Research-to-deploy pipeline and invariants
 
 Discovery and deployment follow a single pipeline. Each stage has contracts and tests.
 
 - **Data ingest** — Bars, options chains, greeks, account. **Data QA gates:** completeness, staleness, symbol integrity. Staleness guards: if IV/greeks older than threshold → no trade. Time-consistency: no strategy can access greeks whose receipt timestamp exceeds sim time (lookahead hazard). Monitor per-provider lag in live and replay.
-- **Feature store** — Price, options, relval, regimes. **Feature invariants:** no NaNs after warmup; monotonic time indices; no dependence on future bars/snapshots. Tests: e.g. tests/test_feature_leakage.py. Separate feature computation from strategy logic (e.g. src/features/).
+- **Feature store** — Price, options, relval, regimes. **Global risk flow** (Asia/Europe return, FX risk signal) is a feature input to regime detection; see Overnight Session Strategy Plan. **Feature invariants:** no NaNs after warmup; monotonic time indices; no dependence on future bars/snapshots. Tests: e.g. tests/test_feature_leakage.py. Separate feature computation from strategy logic (e.g. src/features/).
 - **Strategy factory** — **Strategy family constraints:** define allowable instruments, max trading frequency, max parameter count, invariant risk constraints. Tests: e.g. tests/test_strategy_constraints.py reject strategies exceeding parameter-count or turnover budget.
 - **Replay backtests** — Conservative fills + barriers (existing). Outcomes/labels: all label horizons respected; purging/embargo in train/test splits when labels depend on future. Tests: e.g. tests/test_cv_embargo.py (training excludes overlapping label ranges).
 - **Robustness lab** — Walk-forward, **MC/bootstrap on realized trades** (replay → trade list → resample/reorder paths → distribution; block bootstrap preferred; not GPU Monte Carlo), **regime-stress** runs, slippage sensitivity sweeps. Kill criteria: e.g. survives only low % of paths, worst 5–10% paths unacceptable, ruin risk, probability edge ≤ 0 net of costs.
@@ -327,7 +349,7 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 
 ### 9.5 Gaps Argus still has
 
-- Strategy allocation **prelude** (registry, AllocationEngine, sizing) is in place; **loop wiring** (research → registry → allocation → persisted allocations) and full **StrategyLeague** behavior (capital competition, smoothed updates, degradation detector) are not yet implemented.
+- Strategy allocation **prelude** (registry, AllocationEngine, sizing) and **loop wiring** (research → registry → allocation → persisted allocations when config set) are in place; full **StrategyLeague** behavior (capital competition, smoothed updates, degradation detector) is not yet implemented.
 - Portfolio risk engine (exposure limits, correlation, risk budgeting, drawdown containment).
 - Live vs backtest drift monitor (fills, slippage, execution degradation).
 - Strategy health monitoring (rolling metrics, degradation alerts, quarantine).
@@ -365,9 +387,14 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 | Document | Description |
 |----------|-------------|
 | [docs/outcome_semantics.md](docs/outcome_semantics.md) | Bar outcome window definition, metrics, statuses, quantization, CLI for backfill and coverage. |
-| [docs/replay_pack_and_iv_summary.md](docs/replay_pack_and_iv_summary.md) | Replay pack contents, IV from provider vs derived, checklist for replay + IV + non-zero experiments. |
+| [docs/replay_pack_and_iv_summary.md](docs/replay_pack_and_iv_summary.md) | Replay pack contents, IV from provider vs derived, E2E checklist and Sprint 2 E2E results (verifier usage). |
+| [scripts/verify_vrp_replay.py](scripts/verify_vrp_replay.py) | Sprint 2 E2E verifier: build pack, run VRP replay, print counts; exit 1 with diagnostics when trade_count is zero. |
+| [docs/NEXT_STEPS_IMPLEMENTATION_PLAN.md](docs/NEXT_STEPS_IMPLEMENTATION_PLAN.md) | Concrete implementation plan for research–allocation loop, P1/P2 audit, verification summary. |
+| [docs/MEDIUM_TERM_SCOPE.md](docs/MEDIUM_TERM_SCOPE.md) | Medium-term scope (planning only): portfolio risk, strategy lifecycle, drift monitor, StrategyLeague. |
 | [docs/AUDIT_CODEBASE.md](docs/AUDIT_CODEBASE.md) | Full codebase audit: bugs fixed, risks ranked, concrete patch plan (P1–P3). |
 | [docs/strategy_research_loop.md](docs/strategy_research_loop.md) | Strategy Research Loop: quick start, config, outputs, invariants. |
+| [docs/RESEARCH_ENGINE_AND_CLOSED_LOOP.md](docs/RESEARCH_ENGINE_AND_CLOSED_LOOP.md) | Step-by-step: using the research engine (VRP/overnight when available), one-time verification, and making the loop autonomous; how it funnels to execution and future phases. |
+| [docs/OVERNIGHT_SESSION_STRATEGY_PLAN.md](docs/OVERNIGHT_SESSION_STRATEGY_PLAN.md) | Overnight session strategy implementation plan: data (10 ETFs + 4 FX), Alpha Vantage, global risk flow regime feature, architecture. |
 | [docs/strategy_evaluation.md](docs/strategy_evaluation.md) | Strategy evaluator metrics, composite scoring, penalties, deployability interpretation. |
 | [ONBOARDING_ROADMAP.md](ONBOARDING_ROADMAP.md) | Learning path through the codebase: architecture, data flow, config, soak/tape, glossary. |
 | [argus_strategy_backlog.md](argus_strategy_backlog.md) | Idea parking lot and strategy evaluation framework; master plan is authoritative for priority order. |

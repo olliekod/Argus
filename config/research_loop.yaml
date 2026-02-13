@@ -14,13 +14,13 @@ pack:
   # One of: "single" (use symbols list) or "universe" (liquid ETF universe).
   mode: "single"
   # For mode=single: list of symbols to pack.
-  symbols: ["SPY"]
+  symbols: ["SPY", "QQQ", "IBIT", "IWM"]
   # Date range: either fixed or "last_n_days" (computed at run time).
   # Option A: fixed range
   start_date: "2026-02-01"
   end_date: "2026-02-11"
   # Option B: use last_n_days (optional; overrides start/end if set)
-  # last_n_days: 7
+  last_n_days: 7
   # Bars provider override (null = use data_sources.bars_primary from config).
   bars_provider: null
   # Options snapshot provider override (null = use config default).
@@ -73,7 +73,7 @@ evaluation:
   # Allocation step (Phase 5 prelude): run allocation after evaluation.
   # Set allocations_output_path to enable; null = skip allocation step.
   allocation:
-    kelly_fraction: 0.25
+    kelly_fraction: 0.30
     per_play_cap: 0.07
     vol_target_annual: 0.10
     # Optional options-risk sizing override; either a single float or per-strategy map.
@@ -81,8 +81,8 @@ evaluation:
     # max_loss_per_contract:
     #   VRP_v1: 300.0
     #   VRP_v2: 450.0
-  allocations_output_path: null   # e.g. "logs/allocations.json"
-  equity: 10000.0
+  allocations_output_path: "logs/allocations.json"   # e.g. "logs/allocations.json"
+  equity: 5000.0
   min_dsr: 0.0
   min_composite_score: 0.0
 

@@ -46,10 +46,12 @@ class Database:
         self._connection = await aiosqlite.connect(str(self.db_path))
         self._connection.row_factory = aiosqlite.Row
         await self._create_tables()
-        # Enable WAL mode for long-running app
+        # Enable WAL mode for long-running app and concurrent readers
         await self._connection.execute("PRAGMA journal_mode=WAL")
         await self._connection.execute("PRAGMA synchronous=NORMAL")
         await self._connection.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        # Wait up to 30s on lock (avoids OperationalError: database is locked when another process/connection holds the DB)
+        await self._connection.execute("PRAGMA busy_timeout=30000")
         logger.info(f"Database connected: {self.db_path}")
     
     async def close(self) -> None:
