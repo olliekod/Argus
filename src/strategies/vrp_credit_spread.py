@@ -29,6 +29,9 @@ from src.core.regimes import VolRegime, TrendRegime
 
 logger = logging.getLogger("argus.strategies.vrp_credit_spread")
 
+# One-time IV diagnosis log (avoid spam)
+_iv_diagnosis_logged: bool = False
+
 # Provider names (must match data_sources policy values)
 _TASTYTRADE = "tastytrade"
 _ALPACA = "alpaca"
@@ -66,17 +69,27 @@ def _derive_iv_from_quotes(snapshot: Any) -> Optional[float]:
         elif isinstance(snapshot, dict):
             underlying = snapshot.get("underlying_price")
 
+        try:
+            underlying = float(underlying)
+        except (TypeError, ValueError):
+            return None
         if not underlying or underlying <= 0:
             return None
 
-        # Find closest-to-ATM put with a usable bid/ask
+        # Find closest-to-ATM put with a usable bid/ask (coerce to float for JSON string values)
         best = None
         best_dist = float("inf")
         for p in puts:
-            strike = p.get("strike")
-            bid = p.get("bid")
-            ask = p.get("ask")
-            if strike is None or bid is None or ask is None:
+            try:
+                strike = p.get("strike")
+                bid = p.get("bid")
+                ask = p.get("ask")
+                if strike is None or bid is None or ask is None:
+                    continue
+                strike = float(strike)
+                bid = float(bid)
+                ask = float(ask)
+            except (TypeError, ValueError):
                 continue
             dist = abs(strike - underlying)
             if dist < best_dist and bid > 0 and ask > 0:
@@ -86,15 +99,19 @@ def _derive_iv_from_quotes(snapshot: Any) -> Optional[float]:
         if best is None:
             return None
 
-        mid = (best["bid"] + best["ask"]) / 2.0
-        strike = best["strike"]
+        mid = (float(best["bid"]) + float(best["ask"])) / 2.0
+        strike = float(best["strike"])
         # Rough Brenner-Subrahmanyam approximation:  IV ≈ mid / (0.4 * S * sqrt(T))
         # Assume ~14 DTE (0.038 years) if not provided.
         dte_years = best.get("dte_years", 14 / 365.0)
+        try:
+            dte_years = float(dte_years)
+        except (TypeError, ValueError):
+            dte_years = 14 / 365.0
         if dte_years <= 0:
             dte_years = 14 / 365.0
         iv_approx = mid / (0.4 * underlying * math.sqrt(dte_years))
-        if 0.01 <= iv_approx <= 3.0:
+        if 0.005 <= iv_approx <= 5.0:
             return round(iv_approx, 6)
         return None
     except Exception:
@@ -118,13 +135,14 @@ def _select_iv_from_snapshots(
         return None
 
     def _provider(snap: Any) -> str:
+        raw = ""
         if hasattr(snap, "source"):
-            return getattr(snap, "source", "")
-        if hasattr(snap, "provider"):
-            return getattr(snap, "provider", "")
-        if isinstance(snap, dict):
-            return snap.get("provider", snap.get("source", ""))
-        return ""
+            raw = getattr(snap, "source", "")
+        elif hasattr(snap, "provider"):
+            raw = getattr(snap, "provider", "")
+        elif isinstance(snap, dict):
+            raw = snap.get("provider", snap.get("source", ""))
+        return (raw or "").lower().strip()
 
     def _atm_iv(snap: Any) -> Optional[float]:
         if hasattr(snap, "atm_iv"):
@@ -133,23 +151,28 @@ def _select_iv_from_snapshots(
             return snap.get("atm_iv")
         return None
 
-    tt_snap_count = 0
+    def _recv_ts(snap: Any) -> int:
+        if hasattr(snap, "recv_ts_ms"):
+            return getattr(snap, "recv_ts_ms", 0)
+        if isinstance(snap, dict):
+            return int(snap.get("recv_ts_ms") or snap.get("timestamp_ms") or 0)
+        return 0
 
-    # Pass 1: Tastytrade atm_iv (most recent first)
-    for snap in reversed(visible_snapshots):
-        if _provider(snap) == _TASTYTRADE:
-            tt_snap_count += 1
-            iv = _atm_iv(snap)
-            if iv is not None:
-                return iv
+    tt_snaps = [s for s in visible_snapshots if _provider(s) == _TASTYTRADE]
+    tt_snap_count = len(tt_snaps)
 
-    # Pass 2: Derived IV from Tastytrade quotes
-    for snap in reversed(visible_snapshots):
-        if _provider(snap) == _TASTYTRADE:
-            iv = _derive_iv_from_quotes(snap)
-            if iv is not None:
-                logger.debug("Using derived IV %.4f from Tastytrade quotes", iv)
-                return iv
+    # Pass 1: Use the most recent Tastytrade snapshot that has atm_iv > 0 (so we trade when IV exists)
+    with_iv = [(s, _atm_iv(s)) for s in tt_snaps if _atm_iv(s) is not None and _atm_iv(s) > 0]
+    if with_iv:
+        best = max(with_iv, key=lambda x: _recv_ts(x[0]))
+        return best[1]
+
+    # Pass 2: Derived IV from Tastytrade quotes (newest first)
+    for snap in sorted(tt_snaps, key=_recv_ts, reverse=True):
+        iv = _derive_iv_from_quotes(snap)
+        if iv is not None:
+            logger.debug("Using derived IV %.4f from Tastytrade quotes", iv)
+            return iv
 
     # Pass 3: Alpaca IV (only if explicitly allowed)
     if allow_alpaca_iv:
@@ -160,11 +183,37 @@ def _select_iv_from_snapshots(
                     logger.debug("Falling back to Alpaca IV %.4f (allow_alpaca_iv=True)", iv)
                     return iv
 
-    # Log one-line reason for IV unavailability
+    # Pass 4: Any provider with atm_iv (replay fallback when partial IV exists)
+    any_with_iv = [(s, _atm_iv(s)) for s in visible_snapshots if _atm_iv(s) is not None and _atm_iv(s) > 0]
+    if any_with_iv:
+        best = max(any_with_iv, key=lambda x: _recv_ts(x[0]))
+        logger.debug("Using IV %.4f from %s (replay fallback)", best[1], _provider(best[0]))
+        return best[1]
+
+    # When many visible but still no IV, log once to confirm pack→object atm_iv propagation
+    if len(visible_snapshots) >= 200:
+        sample_ivs = [_atm_iv(s) for s in visible_snapshots[:10]]
+        logger.warning(
+            "VRP IV: %d visible but 0 with IV; sample atm_iv from objects: %s",
+            len(visible_snapshots), sample_ivs,
+        )
+
+    # Log one-line reason for IV unavailability (and one-time INFO for diagnosis)
     if tt_snap_count == 0:
         logger.debug("IV unavailable: no tastytrade snapshots in %d visible snapshots", len(visible_snapshots))
     else:
         logger.debug("IV unavailable: %d tastytrade snapshots lack atm_iv and bid/ask quotes", tt_snap_count)
+    # One-time WARNING to diagnose why IV was not found (visible vs provider vs atm_iv)
+    global _iv_diagnosis_logged
+    if not _iv_diagnosis_logged and (tt_snap_count == 0 or not with_iv):
+        _iv_diagnosis_logged = True
+        providers_seen = {_provider(s) for s in visible_snapshots} if visible_snapshots else set()
+        n_with_iv = sum(1 for s in visible_snapshots if _atm_iv(s) is not None and _atm_iv(s) > 0) if visible_snapshots else 0
+        sample_recv = [_recv_ts(s) for s in visible_snapshots[:3]] if visible_snapshots else []
+        logger.warning(
+            "VRP IV diagnosis: visible=%d providers=%s tt_snaps=%d with_iv=%d sample_recv_ts_ms=%s (no IV selected)",
+            len(visible_snapshots) if visible_snapshots else 0, providers_seen, tt_snap_count, n_with_iv, sample_recv,
+        )
 
     return None
 
@@ -218,6 +267,9 @@ class VRPCreditSpreadStrategy(ReplayStrategy):
         )
         if iv is not None:
             self.last_iv = iv
+            if not getattr(self, "_logged_iv_ok", False):
+                self._logged_iv_ok = True
+                logger.warning("VRP: first IV selected %.4f (visible_snapshots=%d)", iv, len(visible_snapshots or []))
 
         # Extract realized_vol from latest outcome (if available)
         for ts in sorted(visible_outcomes.keys(), reverse=True):

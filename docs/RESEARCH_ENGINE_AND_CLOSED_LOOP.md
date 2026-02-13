@@ -35,13 +35,13 @@ A single **research cycle** is:
    - **pack.db_path** — Same DB that your bar (and optionally snapshot) ingest uses, e.g. `data/argus.db`.
    - **outcomes.ensure_before_pack** — `true` so the loop backfills outcomes before building packs.
    - **outcomes.bar_duration** — Must match bar length in DB (e.g. `60` for 1m).
-   - **strategies** — Start with VRP only; add more when implemented (see §4):
+   - **strategies** — Start with VRP only; add more when implemented (see §4). To **automatically test all parameter variations**, set `sweep` to a YAML grid file; the loop runs every combination (no manual runs). The **GPU Heston model** is for options pricing / Probability of Profit (PoP), not for strategy parameter search — see MASTER_PLAN §1.
 
      ```yaml
      strategies:
        - strategy_class: "VRPCreditSpreadStrategy"
-         params: {}   # or e.g. {"min_vrp": 0.05}
-         sweep: null  # or "config/vrp_sweep.yaml" for param grid
+         params: {}   # base params; merged with each sweep row
+         sweep: null  # or "config/vrp_sweep.yaml" to run all grid combinations automatically
      ```
 
    - **evaluation** — Set output paths if you want rankings/killed/candidates/allocations written:
@@ -136,6 +136,21 @@ python scripts/strategy_research_loop.py --config config/research_loop.yaml --on
 - Use **`last_n_days`** in config so each run automatically uses the latest N days of data.
 - To add more symbols: edit `pack.symbols` and re-run.
 - To add parameter sweeps: set `sweep: "config/vrp_sweep.yaml"` (or another grid) for a strategy and re-run.
+
+### 2.2 Automatic variation testing (sweep) vs GPU Heston
+
+- **“Test all variations”** — That’s what the **sweep** is for. You create a YAML file (e.g. `config/vrp_sweep.yaml`) where each key is a parameter and each value is a **list** of values to try. The research loop runs **every combination** automatically (no manual runs). Example:
+
+  ```yaml
+  # config/vrp_sweep.yaml
+  min_vrp: [0.02, 0.04, 0.06, 0.08]
+  max_vol_regime: ["VOL_LOW", "VOL_NORMAL"]
+  ```
+  Then set `sweep: "config/vrp_sweep.yaml"` for that strategy. One cycle runs 4×2 = 8 experiments, and the evaluator ranks them.
+
+- **GPU Heston model** — Used for **options pricing and Probability of Profit (PoP)** (e.g. “given this spread and IV, what’s the chance of profit?”). It is **not** used for strategy parameter search or for “automatically testing all variations” of strategy params. See MASTER_PLAN §1.
+
+- **Possible future:** Auto-generating a grid from a range (e.g. “min_vrp from 0.01 to 0.10 step 0.01”) is not built in today; you list the values in the sweep YAML. MASTER_PLAN §9.4 notes “automatic parameter robustness scoring, kill unstable parameter sets” as still needed.
 
 **Documenting findings:** Keep a simple log (or doc) of what you ran (symbols, dates, params), what rankings/allocations you got, and what you changed. That’s the “document findings and feed into strategy priority and allocation design” part of the plan.
 

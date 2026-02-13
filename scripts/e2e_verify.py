@@ -6,11 +6,10 @@ End-to-End Data Source Verification
 Single-command pipeline that validates the Argus data-source policy
 end-to-end:
 
-1. Confirms bars/outcomes coverage from ``bars_primary`` (Alpaca).
-2. Confirms option-snapshot coverage + % ``atm_iv`` presence from
-   ``options_snapshots_primary`` (Tastytrade). Note: Tastytrade IV comes from
-   live DXLink enrichment; snapshots written without DXLink running will have
-   0% atm_iv until new snapshots are collected with the orchestrator (OAuth + DXLink).
+1. Confirms bars/outcomes coverage from ``bars_primary`` (e.g. Alpaca).
+2. Confirms option-snapshot coverage + % ``atm_iv`` from
+   ``options_snapshots_primary`` (Tastytrade); secondary (Public) is included
+   when enabled in config. Tastytrade IV comes from DXLink when orchestrator runs.
 3. Probes DXLink greeks/quotes availability.
 4. Builds a replay pack using policy defaults (no provider args).
 5. Runs a smoke experiment (``VRPCreditSpreadStrategy`` on SPY)
@@ -363,6 +362,7 @@ async def run_e2e(
         "policy": {
             "bars_primary": policy.bars_primary,
             "options_snapshots_primary": policy.options_snapshots_primary,
+            "options_snapshots_secondary": getattr(policy, "options_snapshots_secondary", []),
             "options_stream_primary": policy.options_stream_primary,
         },
         "steps": {},
@@ -473,6 +473,7 @@ async def run_e2e(
         f.write("## Policy\n\n")
         f.write(f"- bars_primary: `{policy.bars_primary}`\n")
         f.write(f"- options_snapshots_primary: `{policy.options_snapshots_primary}`\n")
+        f.write(f"- options_snapshots_secondary: `{getattr(policy, 'options_snapshots_secondary', [])}`\n")
         f.write(f"- options_stream_primary: `{policy.options_stream_primary}`\n\n")
         f.write("## Steps\n\n")
         f.write("| Step | Result |\n")

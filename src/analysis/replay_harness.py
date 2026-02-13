@@ -51,6 +51,7 @@ Usage
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from abc import ABC, abstractmethod
@@ -96,6 +97,8 @@ class MarketDataSnapshot:
     iv: Optional[float] = None
     greeks_ts_ms: int = 0     # greeks event timestamp
     source: str = ""
+    # Raw quotes JSON for IV derivation when atm_iv is absent (replay from pack/DB)
+    quotes_json: Optional[str] = None
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -924,6 +927,7 @@ async def load_replay_data(
             if recv_ts is None:
                 recv_ts = s.get("timestamp_ms", 0)
                 
+            qj = s.get("quotes_json")
             snapshots.append(MarketDataSnapshot(
                 symbol=s["symbol"],
                 recv_ts_ms=recv_ts,
@@ -931,6 +935,7 @@ async def load_replay_data(
                 atm_iv=s.get("atm_iv"),
                 quote_ts_ms=s.get("source_ts_ms", 0),
                 source=s.get("provider", ""),
+                quotes_json=qj if isinstance(qj, str) else (json.dumps(qj) if qj else None),
             ))
 
     # Dynamic return based on flags

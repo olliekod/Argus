@@ -3,7 +3,12 @@ Argus System Verification
 =========================
 
 Comprehensive test to verify all components work correctly.
+Uses data-source policy: bars from bars_primary (e.g. Alpaca); options from
+options_snapshots_primary (Tastytrade) and optionally secondary (Public).
+Does not assume Alpaca provides options data.
+
 Run: python scripts/verify_system.py
+      python scripts/verify_system.py --deep
 """
 
 import sys

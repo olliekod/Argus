@@ -1,4 +1,7 @@
-"""Compare options snapshot quality between Tastytrade and Public providers."""
+"""Compare options snapshot quality between policy primary and secondary providers.
+
+Uses data_sources.options_snapshots_primary (Tastytrade) and
+options_snapshots_secondary (Public when enabled). Does not use Alpaca options."""
 
 from __future__ import annotations
 

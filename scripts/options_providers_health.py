@@ -1,7 +1,8 @@
-"""Options & Greeks stream health: Public vs Tastytrade.
+"""Options & Greeks stream health: primary + secondary from data_sources.
 
-Shows a per-provider report so you can confirm every aspect of each
-options/greeks stream is working before running the comparison script.
+Uses config data_sources.options_snapshots_primary (Tastytrade) and
+options_snapshots_secondary (Public when public_options.enabled). Does not
+assume Alpaca options.
 
 - Tastytrade: REST option chain snapshots + DXLink Greeks (IV in snapshots
   when Greeks cache is populated).
@@ -21,6 +22,27 @@ import sys
 from datetime import datetime, timezone
 from pathlib import Path
 
+# Project root for imports
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
+
+
+def _get_providers_from_policy() -> tuple[list[str], str]:
+    """Return (list of provider names, description)."""
+    try:
+        from src.core.config import load_config
+        from src.core.data_sources import get_data_source_policy
+        cfg = load_config()
+        policy = get_data_source_policy(cfg)
+        providers = policy.snapshot_providers(include_secondary=True)
+        public_enabled = (cfg.get("public_options") or {}).get("enabled", False)
+        if not public_enabled and "public" in providers:
+            providers = [p for p in providers if p != "public"]
+        return providers, f"primary ({policy.options_snapshots_primary}) + secondary from config"
+    except Exception:
+        return ["tastytrade", "public"], "tastytrade + public (default)"
+
 
 def _ms_to_iso(ms: int | None) -> str:
     if ms is None:
@@ -33,6 +55,10 @@ def run_report(db_path: Path, hours: int, symbol: str | None) -> int:
         print(f"Error: Database not found at {db_path}")
         return 2
 
+    providers, policy_desc = _get_providers_from_policy()
+    if not providers:
+        providers = ["tastytrade", "public"]
+
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     cursor = conn.cursor()
@@ -41,13 +67,11 @@ def run_report(db_path: Path, hours: int, symbol: str | None) -> int:
     window_ms = hours * 60 * 60 * 1000
     start_ms = now_ms - window_ms
 
-    # Only Public and Tastytrade
-    providers = ("public", "tastytrade")
     symbol_filter = " AND symbol = ?" if symbol else ""
     extra_params: list = [symbol] if symbol else []
 
     print("=" * 72)
-    print("Options & Greeks stream health (Public vs Tastytrade)")
+    print("Options & Greeks stream health (policy: " + policy_desc + ")")
     print("=" * 72)
     print(f"  Window: last {hours} hour(s)  |  DB: {db_path}")
     if symbol:
@@ -128,28 +152,29 @@ def run_report(db_path: Path, hours: int, symbol: str | None) -> int:
         print()
 
     # Ready for comparison?
+    placeholders = ",".join("?" for _ in providers)
     cursor.execute(
-        """
+        f"""
         SELECT provider, COUNT(*) as cnt
         FROM option_chain_snapshots
-        WHERE provider IN ('public', 'tastytrade')
+        WHERE provider IN ({placeholders})
           AND timestamp_ms >= ? AND timestamp_ms <= ?
         GROUP BY provider
         """,
-        (start_ms, now_ms),
+        (*providers, start_ms, now_ms),
     )
     counts = {r[0]: r[1] for r in cursor.fetchall()}
     conn.close()
 
-    public_ok = counts.get("public", 0) >= 10
-    tasty_ok = counts.get("tastytrade", 0) >= 10
-    if public_ok and tasty_ok:
-        print("Ready for comparison: both providers have data in window.")
+    all_ok = all(counts.get(p, 0) >= 10 for p in providers)
+    any_ok = any(counts.get(p, 0) >= 10 for p in providers)
+    if all_ok:
+        print("Ready for comparison: all policy providers have data in window.")
         print("  Run: python scripts/compare_options_snapshot_providers.py --symbol SPY --start <date> --end <date>")
-    elif public_ok or tasty_ok:
-        print("Only one provider has data so far. Let Argus run longer, then re-run this script.")
+    elif any_ok:
+        print("Only some providers have data. Let Argus run longer, then re-run this script.")
     else:
-        print("No Public or Tastytrade data in window. Ensure both are enabled and Argus has been running.")
+        print("No options snapshot data in window. Ensure policy providers are enabled and Argus has been running.")
 
     return 0
 

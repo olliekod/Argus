@@ -39,15 +39,25 @@ outcomes:
   bar_duration: 60
 
 # ── Strategies and experiments ──────────────────────────────────────────────
+# strategy_class: Class name (string). Loaded from src.strategies.vrp_credit_spread
+#   and src.strategies.dow_regime_timing. Supported: VRPCreditSpreadStrategy,
+#   DowRegimeTimingGateStrategy (and any other ReplayStrategy in those modules).
+# params: Dict passed as the strategy constructor's first argument. Merged with
+#   sweep rows when sweep is set. For VRPCreditSpreadStrategy this is the
+#   "thresholds" dict: min_vrp (float), max_vol_regime, avoid_trend,
+#   allow_alpaca_iv (bool). Use {} for defaults.
+# sweep: Path to YAML param grid (relative to project root), or null for single run.
+#   Grid format: each key = param name, value = list of values; all combinations
+#   are run. Example: config/vrp_sweep.yaml with content:
+#     min_vrp: [0.02, 0.05, 0.08]
+#     max_vol_regime: ["VOL_LOW", "VOL_NORMAL"]
 strategies:
   - strategy_class: "VRPCreditSpreadStrategy"
-    # Base params (merged with sweep if present).
-    params: {}
-    # Optional: path to YAML param grid (same format as run_experiment.py --sweep).
+    params: {}   # or e.g. { min_vrp: 0.03, max_vol_regime: "VOL_NORMAL" }
     sweep: null
-  # - strategy_class: "AnotherStrategy"
-  #   params: {}
-  #   sweep: "config/another_sweep.yaml"
+  # - strategy_class: "VRPCreditSpreadStrategy"
+  #   params: { min_vrp: 0.03 }
+  #   sweep: "config/vrp_sweep.yaml"
 
 # ── Experiment runner options ───────────────────────────────────────────────
 experiment:

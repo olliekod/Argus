@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Set, Type
 
@@ -30,6 +31,9 @@ def _pack_snapshots_to_objects(snapshot_dicts: List[Dict[str, Any]]) -> List[Mar
         recv_ts = s.get("recv_ts_ms")
         if recv_ts is None:
             recv_ts = s.get("timestamp_ms", 0)
+        qj = s.get("quotes_json")
+        if qj is not None and not isinstance(qj, str):
+            qj = json.dumps(qj)
         out.append(
             MarketDataSnapshot(
                 symbol=s.get("symbol", "SPY"),
@@ -37,6 +41,7 @@ def _pack_snapshots_to_objects(snapshot_dicts: List[Dict[str, Any]]) -> List[Mar
                 underlying_price=float(s.get("underlying_price", 0.0)),
                 atm_iv=s.get("atm_iv") if s.get("atm_iv") is not None else None,
                 source=s.get("provider", ""),
+                quotes_json=qj,
             )
         )
     return out

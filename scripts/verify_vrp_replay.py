@@ -1,25 +1,102 @@
-"""Repeatable Sprint 2 E2E replay verifier for VRP strategy.
+"""Repeatable E2E replay verifier for VRP strategy.
 
-Builds a replay pack, runs VRPCreditSpreadStrategy once, and prints core counts:
-- bars_count
-- outcomes_count
-- snapshots_count
-- trade_count
+Builds a replay pack using the data-source policy (bars_primary, options_snapshots_primary),
+runs VRPCreditSpreadStrategy once, and prints core counts plus an IV diagnostic so you can
+confirm whether IV is actually present in the pack (atm_iv or derivable from quotes).
+
+When --provider is omitted, uses bars_primary from config (e.g. alpaca).
+Dates: use YYYY-MM-DD (e.g. 2026-02-13). If --start/--end omitted, defaults to today.
 """
 
 from __future__ import annotations
 
 import argparse
 import asyncio
+import json
+import re
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 
 # Add project root to import path for script execution
 sys.path.append(str(Path(__file__).parent.parent))
 
+from src.core.data_sources import get_data_source_policy
 from src.analysis.experiment_runner import ExperimentConfig, ExperimentRunner
 from src.strategies.vrp_credit_spread import VRPCreditSpreadStrategy
 from src.tools.replay_pack import create_replay_pack
+
+
+def _parse_date(s: str) -> str:
+    """Parse date string to YYYY-MM-DD. Accepts YYYY-MM-DD, MM-DD-YYYY, DD-MM-YYYY."""
+    s = s.strip()
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+    m = re.match(r"^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$", s)
+    if m:
+        a, b, year = m.groups()
+        ai, bi = int(a), int(b)
+        if ai > 12:
+            return f"{year}-{bi:02d}-{ai:02d}"  # DD-MM-YYYY
+        if bi > 12:
+            return f"{year}-{ai:02d}-{bi:02d}"  # MM-DD-YYYY
+        return f"{year}-{ai:02d}-{bi:02d}"  # assume MM-DD-YYYY
+    raise ValueError(f"Invalid date {s!r}. Use YYYY-MM-DD (e.g. 2026-02-13).")
+
+
+def _iv_diagnostic(snapshots: list) -> dict:
+    """Count how many snapshots have atm_iv or derivable IV from quotes; include recv_ts range."""
+    with_atm_iv = 0
+    with_quotes = 0
+    with_quotes_usable = 0
+    sample_ivs: list[float] = []
+    recv_ts_all: list[int] = []
+    recv_ts_with_iv: list[int] = []
+    for s in snapshots:
+        recv = s.get("recv_ts_ms") or s.get("timestamp_ms") or 0
+        if recv:
+            recv_ts_all.append(int(recv))
+        atm_iv = s.get("atm_iv")
+        if atm_iv is not None:
+            try:
+                v = float(atm_iv)
+                if v > 0:
+                    with_atm_iv += 1
+                    if recv:
+                        recv_ts_with_iv.append(int(recv))
+                    if len(sample_ivs) < 5:
+                        sample_ivs.append(v)
+            except (TypeError, ValueError):
+                pass
+        qj = s.get("quotes_json")
+        if qj and isinstance(qj, str) and qj.strip():
+            with_quotes += 1
+            try:
+                data = json.loads(qj)
+                puts = data.get("puts") or []
+                underlying = s.get("underlying_price") or 0
+                if puts and underlying and underlying > 0:
+                    for p in puts:
+                        if p.get("strike") is not None and p.get("bid") is not None and p.get("ask") is not None:
+                            with_quotes_usable += 1
+                            break
+            except Exception:
+                pass
+        elif qj and isinstance(qj, dict):
+            with_quotes += 1
+            puts = qj.get("puts") or []
+            if puts:
+                with_quotes_usable += 1
+    return {
+        "with_atm_iv": with_atm_iv,
+        "with_quotes_json": with_quotes,
+        "with_quotes_usable": with_quotes_usable,
+        "sample_ivs": sample_ivs,
+        "recv_ts_min": min(recv_ts_all) if recv_ts_all else None,
+        "recv_ts_max": max(recv_ts_all) if recv_ts_all else None,
+        "recv_ts_with_iv_min": min(recv_ts_with_iv) if recv_ts_with_iv else None,
+        "recv_ts_with_iv_max": max(recv_ts_with_iv) if recv_ts_with_iv else None,
+    }
 
 
 def _default_pack_path(symbol: str, start: str, end: str, provider: str) -> Path:
@@ -62,30 +139,78 @@ def _reasons_for_zero_trades(pack: dict, expected_provider: str) -> list[str]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Build replay pack + run VRP replay smoke check.")
-    parser.add_argument("--symbol", required=True)
-    parser.add_argument("--start", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--end", required=True, help="YYYY-MM-DD")
-    parser.add_argument("--provider", required=True, help="Bars/outcomes provider")
+    parser = argparse.ArgumentParser(
+        description="Build replay pack + run VRP replay smoke check (policy-driven when --provider omitted).",
+        epilog="Dates: YYYY-MM-DD (e.g. 2026-02-13). Omit --start/--end to use today.",
+    )
+    parser.add_argument("--symbol", required=True, help="Symbol (e.g. SPY)")
+    parser.add_argument("--start", default=None, help="Start date YYYY-MM-DD (default: today)")
+    parser.add_argument("--end", default=None, help="End date YYYY-MM-DD (default: today)")
+    parser.add_argument("--provider", default=None, help="Bars/outcomes provider (default: from data_sources.bars_primary)")
     parser.add_argument("--pack_out", default=None, help="Optional output JSON path for replay pack")
     parser.add_argument("--db", default="data/argus.db", help="Path to argus.db")
     args = parser.parse_args()
 
-    pack_path = Path(args.pack_out) if args.pack_out else _default_pack_path(args.symbol, args.start, args.end, args.provider)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if args.start is None and args.end is None:
+        start_date = end_date = today
+    elif args.start is not None and args.end is not None:
+        try:
+            start_date = _parse_date(args.start)
+            end_date = _parse_date(args.end)
+        except ValueError as e:
+            print(f"Error: {e}")
+            return 2
+    else:
+        print("Error: provide both --start and --end, or omit both to use today.")
+        return 2
+
+    policy = get_data_source_policy()
+    provider = args.provider or policy.bars_provider
+
+    pack_path = Path(args.pack_out) if args.pack_out else _default_pack_path(args.symbol, start_date, end_date, provider)
     pack = asyncio.run(
         create_replay_pack(
             symbol=args.symbol,
-            start_date=args.start,
-            end_date=args.end,
+            start_date=start_date,
+            end_date=end_date,
             output_path=str(pack_path),
-            provider=args.provider,
+            provider=provider,
             db_path=args.db,
         )
     )
 
+    snapshots = pack.get("snapshots", [])
+    iv_diag = _iv_diagnostic(snapshots)
+
+    def _ts_iso(ms: int | None) -> str:
+        if ms is None:
+            return "N/A"
+        return datetime.fromtimestamp(ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    print("IV diagnostic (pack snapshots):")
+    print(f"  with atm_iv > 0:     {iv_diag['with_atm_iv']} / {len(snapshots)}")
+    print(f"  with quotes_json:    {iv_diag['with_quotes_json']} / {len(snapshots)}")
+    print(f"  quotes usable (IV): {iv_diag['with_quotes_usable']} / {len(snapshots)}")
+    if iv_diag["sample_ivs"]:
+        print(f"  sample atm_iv:      {iv_diag['sample_ivs']}")
+    else:
+        print("  sample atm_iv:      (none — no provider atm_iv in pack; VRP needs IV from DB or derivable from quotes)")
+    if iv_diag.get("recv_ts_min") is not None:
+        print(f"  recv_ts range:      {_ts_iso(iv_diag['recv_ts_min'])} .. {_ts_iso(iv_diag['recv_ts_max'])}")
+    if iv_diag.get("recv_ts_with_iv_min") is not None:
+        print(f"  recv_ts (w/ IV):    {_ts_iso(iv_diag['recv_ts_with_iv_min'])} .. {_ts_iso(iv_diag['recv_ts_with_iv_max'])}")
+        bars_meta = pack.get("metadata", {})
+        start_date = bars_meta.get("start_date") or start_date
+        end_date_meta = bars_meta.get("end_date") or end_date
+        print(f"  pack bar range:     {start_date} .. {end_date_meta} (bars use timestamp_ms; replay only shows snapshots where recv_ts_ms <= bar time)")
+    if snapshots and (iv_diag["with_atm_iv"] or iv_diag["with_quotes_usable"]) and iv_diag["with_atm_iv"] < len(snapshots):
+        print("  Note: VRP uses the *most recent* snapshot (by recv_ts_ms) first. If the latest snapshots lack atm_iv, it may still report 'no IV' even when older snapshots have IV.")
+    print()
+
     bars_count = len(pack.get("bars", []))
     outcomes_count = len(pack.get("outcomes", []))
-    snapshots_count = len(pack.get("snapshots", []))
+    snapshots_count = len(snapshots)
 
     runner = ExperimentRunner(output_dir="logs/experiments")
     result = runner.run(
@@ -105,7 +230,7 @@ def main() -> int:
 
     if trade_count == 0:
         print("WARNING: trade_count is 0. Likely reasons:")
-        for reason in _reasons_for_zero_trades(pack, args.provider):
+        for reason in _reasons_for_zero_trades(pack, provider):
             print(f"- {reason}")
         return 1
 

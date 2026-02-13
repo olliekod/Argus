@@ -61,20 +61,40 @@ class ExperimentRunner:
         return pack
 
     @staticmethod
+    def _float_or_none(v: Any) -> Optional[float]:
+        if v is None:
+            return None
+        try:
+            return float(v)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
     def _pack_snapshots_to_objects(snapshot_dicts: List[Dict[str, Any]]) -> List[MarketDataSnapshot]:
-        """Convert replay pack snapshot dicts to MarketDataSnapshot for ReplayHarness."""
+        """Convert replay pack snapshot dicts to MarketDataSnapshot for ReplayHarness.
+
+        Passes quotes_json so strategies can derive IV from bid/ask when atm_iv is absent.
+        """
         out: List[MarketDataSnapshot] = []
         for s in snapshot_dicts or []:
             recv_ts = s.get("recv_ts_ms")
             if recv_ts is None:
                 recv_ts = s.get("timestamp_ms", 0)
+            try:
+                recv_ts = int(recv_ts)
+            except (TypeError, ValueError):
+                recv_ts = 0
+            qj = s.get("quotes_json")
+            if qj is not None and not isinstance(qj, str):
+                qj = json.dumps(qj)
             out.append(
                 MarketDataSnapshot(
                     symbol=s.get("symbol", "SPY"),
                     recv_ts_ms=recv_ts,
                     underlying_price=float(s.get("underlying_price", 0.0)),
-                    atm_iv=s.get("atm_iv") if s.get("atm_iv") is not None else None,
+                    atm_iv=ExperimentRunner._float_or_none(s.get("atm_iv")),
                     source=s.get("provider", ""),
+                    quotes_json=qj,
                 )
             )
         return out
@@ -106,6 +126,23 @@ class ExperimentRunner:
             all_snapshots.extend(pack.get("snapshots", []))
 
         snapshots_objs = self._pack_snapshots_to_objects(all_snapshots)
+        n_with_iv = sum(1 for s in snapshots_objs if getattr(s, "atm_iv", None) is not None and s.atm_iv > 0)
+        if snapshots_objs and n_with_iv == 0:
+            print("WARNING: Pack has %d snapshots but 0 have atm_iv on MarketDataSnapshot (check pack→object conversion)." % len(snapshots_objs))
+
+        # Align bars with snapshot window: only keep bars whose sim_time (bar close) can
+        # release at least one snapshot. Packs often have bars from midnight while
+        # snapshots start at market open, so without this we'd process hundreds of bars
+        # with 0 visible snapshots and never release the IV-heavy ones.
+        bar_duration_ms = 60 * 1000  # ReplayConfig default
+        if snapshots_objs:
+            min_recv = min(s.recv_ts_ms for s in snapshots_objs)
+            n_bars_before = len(all_bars)
+            all_bars = [b for b in all_bars if (b.timestamp_ms + bar_duration_ms) >= min_recv]
+            if not all_bars:
+                print("WARNING: No bars after aligning to snapshot window (min recv_ts_ms=%s). Check pack bar/snapshot times." % min_recv)
+            elif n_bars_before != len(all_bars):
+                print("Replay: using %d bars (aligned to snapshot window; dropped %d bars before first snapshot)." % (len(all_bars), n_bars_before - len(all_bars)))
 
         # Warn if pack is missing data many strategies need (e.g. VRP needs outcomes + snapshots)
         if not all_outcomes:
