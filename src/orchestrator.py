@@ -218,6 +218,9 @@ class ArgusOrchestrator:
         self.detectors: Dict[str, Any] = {}
         
         self._running = False
+        # Task-tracking invariant: every asyncio.create_task() in run()
+        # MUST be appended to self._tasks so that stop() can cancel and
+        # await all of them via asyncio.gather(*self._tasks).
         self._tasks: List[asyncio.Task] = []
         self._start_time = datetime.now(timezone.utc)
         self._last_price_snapshot: Dict[str, datetime] = {}

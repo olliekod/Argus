@@ -70,6 +70,16 @@ evaluation:
   rankings_output_dir: "logs"
   killed_output_path: null
   candidate_set_output_path: null
+  # Allocation step (Phase 5 prelude): run allocation after evaluation.
+  # Set allocations_output_path to enable; null = skip allocation step.
+  allocation:
+    kelly_fraction: 0.25
+    per_play_cap: 0.07
+    vol_target_annual: 0.10
+  allocations_output_path: null   # e.g. "logs/allocations.json"
+  equity: 10000.0
+  min_dsr: 0.0
+  min_composite_score: 0.0
 
 # ── Loop (daemon) ───────────────────────────────────────────────────────────
 # Only used when running without --once.
