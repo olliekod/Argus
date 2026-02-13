@@ -98,7 +98,7 @@ def _compute_hac_variance(series: Sequence[float], bandwidth: int = 0) -> float:
     gamma_0 = sum(d * d for d in demeaned) / n
 
     if bandwidth == 0:
-        return gamma_0 / n
+        return max(gamma_0 / n, 1e-15)
 
     # Newey-West HAC
     total = gamma_0

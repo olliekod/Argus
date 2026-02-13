@@ -43,7 +43,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
-from .deflated_sharpe import deflated_sharpe_ratio
+from .deflated_sharpe import (
+    compute_deflated_sharpe_ratio,
+    deflated_sharpe_ratio,
+    threshold_sharpe_ratio,
+)
 from .reality_check import reality_check
 
 logger = logging.getLogger("argus.strategy_evaluator")
@@ -633,16 +637,34 @@ class StrategyEvaluator:
                 results[run_id] = {"dsr": 0.0, "reason": "insufficient_observations"}
                 continue
 
-            # Build a synthetic return series from available data for skew/kurtosis
-            # Since we only have summary stats, use the per-experiment Sharpe
-            # with the False Strategy Theorem approach
+            # We only have summary stats (sharpe, n_obs), not per-period returns.
+            # Use the DSR formula with skew=0, kurtosis=0 (normality assumption).
             try:
-                dsr_info = deflated_sharpe_ratio(
-                    returns=[sharpe] * max(n_obs, 30),
-                    n_trials=n_trials,
-                    all_sharpes=all_sharpes,
+                if all_sharpes and len(all_sharpes) >= 2:
+                    mean_sr = sum(all_sharpes) / len(all_sharpes)
+                    sr_var = sum((s - mean_sr) ** 2 for s in all_sharpes) / (
+                        len(all_sharpes) - 1
+                    )
+                else:
+                    sr_var = 1.0
+                sr_0 = threshold_sharpe_ratio(sr_var, n_trials)
+                dsr_val = compute_deflated_sharpe_ratio(
+                    observed_sharpe=sharpe,
+                    threshold_sr=sr_0,
+                    n_obs=n_obs,
+                    skewness=0.0,
+                    kurtosis=0.0,
                 )
-                results[run_id] = dsr_info
+                results[run_id] = {
+                    "dsr": round(dsr_val, 6),
+                    "observed_sharpe": round(sharpe, 6),
+                    "threshold_sr": round(sr_0, 6),
+                    "n_obs": n_obs,
+                    "n_trials": n_trials,
+                    "skew": 0.0,
+                    "kurtosis": 0.0,
+                    "sharpe_variance": round(sr_var, 6),
+                }
             except Exception as e:
                 logger.warning("DSR computation failed for %s: %s", run_id, e)
                 results[run_id] = {"dsr": 0.0, "reason": str(e)}

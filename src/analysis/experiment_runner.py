@@ -206,6 +206,7 @@ class ExperimentRunner:
 
         base_exec_config = config.execution_config or ExecutionConfig()
         results = []
+        baseline_strategy_id = None
 
         for cm in cost_multipliers:
             # Create a new ExecutionConfig with scaled costs
@@ -232,6 +233,8 @@ class ExperimentRunner:
             )
 
             result = self.run(sweep_config)
+            if baseline_strategy_id is None:
+                baseline_strategy_id = result.strategy_id
             summary = result.summary()
             portfolio = summary.get("portfolio", {})
 
@@ -264,7 +267,7 @@ class ExperimentRunner:
 
         killed = sharpe_at_150 < 0 or mean_ret_at_150 <= 0
 
-        return {
+        sweep_summary = {
             "killed": killed,
             "results": results,
             "sharpe_at_100pct": sharpe_at_100,
@@ -273,6 +276,40 @@ class ExperimentRunner:
             "mean_return_at_150pct": mean_ret_at_150,
         }
 
+        # Merge slippage_sensitivity into the baseline (1x) artifact so the
+        # evaluator can apply the deploy gate when loading experiments.
+        # Remove the 125% and 150% artifacts so the evaluator sees one experiment
+        # per strategy (the 1x run with the gate result in the manifest).
+        output_path = Path(config.output_dir)
+        if results and baseline_strategy_id:
+            baseline_pattern = f"{baseline_strategy_id}_cost_100pct_*.json"
+            candidates = list(output_path.glob(baseline_pattern))
+            if len(candidates) == 1:
+                path = candidates[0]
+                try:
+                    with open(path, "r") as f:
+                        artifact = json.load(f)
+                    artifact.setdefault("manifest", {})["slippage_sensitivity"] = sweep_summary
+                    with open(path, "w") as f:
+                        json.dump(artifact, f, indent=2)
+                    logger.info("Updated %s with slippage_sensitivity", path)
+                except (OSError, json.JSONDecodeError) as e:
+                    logger.warning("Could not update baseline artifact with slippage_sensitivity: %s", e)
+            else:
+                logger.warning(
+                    "Expected one baseline artifact matching %s, found %d",
+                    baseline_pattern, len(candidates),
+                )
+            # Remove 125% and 150% artifacts so evaluator gets one record per strategy
+            for tag in ("cost_125pct", "cost_150pct"):
+                for p in output_path.glob(f"{baseline_strategy_id}_{tag}_*.json"):
+                    try:
+                        p.unlink()
+                        logger.debug("Removed sweep-only artifact %s", p)
+                    except OSError as e:
+                        logger.warning("Could not remove %s: %s", p, e)
+
+        return sweep_summary
     def _extract_pack_data_sources(self, pack_paths: List[str]) -> Dict[str, Any]:
         """Extract data-source metadata from loaded packs."""
         bars_providers = set()

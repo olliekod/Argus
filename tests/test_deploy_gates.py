@@ -142,8 +142,9 @@ class TestDSRKillThreshold:
     def test_dsr_kill_reason_added(self):
         """Strategy with low DSR should get dsr_below_threshold kill."""
         with tempfile.TemporaryDirectory() as tmpdir:
-            # Create two experiments so DSR can be computed
-            for i, (rid, sr) in enumerate([("run1", 0.5), ("run2", 0.3)]):
+            # Use low Sharpe so DSR stays below 0.99 (with n_trials=2, threshold is low
+            # but observed Sharpe must be modest for DSR < 0.99)
+            for i, (rid, sr) in enumerate([("run1", 0.08), ("run2", 0.05)]):
                 exp = _make_experiment(
                     strategy_id=f"S{i}",
                     run_id=rid,
@@ -166,7 +167,7 @@ class TestDSRKillThreshold:
             evaluator.load_experiments()
             rankings = evaluator.evaluate()
 
-            # At least one should have DSR kill
+            # At least one should have DSR kill (low Sharpe -> DSR < 0.99)
             dsr_kills = [
                 r for r in rankings
                 for kr in r.get("kill_reasons", [])

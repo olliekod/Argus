@@ -52,7 +52,8 @@ flowchart LR
 | 4A Outcome Engine | **Done.** Bar outcomes, forward returns, run-up/drawdown, multi-horizon; deterministic backfills; `python -m src.outcomes`. |
 | 4B Backtesting / Replay | **Done.** Replay harness, experiment runner, conservative execution model; replay packs with bars, outcomes, regimes, option snapshots. |
 | 4C Parameter search & robustness lab | **Done.** Parameter sweeps; regime sensitivity scoring (`compute_regime_sensitivity_score`); parameter stability auto-kill (`compute_robustness_penalty`, `compute_walk_forward_penalty`); MC/bootstrap on realized trades (`mc_bootstrap.run_mc_paths`, `evaluate_mc_kill`); regime-subset stress (`run_regime_subset_stress`); Strategy Research Loop (outcomes → packs → experiments → evaluation, DB pass-through, base-params merge, `require_recent_bars_hours`). Integrated in ExperimentRunner and StrategyEvaluator. |
-| 4C optional (deploy gates) | **Backlog.** Deflated Sharpe, Reality Check/SPA-style comparison, slippage sensitivity sweeps (baseline, +25%, +50% costs). |
+| 4C optional (deploy gates) | **Done.** Deflated Sharpe (`deflated_sharpe.py`), Reality Check (`reality_check.py`), slippage sensitivity (`run_cost_sensitivity_sweep` + manifest integration); kill reasons in StrategyEvaluator; config via `DeployGatesOpts` / `evaluation.deploy_gates`. |
+| 5 Prelude (sizing and allocation) | **Done.** Forecast/sizing (`sizing.py`: fractional Kelly, vol-target overlay, `contracts_from_risk_budget`, confidence shrinkage); StrategyRegistry (`strategy_registry.py`); AllocationEngine (`allocation_engine.py`: per-play cap 7%, aggregate cap, optional vol target); config via `AllocationOpts` / `evaluation.allocation`. Research loop does not yet call registry or allocation engine. |
 
 ### IV / snapshot / replay truth map
 
@@ -79,15 +80,15 @@ flowchart LR
 | **3B** | Options pipeline | Done | Options ingestion, chain normalization, spread generation, liquidity filtering, deterministic persistence, tape capture, replay validation. |
 | **4A** | Outcome engine | Done | Forward returns, run-up, drawdown, multi-horizon outcomes, outcome DB storage, deterministic backfills. |
 | **4B** | Backtesting engine | Done | Replay harness, position simulator, entry/exit modeling, transaction costs, slippage (conservative execution model). |
-| **4C** | Parameter search & robustness lab | **Done** | Parameter sweeps; regime sensitivity scoring; parameter stability auto-kill (robustness/walk-forward penalties); MC/bootstrap on realized trades (block bootstrap, kill rules); regime-subset stress; Strategy Research Loop (outcomes → packs → experiments → evaluation). Optional deploy gates: Deflated Sharpe, Reality Check, slippage sensitivity — backlog. |
-| **5** | Portfolio risk engine | Future | Position sizing (fractional Kelly with caps; see §9.3), exposure limits, **per-play cap (e.g. ≤7% of equity)**, drawdown controls, correlation awareness, strategy budgets. Black–Scholes (or existing Greeks): delta/vega for exposure and implementation shortfall, not a separate phase. |
+| **4C** | Parameter search & robustness lab | **Done** | Parameter sweeps; regime sensitivity scoring; parameter stability auto-kill (robustness/walk-forward penalties); MC/bootstrap on realized trades (block bootstrap, kill rules); regime-subset stress; Strategy Research Loop (outcomes → packs → experiments → evaluation). Deploy gates done: DSR, Reality Check, slippage sensitivity (ExperimentRunner + evaluator). |
+| **5** | Portfolio risk engine | **Prelude done** | Sizing stack (Forecast, fractional Kelly, vol target, options contracts), StrategyRegistry, AllocationEngine. **Full Phase 5 (future):** Exposure limits, correlation, drawdown containment, strategy budgets. Black–Scholes (or existing Greeks): delta/vega for exposure and implementation shortfall, not a separate phase. |
 | **6** | Execution engine | Future | Broker integration, order routing, fill simulation, paper then live trading. TCA ledger (decision price, arrival, NBBO, executed, spread paid). |
 | **7** | Strategy expansion | Future | Put spread selling, volatility plays, panic snapback, FVG, session momentum, crypto–ETF relationships, Polymarket. |
 | **8** | Portfolio intelligence | Future | Strategy aggregation, signal voting, dynamic allocation, regime-based capital shifts. **StrategyLeague** (tournament allocator): eligibility gate, smoothed weight updates, degradation detector, kill/quarantine; allocate from health metrics not raw short-run PnL. |
 | **9** | Intelligence API product | Future | Expose bars, regimes, options intelligence, spread candidates, signals for subscription revenue. |
 | **10** | Self-improving system | Future | Automatic idea testing, strategy mutation, performance pruning, adaptive weighting. |
 
-**Current status:** Research engine complete through **4C**. Phase 4C robustness lab is done: parameter sweeps, regime sensitivity scoring, parameter stability auto-kill (robustness/walk-forward penalties), MC/bootstrap on realized trades, regime-subset stress, Strategy Research Loop (with DB pass-through, base-params merge, require_recent_bars_hours). Public options/Greeks integration done. **Next:** Phase 5 (portfolio risk engine), P1 audit fixes, or optional 4C deploy gates (DSR, slippage sensitivity).
+**Where we are now:** Phase 4C including deploy gates is done. Phase 5 prelude (sizing, registry, allocation engine) is done. The research loop still stops at rankings/candidate set and does not run allocation. **Next priorities:** (1) Close the research–allocation loop, (2) P1 audit (10.2, 10.4), (3) Portfolio risk engine (Phase 5 full), (4) Strategy lifecycle.
 
 ---
 
@@ -168,9 +169,9 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 
 **P1 — Critical / This sprint**
 
-- **10.1 Alpaca UTC timestamp parsing** — `src/connectors/alpaca_client.py`: Ensure datetime is UTC-aware before `.timestamp()` (naive → assume UTC). Add unit test.
+- **10.1 Alpaca UTC timestamp parsing** — **Fixed.** Naive datetimes treated as UTC in `alpaca_client.py` before `.timestamp()`.
 - **10.2 Deribit rate limiter** — `src/connectors/deribit_client.py`: Replace `.seconds` with `.total_seconds()` on timedelta (lines 79, 84). Add unit test.
-- **10.3 Options snapshot write retry** — `src/core/persistence.py`: Replace fire-and-forget option snapshot writes with retry pattern (e.g. 3× retry, backoff, log on final failure). Add test with mocked DB failure.
+- **10.3 Options snapshot write retry** — **Fixed.** `persistence.py` option chain snapshot write uses 3× retry with exponential backoff.
 - **10.4 Orchestrator task tracking** — Verify every `asyncio.create_task()` in `src/orchestrator.py` is appended to `self._tasks` and that `stop()` cancels and awaits them. (Audit claimed tasks were not tracked; codebase now appends in `run()` — confirm no untracked tasks and that shutdown is clean.)
 
 **P2 — High / Next sprint**
@@ -204,19 +205,18 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 - **Regime-subset stress** — `run_regime_subset_stress()` in `regime_stress.py`; run_experiment.py `--regime-stress`; Strategy Research Loop runs it per strategy.
 - **Strategy Research Loop** — `scripts/strategy_research_loop.py`; outcomes → packs → experiments → evaluation; DB pass-through, base-params merge, require_recent_bars_hours.
 
-### 8.2b Phase 4C optional (deploy gates — backlog)
+### 8.2b Phase 4C deploy gates — Done
 
-- **Deflated Sharpe Ratio (DSR)** — Multiple-testing correction; not yet implemented.
-- **Reality Check / SPA-style benchmark comparison** — Not yet implemented.
-- **Slippage sensitivity sweeps** — Run experiments at baseline, +25%, +50% costs; auto-fail if edge disappears; mandatory for deploy; not yet implemented.
-- **Selection gate** Deflated Sharpe Ratio (DSR) as deploy gate; Reality Check / SPA-style benchmark comparison; PBO-style penalty in ranking. Multiple-testing correction so “best of many” does not pass by chance. Regression test: random strategy family must not frequently pass (e.g. tests/test_false_discovery_rate.py).
-
+- **Deflated Sharpe Ratio** — `src/analysis/deflated_sharpe.py` (threshold SR, DSR formula with skew/kurtosis); StrategyEvaluator `_compute_dsr_for_all()`, kill reason `dsr_below_threshold`.
+- **Reality Check (White's SPA-style)** — `src/analysis/reality_check.py` (stationary bootstrap, HAC variance); evaluator kill reason `reality_check_failed` when p_value >= threshold.
+- **Slippage sensitivity** — `ExecutionConfig.cost_multiplier`; `ExperimentRunner.run_cost_sensitivity_sweep()` (1x, 1.25x, 1.5x); sweep result written into baseline artifact manifest; evaluator kill reason `slippage_sensitivity` when killed.
+- **Config** — `research_loop_config.DeployGatesOpts`; YAML `evaluation.deploy_gates` (dsr_min, reality_check_p_max, etc.).
 ### 8.3 Strategic / product TODOs
 
-- **Strategy allocation engine (StrategyLeague)** — Strategy registry, capital competition, budget updates, promotion/demotion. **Contract:** eligibility gate (binary pass/fail on data quality, deployability); allocation update with **smoothed weight updates** and anti-churn (no allocation change > X% per rebalance); degradation detector (kill/quarantine on rolling expectancy deterioration, slippage spikes, drawdown regime breach, model drift). Consume strategy forecasts + risk estimates; output target exposures under hard constraints. No strategy gets allocation if it fails data-quality gates in the recent window.
+- **Strategy allocation engine (StrategyLeague)** — **Minimal allocation engine — Done.** `StrategyRegistry`, `AllocationEngine`, `AllocationConfig`; consumes `Forecast` list, outputs target weights/contracts with per-play cap (7%) and aggregate cap. **Still to do (StrategyLeague):** capital competition, smoothed weight updates, degradation detector, eligibility gate in production loop.
 - **Strategy lifecycle & kill engine** — Rolling performance metrics, degradation detection, quarantine, automatic strategy death when edge disappears. Kill triggers: rolling expectancy beyond confidence bounds, slippage/lag spikes, drawdown regime breach, data distribution shift.
 - **Portfolio risk engine** — Exposure limits, correlation control, risk budgeting, drawdown containment. **Per-play cap:** e.g. ≤7% of equity per play (one position or correlated cluster); portfolio caps for sector/underlying/vega concentration. Required before safe live deployment. Tests: e.g. test_risk_caps.py (allocator clamps when multiple signals try to exceed caps).
-- **Sizing engine (Phase 1)** — Vol-targeted **fractional Kelly** with caps (e.g. quarter-Kelly 0.25·μ/σ² as upper bound; 10–25% Kelly for automated deploy). μ from strategy backtest (walk-forward), shrunk by confidence; σ from rolling realized vol; size = c·μ/σ² with caps and portfolio vol target; skip trades where expected edge < costs. Treat Kelly as upper bound; hard drawdown and max-loss constraints always apply.
+- **Sizing engine (Phase 1)** — **Done.** `sizing.py`: Forecast, `fractional_kelly_size`, `vol_target_overlay`, `contracts_from_risk_budget`, `shrink_mu`, `size_position`. Quarter-Kelly, caps, vol target, confidence shrinkage. **Phase 2–3** (covariance shrinkage, portfolio risk budgeting) remains future.
 - **Sizing engine (Phase 2–3)** — Covariance shrinkage and portfolio risk budgeting; then drawdown probability constraints and ES monitoring. Two allocators: simple vol-scaling/risk-budget baseline; shrinkage-covariance allocator for multi-strategy. Tests: test_allocator_numerics.py (PSD covariance, weight sum constraints).
 - **Black–Scholes / Greeks usage** — Use for risk (delta/vega, max vega per underlying), IV/VRP inputs (already in use), and implementation shortfall (decision vs execution). Not a separate phase; part of execution and risk caps.
 - **Live vs backtest drift monitor** — Compare live fills vs simulated; detect slippage drift and execution degradation. Alert if realized slippage exceeds backtest assumption by Yσ → quarantine strategy.
@@ -225,57 +225,50 @@ Long-term monetization: sell spreads, signals, and options intelligence via API.
 
 ### 8.4 Next steps and recommended route
 
+**Next steps (summary):**
+
+1. **Close the research–allocation loop** — In `strategy_research_loop.py`, after `evaluate_and_persist`: load rankings into StrategyRegistry (with DSR/score filters), build `Forecast`s from evaluator output (or candidate set), run AllocationEngine, persist allocations (e.g. JSON) so a future paper/live path can consume them. This completes "test strategies → filter → allocate" without execution.
+2. **P1 audit** — Finish 10.2 (Deribit `.total_seconds()`), 10.4 (orchestrator task tracking verification).
+3. **Portfolio risk engine** — Correlation awareness, drawdown containment, full exposure limits (Phase 5 full).
+4. **Strategy lifecycle** — Rolling metrics, degradation detection, quarantine/kill in production.
+
 **Assessment (codebase vs Master Plan):**
 
 - **Phases 0–4B:** In place. Event bus, bars, regimes, options pipeline, outcome engine, replay harness, experiment runner, execution model, and (after audit fixes) DXLink Greeks + cross-expiration IV are the backbone. Replay packs with bars + outcomes + regimes + snapshots work; VRP strategy can consume `atm_iv` and `realized_vol` in replay.
-- **Phase 4C:** Done. Regime sensitivity scoring, parameter stability auto-kill (robustness/walk-forward penalties), MC/bootstrap on realized trades, regime-subset stress, Strategy Research Loop — all integrated in ExperimentRunner and StrategyEvaluator. **Optional backlog:** Deflated Sharpe, Reality Check, slippage sensitivity sweeps.
-- **Audit:** Two critical bugs fixed. P1–P3 items (timestamp parsing, rate limiter, snapshot retry, task tracking check, bar lock, DXLink errors, ExecutionModel reset, secrets permissions, VRP RV, etc.) are still open and affect correctness or operational safety.
+- **Phase 4C:** Done. Regime sensitivity scoring, parameter stability auto-kill (robustness/walk-forward penalties), MC/bootstrap on realized trades, regime-subset stress, Strategy Research Loop, and deploy gates (DSR, Reality Check, slippage sensitivity) — all integrated in ExperimentRunner and StrategyEvaluator.
+- **Audit:** Two critical bugs fixed. P1: 10.1 and 10.3 fixed; 10.2 and 10.4 remain. P2–P3 items (bar lock, DXLink errors, ExecutionModel reset, secrets permissions, VRP RV, etc.) still open.
 - **Public API:** Done. Second IV/Greeks source; health script and provider comparison; reduces dependence on DXLink alone.
-- **Strategic gaps:** No strategy allocation engine, no portfolio risk engine, no sizing layer, no strategy lifecycle/kill engine, no live vs backtest drift monitor. These block safe scaling and live deployment.
+- **Strategic gaps:** Allocation **prelude** and sizing are in place; research loop is **not yet wired** to StrategyRegistry or AllocationEngine (no step that builds forecasts from rankings and runs allocation). Still missing: full portfolio risk engine, strategy lifecycle/kill engine, live vs backtest drift monitor.
 
 **Recommended next steps (ordered):**
 
-1. **Harden data and replay (1–2 sprints)**  
-   - **P1 audit fixes:** Alpaca UTC (10.1), Deribit rate limiter (10.2), options snapshot retry (10.3), confirm task tracking and shutdown (10.4).  
+1. **Close the research–allocation loop**  
+   - In `strategy_research_loop.py`, after `evaluate_and_persist`: load rankings into StrategyRegistry (with DSR/score filters), build `Forecast`s from evaluator output (or candidate set), run AllocationEngine, persist allocations (e.g. JSON). Outcome: one cycle "test → filter → allocate" without execution; paper/live can consume allocations later.
+
+2. **Harden data and replay (1–2 sprints)**  
+   - **P1 audit:** Deribit rate limiter (10.2), orchestrator task tracking (10.4). (10.1 and 10.3 fixed.)  
    - **P2 quick wins:** ExecutionModel reset at start of replay `run()` (10.7), secrets file permissions (10.8).  
    - **E2E check:** Confirm IV truth map in practice (cold start, illiquid symbols); ensure replay experiments produce non-zero VRP trades where expected.
-
-2. **Public API for Greeks/IV (1 sprint)**  
-   - Implement Public client (auth, token refresh, accountId) and Public options connector (expirations → chain → greeks → snapshot with `atm_iv`).  
-   - Wire into orchestrator; add config and tests.  
-   - Outcome: Second source of IV; less reliance on DXLink alone; same snapshot/replay path.
 
 3. **Use the research engine to prove edge (ongoing)**  
    - Run VRP and (when ready) Overnight Session experiments on replay packs (multiple symbols, date ranges).  
    - Use existing `--sweep` and evaluator for parameter robustness and regime sensitivity.  
    - Document what works and what doesn’t; feed results into strategy priority (Master Plan §4) and into future allocation/sizing design.
 
-4. **Phase 4C — Done**  
-   - **Strategy Research Loop:** Config-driven full cycle; outcomes backfill with DB pass-through; base-params merge in sweeps; require_recent_bars_hours guard.  
-   - **Regime sensitivity scoring:** Done (`compute_regime_sensitivity_score`).  
-   - **Parameter stability auto-kill:** Done (`compute_robustness_penalty`, `compute_walk_forward_penalty`).  
-   - **Regime-subset stress:** Done (`run_regime_subset_stress`).  
-   - **MC/bootstrap on realized trades:** Done (`mc_bootstrap.run_mc_paths`, `evaluate_mc_kill`; block bootstrap; integrated in ExperimentRunner and StrategyEvaluator).  
-   - **Optional (backlog):** DSR, Reality Check/SPA-style comparison, slippage sensitivity sweeps; BOCPD as regime gate.
-
-5. **Strategy allocation and sizing (Phase 5 prelude)**   
-   - Introduce a small **strategy allocation engine:** registry, forecast normalization (μ̂, σ̂, confidence), and a single-instrument sizing rule (e.g. vol-targeted fractional Kelly with caps). No broker execution yet; output is target exposure or “risk budget” per strategy/symbol.  
-   - Optionally add options-spread sizing (risk budget / max loss per contract).  
-   - Outcome: Clear separation “strategy says what; sizing says how much” and a path to portfolio risk (Phase 5).
-
-6. **Portfolio risk engine (Phase 5)**  
+4. **Portfolio risk engine (Phase 5 full)**  
    - Exposure limits, correlation awareness, drawdown containment, and (later) covariance shrinkage and portfolio-level vol target.  
    - Required before paper/live with real capital.
 
-7. **Strategy lifecycle and monitoring**  
+
+5. **Strategy lifecycle and monitoring**  
    - Rolling performance, degradation detection, quarantine, and automatic strategy death.  
    - Live vs backtest drift monitor when paper or live is in use.
 
 **Best route going forward:**
 
-- **Short term:** **Phase 4C done.** Next: Phase 5 (portfolio risk engine), P1 audit fixes (Alpaca UTC, Deribit rate limiter, options snapshot retry, task tracking), or optional 4C deploy gates (DSR, slippage sensitivity). E2E IV check when running both providers.  
-- **Medium term:** Use the replay and experiment pipeline to **validate VRP (and session ideas)** on multiple packs and regimes with the new kill criteria. Add a **minimal allocation/sizing layer** that consumes strategy forecasts and outputs risk budgets under caps, without execution.  
-- **Long term:** Add **portfolio risk engine** and **strategy lifecycle**, then paper trading and live execution. Keep the Master Plan order: allocation → lifecycle → risk engine → monitoring → paper → live → strategy expansion.
+- **Short term:** Close the research–allocation loop (registry + allocation in research loop). Then remaining P1 (10.2, 10.4).  
+- **Medium term:** Portfolio risk engine, strategy lifecycle.  
+- **Long term:** Paper → live → strategy expansion.
 
 Public API is done (second IV source); focus is on killing bad strategies fast so only robust parameter sets get capital later.
 
@@ -332,7 +325,7 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 
 ### 9.5 Gaps Argus still has
 
-- Strategy lifecycle & allocation engine (registry, capital competition, promotion/demotion, kill degraded).
+- Strategy allocation **prelude** (registry, AllocationEngine, sizing) is in place; **loop wiring** (research → registry → allocation → persisted allocations) and full **StrategyLeague** behavior (capital competition, smoothed updates, degradation detector) are not yet implemented.
 - Portfolio risk engine (exposure limits, correlation, risk budgeting, drawdown containment).
 - Live vs backtest drift monitor (fills, slippage, execution degradation).
 - Strategy health monitoring (rolling metrics, degradation alerts, quarantine).

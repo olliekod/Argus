@@ -292,14 +292,16 @@ def load_research_loop_config(
     alloc_raw = eval_raw.get("allocation") or raw.get("allocation", {})
     allocation = None
     if alloc_raw:
+        # vol_target_annual: missing -> 0.10; explicit null -> None (no overlay)
+        vol_raw = alloc_raw.get("vol_target_annual")
+        if vol_raw is None and "vol_target_annual" in alloc_raw:
+            vol_target_annual = None
+        else:
+            vol_target_annual = float(vol_raw if vol_raw is not None else 0.10)
         allocation = AllocationOpts(
             kelly_fraction=float(alloc_raw.get("kelly_fraction", 0.25)),
             per_play_cap=float(alloc_raw.get("per_play_cap", 0.07)),
-            vol_target_annual=(
-                float(alloc_raw["vol_target_annual"])
-                if alloc_raw.get("vol_target_annual") is not None
-                else 0.10
-            ),
+            vol_target_annual=vol_target_annual,
             min_edge_over_cost=float(alloc_raw.get("min_edge_over_cost", 0.0)),
         )
 

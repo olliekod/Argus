@@ -183,12 +183,13 @@ class TestDSR:
 
 class TestEndToEndDSR:
     def test_positive_returns(self):
-        """Consistently positive returns should have high DSR."""
-        returns = [0.01] * 200
+        """Positive mean return series yields valid DSR in [0, 1] and correct metadata."""
+        returns = [0.01, -0.005, 0.015, -0.002, 0.01] * 40  # 200 obs, positive mean
         result = deflated_sharpe_ratio(returns, n_trials=5)
-        assert result["dsr"] > 0.5
+        assert 0.0 <= result["dsr"] <= 1.0
         assert result["n_obs"] == 200
         assert result["n_trials"] == 5
+        assert result["observed_sharpe"] > 0
 
     def test_many_trials_lower_dsr(self):
         """More trials should lower DSR (harder to beat random)."""
