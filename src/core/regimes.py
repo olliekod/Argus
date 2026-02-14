@@ -425,8 +425,11 @@ def dict_to_market_regime(d: Dict[str, Any]) -> MarketRegimeEvent:
 # Market Classification
 # ═══════════════════════════════════════════════════════════════════════════
 
+# Global ETF proxies for overnight strategy risk-flow feature (daily bars only)
+_GLOBAL_ETF_PROXIES = {"EWJ", "FXI", "EWT", "EWY", "INDA", "EWG", "EWU", "FEZ", "EWL", "EEM"}
+
 # Symbols that belong to EQUITIES market
-EQUITIES_SYMBOLS = set(LIQUID_ETF_UNIVERSE) | {"IBIT", "BITO", "NVDA"}
+EQUITIES_SYMBOLS = set(LIQUID_ETF_UNIVERSE) | {"IBIT", "BITO", "NVDA"} | _GLOBAL_ETF_PROXIES
 
 # All other symbols default to CRYPTO
 

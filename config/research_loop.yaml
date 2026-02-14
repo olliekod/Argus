@@ -54,6 +54,14 @@ strategies:
   - strategy_class: "VRPCreditSpreadStrategy"
     params: {}   # or e.g. { min_vrp: 0.03, max_vol_regime: "VOL_NORMAL" }
     sweep: "config/vrp_sweep.yaml"
+  - strategy_class: "OvernightSessionStrategy"
+    params:
+      fwd_return_threshold: 0.005
+      entry_window_minutes: 30
+      horizon_seconds: 14400
+      gate_on_risk_flow: false
+      min_global_risk_flow: -0.005
+    sweep: "config/overnight_sweep.yaml"
   # - strategy_class: "VRPCreditSpreadStrategy"
   #   params: { min_vrp: 0.03 }
   #   sweep: "config/vrp_sweep.yaml"

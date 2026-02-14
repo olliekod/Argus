@@ -159,8 +159,8 @@ class OutcomeEngine:
         self.gap_tolerance_bars = config.get("gap_tolerance_bars", 1)
         self.quantize_decimals = config.get("quantize_decimals", 10)
         self.horizons_by_bar = config.get("horizons_seconds_by_bar", {
-            60: [300, 900, 3600, 14400, 86400],
-            300: [900, 3600, 14400, 86400],
+            60: [300, 900, 3600, 14400, 28800, 86400],
+            300: [900, 3600, 14400, 28800, 86400],
             900: [3600, 14400, 86400],
             3600: [14400, 86400],
             14400: [86400],

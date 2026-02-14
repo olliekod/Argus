@@ -591,6 +591,21 @@ class RegimeDetector:
         self._market_events_emitted += 1
         self._last_market_regimes[market] = event
 
+    def set_external_metric(self, key: str, value: Any) -> None:
+        """Inject an external metric into the risk metrics dict.
+
+        This is the integration point for features that are computed
+        outside the per-bar indicator pipeline (e.g. GlobalRiskFlow
+        from daily ETF bars).  The value will appear in ``metrics_json``
+        on subsequent market regime events.
+
+        Args:
+            key: Metric name (e.g. ``"global_risk_flow"``).
+            value: Metric value (must be JSON-serialisable).
+        """
+        with self._lock:
+            self._risk_metrics[key] = value
+
     def _get_session_regime(self, market: str, ts_ms: int) -> str:
         return get_session_regime(market, ts_ms)
 

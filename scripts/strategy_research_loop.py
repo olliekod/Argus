@@ -69,6 +69,7 @@ logger = logging.getLogger("argus.research_loop")
 _STRATEGY_MODULES = [
     "src.strategies.vrp_credit_spread",
     "src.strategies.dow_regime_timing",
+    "src.strategies.overnight_session",
 ]
 
 

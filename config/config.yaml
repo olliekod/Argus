@@ -115,6 +115,31 @@ exchanges:
     enabled: true
     symbols: ["IBIT", "BITO", "DIA", "GLD", "IWM", "QQQ", "SMH", "SPY", "TLT", "XLE", "XLF", "XLK", "NVDA"]
 
+  # Alpha Vantage — daily bars for global ETF proxies and FX pairs.
+  # These are NOT in Alpaca's symbols list (no intraday backfill).
+  # Used exclusively by the GlobalRiskFlow feature and overnight strategy.
+  # Budget: ~14 calls/day at free tier (5 calls/min, 25/day).
+  alphavantage:
+    enabled: false     # enable after secrets.yaml has api_key
+    daily_symbols:
+      # Asia-Pacific
+      - "EWJ"     # Japan (Nikkei proxy)
+      - "FXI"     # China large-cap
+      - "EWT"     # Taiwan (semi proxy)
+      - "EWY"     # South Korea
+      - "INDA"    # India
+      # Europe
+      - "EWG"     # Germany (DAX proxy)
+      - "EWU"     # United Kingdom
+      - "FEZ"     # Eurozone large-cap
+      - "EWL"     # Switzerland (defensive)
+      - "EEM"     # Emerging markets broad
+    fx_pairs:
+      - "EUR/USD"
+      - "USD/JPY"
+      - "GBP/USD"
+      - "AUD/USD"
+
 # -----------------------------------------------------------------------------
 # Tastytrade Configuration
 # -----------------------------------------------------------------------------
