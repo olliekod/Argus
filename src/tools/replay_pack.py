@@ -30,6 +30,13 @@ from typing import Any, Dict, List, Optional
 from src.core.database import Database
 from src.core.data_sources import get_data_source_policy, DataSourcePolicy
 from src.core.liquid_etf_universe import get_liquid_etf_universe
+from src.core.global_risk_flow import (
+    compute_global_risk_flow,
+    ASIA_SYMBOLS,
+    EUROPE_SYMBOLS,
+    FX_RISK_SYMBOL,
+)
+
 
 
 def _atm_iv_from_quotes_json(quotes_json: str, underlying_price: float) -> Optional[float]:
@@ -435,6 +442,45 @@ async def create_replay_pack(
             "regimes": all_regimes,
             "snapshots": snapshots,
         }
+
+        # 6b. Inject GlobalRiskFlow into Regimes
+        # regimes in DB have metrics_json: str. We parse, inject, and re-serialize.
+        # This ensures the replay-pack consumer (RegimeDetector or Strategy)
+        # sees the metric as if it were emitted by the live system.
+        all_daily_symbols = list(ASIA_SYMBOLS) + list(EUROPE_SYMBOLS) + [FX_RISK_SYMBOL]
+        av_bars_by_sym = await db.get_bars_daily_for_risk_flow(
+            source="alphavantage",
+            symbols=all_daily_symbols,
+            end_ms=end_ms,
+            lookback_days=365,
+        )
+
+        injected_count = 0
+        for regime in all_regimes:
+            # regimes from DB are dicts with 'timestamp' (ISO string) or 'timestamp_ms' if already processed
+            regime_ts_ms = regime.get("timestamp_ms")
+            if regime_ts_ms is None:
+                regime_ts_ms = _bar_timestamp_to_ms(regime.get("timestamp"))
+            
+            risk_flow = compute_global_risk_flow(av_bars_by_sym, regime_ts_ms)
+            if risk_flow is not None:
+                # Parse metrics_json
+                m_json = regime.get("metrics_json", "{}")
+                try:
+                    metrics = json.loads(m_json)
+                    new_val = round(risk_flow, 8)
+                    
+                    # Only update if missing or changed to avoid unnecessary reserialization
+                    if metrics.get("global_risk_flow") != new_val:
+                        metrics["global_risk_flow"] = new_val
+                        # Local reserialization with sort_keys for determinism
+                        regime["metrics_json"] = json.dumps(metrics, sort_keys=True)
+                        injected_count += 1
+                except json.JSONDecodeError:
+                    pass
+        
+        if injected_count > 0:
+            print(f"  Injected global_risk_flow into {injected_count} regimes.")
 
         # 7. Write
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)

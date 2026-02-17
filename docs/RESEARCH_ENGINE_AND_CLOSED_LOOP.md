@@ -158,7 +158,7 @@ python scripts/strategy_research_loop.py --config config/research_loop.yaml --on
 
 ## 4. Overnight session experiments (when that strategy exists)
 
-The Master Plan lists **Overnight Session Momentum / Seasonality** as a top-priority direction (session transitions, BTC/IBIT/SPY overnight). There is **no** `OvernightSessionStrategy` (or similar) in the codebase yet; only **VRPCreditSpreadStrategy** and **DowRegimeTiming** are wired in `strategy_research_loop.py`.
+The Master Plan lists **Overnight Session Momentum / Seasonality** as a top-priority direction. **OvernightSessionStrategy** is implemented in `src/strategies/overnight_session.py`, wired in `strategy_research_loop.py` and `config/research_loop.yaml` (with `config/overnight_sweep.yaml`). **VRPCreditSpreadStrategy** and **DowRegimeTiming** are also wired.
 
 **When an overnight/session strategy is implemented:**
 

@@ -459,22 +459,23 @@ class IBITDetector(BaseDetector):
                     detection['detection_data']['farm_count'] = farm_count
                     self.logger.info(f"Farm evaluation: {farm_count} traders followed signal")
                 
-                # Send paper trade notification via Telegram
+                # Send paper trade notification via Telegram (Tier 3 - Background/Log only)
                 if self._telegram_callback:
                     paper_msg = f"""
-📝 *PAPER TRADE OPENED*
+📝 <b>PAPER TRADE OPENED</b>
 
 Trade #{paper_trade.id}
 ${paper_trade.short_strike:.0f}/${paper_trade.long_strike:.0f} Put Spread
-Qty: {paper_trade.quantity} contracts//
-Credit: ${paper_trade.entry_credit:.2f}
+Qty: {paper_trade.quantity} contracts, Credit: ${paper_trade.entry_credit:.2f}
 
-IV Rank: {paper_trade.iv_rank_at_entry:.0f}%
-PoP: {paper_trade.entry_pop:.0f}%
-
-_This is a PAPER trade for tracking._
+IV Rank: {paper_trade.iv_rank_at_entry:.0f}% | PoP: {paper_trade.entry_pop:.0f}%
 """
-                    await self._telegram_callback(paper_msg.strip())
+                    # If the callback is the TelegramBot.send_alert, use it with Tier 3
+                    if hasattr(self._telegram_callback, '__name__') and self._telegram_callback.__name__ == 'send_alert':
+                        await self._telegram_callback(paper_msg.strip(), priority=3)
+                    else:
+                        # Fallback for simple callbacks
+                        await self._telegram_callback(paper_msg.strip())
                     
             except Exception as e:
                 self.logger.warning(f"Failed to log paper trade: {e}")

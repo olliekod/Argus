@@ -210,24 +210,29 @@ class IBITOptionsClient:
         otm_pct = 0.10 + (0.20 - target_delta) * 0.5  # Rough conversion
         target_strike = current_price * (1 - otm_pct)
         
+        # Filter for quality quotes (no NaN, non-zero bid)
+        valid_puts = puts.dropna(subset=['bid', 'ask', 'strike'])
+        valid_puts = valid_puts[(valid_puts['bid'] > 0) & (valid_puts['ask'] > 0)]
+        
+        if valid_puts.empty:
+            logger.warning(f"No valid put quotes found for {expiration} (all NaN or zero bid)")
+            return None
+
         # Find closest strike to target
-        puts_sorted = puts.copy()
+        puts_sorted = valid_puts.copy()
         puts_sorted['distance'] = abs(puts_sorted['strike'] - target_strike)
         puts_sorted = puts_sorted.sort_values('distance')
-        
-        if puts_sorted.empty:
-            return None
         
         short_put = puts_sorted.iloc[0]
         short_strike = float(short_put['strike'])
         
         # Find long strike (spread_width below short)
         long_target = short_strike - spread_width
-        long_candidates = puts[puts['strike'] <= long_target].sort_values('strike', ascending=False)
+        long_candidates = valid_puts[valid_puts['strike'] <= long_target].sort_values('strike', ascending=False)
         
         if long_candidates.empty:
             # Use next available lower strike
-            lower_strikes = puts[puts['strike'] < short_strike].sort_values('strike', ascending=False)
+            lower_strikes = valid_puts[valid_puts['strike'] < short_strike].sort_values('strike', ascending=False)
             if lower_strikes.empty:
                 return None
             long_put = lower_strikes.iloc[0]
@@ -250,6 +255,12 @@ class IBITOptionsClient:
         
         net_credit = short_mid - long_mid
         max_risk = actual_width - net_credit
+        
+        # Guard against NaN/Inf in calculation
+        import math
+        if math.isnan(net_credit) or math.isnan(max_risk):
+            logger.warning(f"NaN economics for {self.symbol} spread: credit={net_credit}, risk={max_risk}")
+            return None
         
         # Get IV for short put
         short_iv = float(short_put.get('impliedVolatility', 0) or 0)
@@ -340,8 +351,10 @@ class IBITOptionsClient:
                 iv_low = realized_vol * 0.8
                 iv_high = realized_vol * 1.5
                 
-                if iv_high > iv_low:
+                if iv_high > iv_low and not math.isnan(realized_vol):
                     iv_rank = ((current_iv - iv_low) / (iv_high - iv_low)) * 100
+                    if math.isnan(iv_rank):
+                        return 50.0
                     return max(0, min(100, iv_rank))
         except Exception as e:
             logger.debug(f"Could not calculate historical IV rank: {e}")

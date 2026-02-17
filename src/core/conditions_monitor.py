@@ -104,6 +104,7 @@ class ConditionsMonitor:
         self._get_btc_iv: Optional[Callable] = None
         self._get_funding: Optional[Callable] = None
         self._get_btc_price: Optional[Callable] = None
+        self._get_risk_flow: Optional[Callable] = None
         
         logger.info("Conditions Monitor initialized")
     
@@ -112,11 +113,13 @@ class ConditionsMonitor:
         get_btc_iv: Optional[Callable] = None,
         get_funding: Optional[Callable] = None,
         get_btc_price: Optional[Callable] = None,
+        get_risk_flow: Optional[Callable] = None,
     ):
         """Set callbacks for fetching data from connectors."""
         self._get_btc_iv = get_btc_iv
         self._get_funding = get_funding
         self._get_btc_price = get_btc_price
+        self._get_risk_flow = get_risk_flow
     
     def _is_market_open(self) -> bool:
         """Check if US stock market is currently open."""
@@ -343,7 +346,16 @@ class ConditionsMonitor:
             'market_time_et': market_time,
             'last_updated': s.timestamp.isoformat(),
             'last_updated_et': updated_et.strftime("%Y-%m-%d %H:%M:%S %Z"),
+            'risk_flow': "N/A",
         }
+        
+        if self._get_risk_flow:
+            try:
+                res['risk_flow'] = self._get_risk_flow()
+            except Exception:
+                pass
+                
+        return res
     
     async def start_monitoring(self) -> None:
         """Start the monitoring loop."""

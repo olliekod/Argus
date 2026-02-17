@@ -130,10 +130,18 @@ class AlphaVantageClient:
                     f"Alpha Vantage error: {data['Error Message']}"
                 )
 
-            # Rate-limit "Note" — AV returns this instead of data when
-            # you've hit the per-minute or per-day cap.
-            if "Note" in data:
-                last_note = data["Note"]
+            # Rate-limit "Note" or "Information" — AV returns this instead of data 
+            # when you've hit the per-minute or per-day cap.
+            rate_limit_msg = data.get("Note") or data.get("Information")
+            if rate_limit_msg:
+                last_note = rate_limit_msg
+                
+                # If it's a daily limit message, raise immediately (retrying won't help)
+                if "25 requests per day" in str(rate_limit_msg).lower():
+                    raise AlphaVantageRateLimitError(
+                        f"Alpha Vantage daily limit reached: {rate_limit_msg}"
+                    )
+
                 if attempt < self._max_retries:
                     backoff = self._retry_base * (2 ** attempt)
                     logger.warning(

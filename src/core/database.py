@@ -2797,3 +2797,46 @@ class Database:
                 d["last_ts_age_s"] = -1
             result.append(d)
         return result
+
+    async def get_bars_daily_for_risk_flow(
+        self,
+        source: str,
+        symbols: List[str],
+        end_ms: int,
+        lookback_days: int = 365,
+    ) -> Dict[str, List[Dict[str, Any]]]:
+        """Fetch daily bars for risk-flow computation.
+
+        Parameters
+        ----------
+        source : str
+            Bar source (e.g. ``"alphavantage"``).
+        symbols : list[str]
+            Symbols to retrieve (e.g. ``["SPY", "EWJ", "FX:EURUSD"]``).
+        end_ms : int
+            Strict upper bound (exclusive) — bars with timestamp < end_ms.
+        lookback_days : int
+            How far back to look (default 365).
+
+        Returns
+        -------
+        dict[str, list[dict]]
+            ``{symbol: [{timestamp_ms, open, high, low, close, volume}, ...]}``
+            Bars are sorted ascending by timestamp.
+        """
+        start_epoch = (end_ms / 1000.0) - (lookback_days * 86400)
+        result: Dict[str, List[Dict[str, Any]]] = {}
+        for sym in symbols:
+            cursor = await self._connection.execute("""
+                SELECT
+                    CAST(strftime('%s', timestamp) AS INTEGER) * 1000 as timestamp_ms,
+                    open, high, low, close, volume
+                FROM market_bars
+                WHERE source = ? AND symbol = ? AND bar_duration = 86400
+                  AND timestamp >= datetime(?, 'unixepoch')
+                  AND timestamp < datetime(?, 'unixepoch')
+                ORDER BY timestamp ASC
+            """, (source, sym, start_epoch, end_ms / 1000.0))
+            rows = await cursor.fetchall()
+            result[sym] = [dict(row) for row in rows]
+        return result

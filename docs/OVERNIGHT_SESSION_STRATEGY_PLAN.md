@@ -104,6 +104,8 @@ These cover Asia growth & tech, China risk, Europe industrial & financial flow, 
 
 **Goal:** Add global proxies and regime signals without new connectors.
 
+**Status:** Core implementation is **done**: Alpha Vantage collector (10 ETFs + 4 FX → `market_bars`), global risk flow computation, DB-only updater, regime merge, replay-pack injection, and overnight strategy gating (`gate_on_risk_flow`, `min_global_risk_flow`). Remaining work: verification (E2E pack + strategy gating), optional config (global ETFs in Alpaca), and docs. See **[PLAN_OVERNIGHT_PHASE2.md](PLAN_OVERNIGHT_PHASE2.md)** for the Phase 2 checklist and task list.
+
 #### 2a. Global ETF Proxies (10 Symbols — Asia + Europe)
 
 Add these symbols to Alpaca/Yahoo and Alpha Vantage daily backfill:

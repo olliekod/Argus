@@ -8,6 +8,7 @@ Includes dynamic position sizing based on Probability of Profit.
 
 import logging
 import time
+import math
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -159,18 +160,19 @@ class TradeCalculator:
         if position_size_pct <= 0:
             return 0
         
+        import math
+        if math.isnan(max_risk_per_contract) or max_risk_per_contract <= 0:
+            return 0
+        
         max_capital_at_risk = self.account_size * position_size_pct
         
         # Each contract represents 100 shares
         risk_per_contract = max_risk_per_contract * 100
         
-        if risk_per_contract <= 0:
-            return 0
-        
         num_contracts = int(max_capital_at_risk / risk_per_contract)
         
-        # Minimum 1 contract if trade is valid
-        return max(1, num_contracts)
+        # Guard against zero or negative contracts
+        return max(0, num_contracts)
     
     def generate_recommendation(
         self,
@@ -283,6 +285,11 @@ class TradeCalculator:
             logger.info(f"PoP {pop:.1f}% too low for trade")
             warnings.append(f"⚠️ PoP {pop:.1f}% below 50% threshold - consider skipping")
             position_size_pct = self.MIN_POSITION_SIZE  # Allow override
+        
+        # Guard against NaN values in critical economics
+        if any(math.isnan(v) for v in [net_credit, max_risk, break_even, pop, prob_touch_stop]):
+            logger.error(f"Cannot generate recommendation for {self.symbol}: NaN values detected")
+            return None
         
         # Calculate contracts
         num_contracts = self.calculate_num_contracts(max_risk, position_size_pct)

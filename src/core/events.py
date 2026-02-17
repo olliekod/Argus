@@ -201,6 +201,19 @@ class RegimeChangeEvent:
     v: int = SCHEMA_VERSION
 
 
+@dataclass(frozen=True, slots=True)
+class ExternalMetricEvent:
+    """External metric injected into the regime pipeline.
+
+    Published to: regimes.external_metrics
+    Consumed by RegimeDetector to enrich ``metrics_json``.
+    """
+    key: str                  # e.g. 'global_risk_flow'
+    value: Any                # JSON-serialisable metric value
+    timestamp_ms: int         # epoch milliseconds
+    v: int = SCHEMA_VERSION
+
+
 # ─── Topic constants ────────────────────────────────────────
 TOPIC_MARKET_QUOTES = "market.quotes"
 TOPIC_MARKET_BARS = "market.bars"
@@ -224,5 +237,8 @@ TOPIC_OPTIONS_CONTRACTS = "options.contracts"   # Static contract metadata
 TOPIC_OPTIONS_QUOTES = "options.quotes"         # Live option quotes
 TOPIC_OPTIONS_CHAINS = "options.chains"         # Atomic chain snapshots
 TOPIC_OPTIONS_SPREADS = "options.spreads"       # Put spread candidates
+
+# External Metrics Topics
+TOPIC_EXTERNAL_METRICS = "regimes.external_metrics"  # GlobalRiskFlow etc.
 
 

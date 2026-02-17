@@ -153,6 +153,10 @@ class OvernightSessionStrategy(ReplayStrategy):
         if self._cfg["gate_on_risk_flow"]:
             risk_flow = self._extract_global_risk_flow(visible_regimes)
             if risk_flow is not None and risk_flow < self._cfg["min_global_risk_flow"]:
+                logger.info(
+                    "Skipped entry due to global_risk_flow=%.6f < min=%.6f",
+                    risk_flow, self._cfg["min_global_risk_flow"],
+                )
                 return  # skip entry evaluation; closes still happen
 
         # ── Entry evaluation ──────────────────────────────────────────

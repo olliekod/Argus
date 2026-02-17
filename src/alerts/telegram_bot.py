@@ -388,6 +388,58 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
             },
         )
     
+    async def send_tiered_message(
+        self,
+        text: str,
+        priority: int = 2,
+        key: Optional[str] = None,
+        rate_limit_mins: Optional[int] = None
+    ) -> bool:
+        """
+        Send a prioritized and potentially rate-limited alert.
+        
+        Args:
+            text: Message text (HTML supported)
+            priority: 1 (Urgent), 2 (Informational), 3 (Background/Log-only)
+            key: Optional deduplication key for rate limiting
+            rate_limit_mins: Optional override for rate limit window
+            
+        Returns:
+            bool: True if message was sent (or Tier 3), False if suppressed
+        """
+        # Tier 3 is log-only
+        if priority >= 3:
+            if not self.tier_3_enabled:
+                logger.debug(f"[Tier 3] {text[:100]}...")
+                return True
+        
+        # Check if tier is enabled
+        if priority == 1 and not self.tier_1_enabled:
+            return False
+        if priority == 2 and not self.tier_2_enabled:
+            return False
+
+        # Apply rate limiting if key provided
+        if key:
+            now = datetime.now()
+            limit = timedelta(minutes=rate_limit_mins if rate_limit_mins is not None else 10)
+            if key in self._last_alert_time:
+                if now - self._last_alert_time[key] < limit:
+                    logger.debug(f"Rate limited alert for key: {key}")
+                    return False
+            self._last_alert_time[key] = now
+
+        # Add priority emoji if not present
+        emoji = self.EMOJIS.get(priority, "")
+        final_text = text if text.startswith(tuple(self.EMOJIS.values())) else f"{emoji} {text}"
+
+        try:
+            await self.send_message(final_text)
+            return True
+        except Exception as e:
+            logger.error(f"Failed to send tiered alert: {e}")
+            return False
+    
     # -------------------------------------------------------------------------
     # COMMAND HANDLERS
     # -------------------------------------------------------------------------
@@ -514,6 +566,7 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
                     "",
                     f"• BTC IV: {conditions.get('btc_iv', 'N/A')}%",
                     f"• Funding: {conditions.get('funding', 'N/A')}",
+                    f"• Risk Flow: {conditions.get('risk_flow', 'N/A')}",
                     f"• Market: {'🟢 OPEN' if conditions.get('market_open') else '🔴 CLOSED'}",
                     f"• Market Time: {market_time}",
                     f"• Updated: {updated}",

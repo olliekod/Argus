@@ -19,7 +19,9 @@ from .bus import EventBus
 from .events import (
     BarEvent,
     ComponentHeartbeatEvent,
+    ExternalMetricEvent,
     QuoteEvent,
+    TOPIC_EXTERNAL_METRICS,
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_QUOTES,
     TOPIC_REGIMES_SYMBOL,
@@ -137,6 +139,7 @@ class RegimeDetector:
 
         bus.subscribe(TOPIC_MARKET_BARS, self._on_bar)
         bus.subscribe(TOPIC_MARKET_QUOTES, self._on_quote)
+        bus.subscribe(TOPIC_EXTERNAL_METRICS, self._on_external_metric)
         logger.info("RegimeDetector initialized — config_hash=%s", self._config_hash)
 
     def _on_quote(self, event: QuoteEvent) -> None:
@@ -605,6 +608,22 @@ class RegimeDetector:
         """
         with self._lock:
             self._risk_metrics[key] = value
+
+    def _on_external_metric(self, event: ExternalMetricEvent) -> None:
+        """Handle an ExternalMetricEvent from the event bus."""
+        v = getattr(event, "v", 1)
+        if v > 1:
+            logger.warning(
+                "Received ExternalMetricEvent with unknown schema version v=%d. "
+                "Ignoring to prevent unexpected behavior.", v
+            )
+            return
+
+        self.set_external_metric(event.key, event.value)
+        logger.debug(
+            "external_metric key=%s value=%s ts_ms=%d",
+            event.key, event.value, event.timestamp_ms,
+        )
 
     def _get_session_regime(self, market: str, ts_ms: int) -> str:
         return get_session_regime(market, ts_ms)

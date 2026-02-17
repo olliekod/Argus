@@ -120,7 +120,8 @@ exchanges:
   # Used exclusively by the GlobalRiskFlow feature and overnight strategy.
   # Budget: ~14 calls/day at free tier (5 calls/min, 25/day).
   alphavantage:
-    enabled: false     # enable after secrets.yaml has api_key
+    enabled: true     # enable after secrets.yaml has api_key
+    external_metrics_interval_seconds: 3600  # how often to recompute global_risk_flow (1 hour)
     daily_symbols:
       # Asia-Pacific
       - "EWJ"     # Japan (Nikkei proxy)

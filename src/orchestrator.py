@@ -30,12 +30,14 @@ from .core.events import (
     QuoteEvent,
     MetricEvent,
     SignalEvent,
+    ExternalMetricEvent,
     TOPIC_MARKET_BARS,
     TOPIC_MARKET_METRICS,
     TOPIC_MARKET_QUOTES,
     TOPIC_SIGNALS,
     TOPIC_SIGNALS_RAW,
     TOPIC_OPTIONS_CHAINS,
+    TOPIC_EXTERNAL_METRICS,
     TOPIC_SYSTEM_HEARTBEAT,
     TOPIC_SYSTEM_MINUTE_TICK,
 )
@@ -57,6 +59,9 @@ from .connectors.tastytrade_options import TastytradeOptionsConnector, Tastytrad
 from .connectors.public_client import PublicAPIClient, PublicAPIConfig
 from .connectors.public_options import PublicOptionsConnector, PublicOptionsConfig
 from .connectors.tastytrade_streamer import TastytradeStreamer
+from .connectors.alphavantage_client import AlphaVantageClient
+from .connectors.alphavantage_collector import AlphaVantageCollector
+from .core.global_risk_flow_updater import GlobalRiskFlowUpdater
 from .core.greeks_cache import GreeksCache, enrich_snapshot_iv
 from .core.iv_consensus import IVConsensusConfig, IVConsensusEngine
 from .strategies.spread_generator import SpreadCandidateGenerator, SpreadGeneratorConfig
@@ -175,9 +180,12 @@ class ArgusOrchestrator:
             "public_options",
             "polymarket_gamma",
             "polymarket_clob",
+            "alphavantage",
         ]
+        self._detector_names = ["ibit_detector", "volatility_detector", "risk_flow"]
         self._activity_tracker = ActivityStatusTracker(
             provider_names=self._provider_names,
+            detector_names=self._detector_names,
             boot_ts=time.time(),
         )
 
@@ -200,6 +208,9 @@ class ArgusOrchestrator:
         self.alpaca_options: Optional[AlpacaOptionsConnector] = None
         self.tastytrade_options: Optional[TastytradeOptionsConnector] = None
         self.public_options: Optional[PublicOptionsConnector] = None
+        self.alphavantage_client: Optional[AlphaVantageClient] = None
+        self.av_collector: Optional[AlphaVantageCollector] = None
+        self.global_risk_flow_updater: Optional[GlobalRiskFlowUpdater] = None
         self.spread_generator: Optional[SpreadCandidateGenerator] = None
         self._greeks_cache: GreeksCache = GreeksCache()
         self._iv_consensus = IVConsensusEngine(IVConsensusConfig(policy="prefer_dxlink"))
@@ -216,6 +227,9 @@ class ArgusOrchestrator:
         
         # Paper trader farm (752 parallel traders)
         self.paper_trader_farm: Optional[PaperTraderFarm] = None
+        self._recent_farm_entries: List[Any] = []
+        self._recent_farm_exits: List[Any] = []
+        self._farm_summary_last_run: float = time.time()
         
         self.detectors: Dict[str, Any] = {}
         
@@ -367,10 +381,19 @@ class ArgusOrchestrator:
             kind="metric",
         )
 
+    def _note_external_metric(self, event: ExternalMetricEvent) -> None:
+        """Record activity for external metrics (e.g. risk flow)."""
+        self._activity_tracker.record_detector_event(
+            "risk_flow",
+            event_ts=event.timestamp_ms / 1000.0,
+            kind="metric",
+        )
+
     def _wire_activity_tracking(self) -> None:
         self.event_bus.subscribe(TOPIC_MARKET_QUOTES, self._note_provider_quote)
         self.event_bus.subscribe(TOPIC_MARKET_BARS, self._note_provider_bar)
         self.event_bus.subscribe(TOPIC_MARKET_METRICS, self._note_provider_metric)
+        self.event_bus.subscribe(TOPIC_EXTERNAL_METRICS, self._note_external_metric)
         self.event_bus.subscribe(TOPIC_SIGNALS, self._note_detector_signal)
 
     def _record_detector_activity(self, detector: str, event_ts: float, kind: str) -> None:
@@ -401,6 +424,9 @@ class ArgusOrchestrator:
             self._activity_tracker.register_provider(
                 name, configured=providers.get(name) is not None
             )
+        
+        # Start background tasks for consolidated summaries
+        self._tasks.append(asyncio.create_task(self._run_periodic_farm_summary()))
 
     async def setup(self) -> None:
         """Initialize all components with phase timing."""
@@ -438,6 +464,8 @@ class ArgusOrchestrator:
 
         # Phase 4: Telegram
         await self._setup_telegram()
+        if self.telegram and self.av_collector:
+            self.av_collector.set_telegram(self.telegram)
         self._phase("telegram_init")
 
         # Phase 5: Providers (gap risk, conditions, farm, review)
@@ -538,6 +566,30 @@ class ArgusOrchestrator:
     
     async def _setup_connectors(self) -> None:
         """Initialize exchange connectors (with event bus wiring)."""
+        av_cfg = self.config.get('exchanges', {}).get('alphavantage', {})
+        if av_cfg.get('enabled', False):
+            av_api_key = get_secret(self.secrets, 'alphavantage', 'api_key')
+            if av_api_key:
+                self.alphavantage_client = AlphaVantageClient(api_key=av_api_key)
+                self.logger.info("Alpha Vantage client configured")
+                
+                # Continuous Collector
+                self.av_collector = AlphaVantageCollector(
+                    av_client=self.alphavantage_client,
+                    db=self.db,
+                    bus=self.event_bus,
+                    config=self.config
+                )
+            else:
+                self.logger.warning("Alpha Vantage enabled but API key not found in secrets.yaml")
+
+        # GlobalRiskFlow Updater
+        self.global_risk_flow_updater = GlobalRiskFlowUpdater(
+            bus=self.event_bus,
+            db=self.db,
+            config=self.config,
+        )
+
         # Bybit WebSocket (public - no auth needed)
         bybit_symbols = [s for s in self.symbols]
         self.bybit_ws = BybitWebSocket(
@@ -949,6 +1001,7 @@ class ArgusOrchestrator:
             get_btc_iv=self._get_btc_iv,
             get_funding=self._get_btc_funding,
             get_btc_price=self._get_btc_price,
+            get_risk_flow=self._get_current_risk_flow,
         )
         self.logger.info("Conditions Monitor initialized")
         
@@ -1085,7 +1138,7 @@ class ArgusOrchestrator:
                         change_5d_pct = ((current_price - past_price) / past_price) * 100
                 return {
                     'price': ticker.get('last_price', 0),
-                    'change_24h_pct': ticker.get('price_24h_pcnt', 0) * 100,
+                    'change_24h_pct': ticker.get('price_change_24h', 0),
                     'change_5d_pct': change_5d_pct,
                 }
         return None
@@ -1409,8 +1462,10 @@ class ArgusOrchestrator:
             details={
                 'IBIT Price': f"${data.get('ibit_price', 0):.2f}",
                 'IBIT 24h Change': f"{data.get('ibit_change_24h', 0):+.1f}%",
-                'BTC IV': f"{data.get('btc_iv', 0):.0f}%",
-                'Market': data.get('market_state', 'CLOSED'),
+                'BTC IV': f"{conditions.get('btc_iv', 'N/A')}%",
+                'Funding': f"{conditions.get('funding', 'N/A')}",
+                'Risk Flow': f"{conditions.get('risk_flow', 'N/A')}",
+                'Market': '🟢 OPEN' if conditions.get('market_open') else '🔴 CLOSED',
                 'Short Strike': f"${data.get('suggested_short_strike', 0):.0f}",
                 'Long Strike': f"${data.get('suggested_long_strike', 0):.0f}",
             },
@@ -1982,9 +2037,8 @@ class ArgusOrchestrator:
                         n = len(closed_trades)
                         self._today_closed += n
                         self.logger.info(f"Exit monitor: {n} trades closed")
-                        # Send consolidated exit summary
-                        if self.telegram:
-                             await self._send_exit_summary(closed_trades)
+                        # Add to summary queue instead of sending individual summary
+                        self._recent_farm_exits.extend(closed_trades)
 
                 # Check expirations
                 eastern = ZoneInfo("America/New_York")
@@ -2056,8 +2110,10 @@ class ArgusOrchestrator:
                     self._research_last_symbol = signal['symbol']
 
                     # Alert if any followed traders entered
-                    if trades and self.telegram:
-                        await self._alert_followed_trades(trades, signal)
+                    if trades:
+                        self._recent_farm_entries.extend(trades)
+                        if self.telegram:
+                            await self._alert_followed_trades(trades, signal)
 
                 self._research_last_entered = total_entered
                 self._today_opened += total_entered
@@ -2113,6 +2169,7 @@ class ArgusOrchestrator:
             return
         eligible.sort(key=lambda x: x.get('total_pnl', 0), reverse=True)
         promoted_ids = [p['trader_id'] for p in eligible[:top_n]]
+
         if self.paper_trader_farm:
             self.paper_trader_farm.set_promoted_traders(promoted_ids)
         self._research_promoted = True
@@ -2123,6 +2180,46 @@ class ArgusOrchestrator:
                 detector = self.detectors.get(key)
                 if detector:
                     detector.paper_trading_enabled = True
+
+    async def _run_periodic_farm_summary(self) -> None:
+        """Background task: Periodically send consolidated farm activity summaries."""
+        while self._running:
+            try:
+                # Summary interval: 30 minutes
+                interval = 30 * 60
+                await asyncio.sleep(interval)
+                
+                if not self.telegram or not self.paper_trader_farm:
+                    continue
+                    
+                # Collect activity
+                entries = self._recent_farm_entries.copy()
+                exits = self._recent_farm_exits.copy()
+                self._recent_farm_entries.clear()
+                self._recent_farm_exits.clear()
+                
+                if not entries and not exits:
+                    continue
+                    
+                lines = ["🚜 <b>LIVE FARM ACTIVITY</b>"]
+                
+                if entries:
+                    symbols = set(t.symbol for t in entries)
+                    lines.append(f"• <b>New Entries</b>: {len(entries)} (Symbols: {', '.join(symbols)})")
+                
+                if exits:
+                    total_pnl = sum(t.realized_pnl for t in exits)
+                    wins = sum(1 for t in exits if t.realized_pnl > 0)
+                    lines.append(f"• <b>Realized P&L</b>: ${total_pnl:+.2f} ({wins}/{len(exits)} wins)")
+                
+                lines.append(f"\n<i>Summary of the last 30 minutes.</i>")
+                
+                await self.telegram.send_tiered_message("\n".join(lines), priority=2, key="periodic_farm_summary")
+                self._farm_summary_last_run = time.time()
+                
+            except Exception as e:
+                self.logger.error(f"Farm summary task error: {e}")
+                await asyncio.sleep(60)
 
     async def _alert_followed_trades(self, trades: list, signal: dict) -> None:
         """Send Telegram alert when followed traders enter positions."""
@@ -2137,9 +2234,15 @@ class ArgusOrchestrator:
             if not matched:
                 return
 
-            for trade in matched[:5]:  # Cap at 5 to avoid spam
-                # This is a stub for future implementation
-                pass
+            for trade in matched[:3]:  # Limit to 3 to avoid spam
+                msg = (
+                    f"🌟 <b>FOLLOWED TRADER ENTRY</b>\n"
+                    f"Trader: <code>{trade.trader_id[:8]}</code>\n"
+                    f"Strategy: {trade.strategy_type}\n"
+                    f"Symbol: {trade.symbol} at {trade.entry_price:.2f}\n"
+                    f"Credit: ${trade.entry_credit:.2f} | PoP: {trade.entry_pop:.1f}%"
+                )
+                await self.telegram.send_tiered_message(msg, priority=2, key=f"follow_{trade.trader_id}")
         except Exception as e:
             self.logger.warning(f"Failed to alert followed trades: {e}")
 
@@ -2302,11 +2405,15 @@ class ArgusOrchestrator:
                     msg_age_str = f"{msg_age:.0f}s" if msg_age is not None else "N/A"
                     db_size = os.path.getsize(str(self.db.db_path)) / (1024 * 1024) if self.db.db_path.exists() else 0
 
+                    risk_val = "N/A"
+                    if self.global_risk_flow_updater and self.global_risk_flow_updater._last_value is not None:
+                        risk_val = f"{self.global_risk_flow_updater._last_value:.4f}"
+
                     self.logger.info(
                         f"[HEARTBEAT] uptime={uptime_seconds():.0f}s "
                         f"bybit={bybit_str} last_msg={msg_age_str} "
                         f"traders={active_traders} positions={open_positions} "
-                        f"db={db_size:.0f}MB"
+                        f"risk_flow={risk_val} db={db_size:.0f}MB"
                     )
                 except Exception as e:
                     self.logger.error(f"Heartbeat error: {e}")
@@ -2375,42 +2482,56 @@ class ArgusOrchestrator:
         """Send notification when market opens."""
         if not self.telegram:
             return
+        
         conditions = {}
         if self.conditions_monitor:
             conditions = await self.conditions_monitor.get_current_conditions()
-        score = conditions.get('score', 'N/A')
-        label = conditions.get('warmth_label', 'N/A')
+        
+        score = conditions.get('score', 5)
+        label = str(conditions.get('warmth_label', 'neutral')).upper()
         btc_iv = conditions.get('btc_iv', 'N/A')
+        iv_rank = conditions.get('iv_rank', 'N/A')
+        
+        # Risk Flow status (Global Risk Flow)
+        risk_flow = conditions.get('risk_flow', 'neutral')
+        risk_icon = "🔵" if risk_flow == 'neutral' else ("🟢" if risk_flow == 'risk-on' else "🔴")
 
         active = len(self.paper_trader_farm.active_traders) if self.paper_trader_farm else 0
         open_positions = sum(
             len(t.open_positions) for t in self.paper_trader_farm.active_traders.values()
         ) if self.paper_trader_farm else 0
 
+        header = f"🔔 <b>MARKET BRIEFING</b> — {now_et.strftime('%b %d, %Y')}"
         lines = [
-            f"🔔 <b>Market Open</b> — {now_et.strftime('%b %d, %Y')}",
+            header,
             "",
-            f"Conditions: {score}/10 {str(label).upper()}",
-            f"BTC IV: {btc_iv}%",
+            f"🌡️ <b>Conditions: {score}/10 {label}</b>",
+            f"📈 BTC IV: {btc_iv}% (Rank: {iv_rank}%)",
+            f"{risk_icon} Global Risk Flow: {str(risk_flow).upper()}",
+            "",
         ]
 
-        ibit_det = self.detectors.get('ibit')
-        if ibit_det and hasattr(ibit_det, '_current_ibit_data') and ibit_det._current_ibit_data:
-            lines.append(f"IBIT: ${ibit_det._current_ibit_data.get('price', 0):.2f}")
-        bito_det = self.detectors.get('bito')
-        if bito_det and hasattr(bito_det, '_current_ibit_data') and bito_det._current_ibit_data:
-            lines.append(f"BITO: ${bito_det._current_ibit_data.get('price', 0):.2f}")
+        # Add instrument prices if available
+        prices = []
+        for key in ('ibit', 'bito'):
+            det = self.detectors.get(key)
+            if det and hasattr(det, '_current_ibit_data') and det._current_ibit_data:
+                price = det._current_ibit_data.get('price', 0)
+                change = det._current_ibit_data.get('change_pct', 0)
+                emoji = "↗️" if change >= 0 else "↘️"
+                prices.append(f"• {key.upper()}: ${price:.2f} {emoji} {change:+.2f}%")
+        
+        if prices:
+            lines += prices + [""]
 
         lines += [
-            "",
-            f"Farm: {len(self.paper_trader_farm.trader_configs):,} configs" if self.paper_trader_farm else "Farm: N/A",
-            f"Active traders: {active:,}",
-            f"Open positions: {open_positions:,}",
+            f"🚜 <b>Farm Status</b>",
+            f"• Configs: {len(self.paper_trader_farm.trader_configs):,}" if self.paper_trader_farm else "• Farm: N/A",
+            f"• Active Traders: {active:,}",
+            f"• Open Positions: {open_positions:,}",
         ]
-        try:
-            await self.telegram.send_message("\n".join(lines))
-        except Exception as e:
-            self.logger.error(f"Failed to send market open notification: {e}")
+        
+        await self.telegram.send_tiered_message("\n".join(lines), priority=2, key="market_open")
 
     async def _send_market_close_notification(self, now_et: datetime) -> None:
         """Send end-of-day summary when market closes."""
@@ -2422,37 +2543,39 @@ class ArgusOrchestrator:
         top_gains = await farm.get_top_unrealized(n=3) if farm else []
 
         lines = [
-            f"🔔 <b>Market Close</b> — {now_et.strftime('%b %d, %Y')}",
+            f"🔔 <b>MARKET CLOSE SUMMARY</b> — {now_et.strftime('%b %d, %Y')}",
             "",
-            "<b>Today's Activity:</b>",
-            f"• Opened: {self._today_opened:,}",
-            f"• Closed: {self._today_closed:,}",
-            f"• Expired: {self._today_expired:,}",
-            f"• Realized P&L: ${aggregate.get('realized_pnl', 0):+.2f}",
+            "<b>Today's Result:</b>",
+            f"• Realized P&L: <b>${aggregate.get('realized_pnl', 0):+.2f}</b>",
+            f"• Win Rate: {aggregate.get('win_rate', 0):.1f}%",
+            "",
+            "<b>Activity Breakdown:</b>",
+            f"• New Entries: {self._today_opened:,}",
+            f"• Manual/Exit Closures: {self._today_closed:,}",
+            f"• Expirations: {self._today_expired:,}",
             "",
         ]
 
         if top_gains:
-            lines.append("<b>Top 3 Unrealized Gains:</b>")
+            lines.append("<b>Top Unrealized Runners:</b>")
             for i, g in enumerate(top_gains, 1):
+                pnl_emoji = "🟢" if g['unrealized_pnl'] > 0 else "🔴"
                 lines.append(
-                    f"{i}. {g['strategy']} {g['symbol']} {g['strikes']} — "
-                    f"${g['unrealized_pnl']:+.2f} ({g['pnl_pct']:+.1f}%)"
+                    f"{i}. {g['symbol']} {g['strategy']} {g['strikes']}\n"
+                    f"   {pnl_emoji} <b>${g['unrealized_pnl']:+.2f} ({g['pnl_pct']:+.1f}%)</b>"
                 )
             lines.append("")
 
         conditions = {}
         if self.conditions_monitor:
             conditions = await self.conditions_monitor.get_current_conditions()
+        
         lines.append(
-            f"Conditions at close: {conditions.get('score', 'N/A')}/10 "
+            f"Settlement Score: {conditions.get('score', 'N/A')}/10 "
             f"{str(conditions.get('warmth_label', 'N/A')).upper()}"
         )
 
-        try:
-            await self.telegram.send_message("\n".join(lines))
-        except Exception as e:
-            self.logger.error(f"Failed to send market close notification: {e}")
+        await self.telegram.send_tiered_message("\n".join(lines), priority=2, key="market_close")
     
     # =========================================================================
     # Dashboard helper callbacks
@@ -2602,6 +2725,12 @@ class ArgusOrchestrator:
     async def _get_provider_statuses(self) -> Dict[str, Any]:
         """Provider health for dashboard using the activity tracker."""
         return self._activity_tracker.get_provider_statuses()
+
+    def _get_current_risk_flow(self) -> Optional[float]:
+        """Get the last computed GlobalRiskFlow value."""
+        if self.global_risk_flow_updater:
+            return self.global_risk_flow_updater._last_value
+        return None
 
     async def _get_detector_statuses(self) -> Dict[str, Any]:
         """Detector activity status for dashboard."""
@@ -2973,6 +3102,14 @@ class ArgusOrchestrator:
         if self.gap_risk_tracker:
             self._tasks.append(asyncio.create_task(self._run_market_close_snapshot()))
 
+        # Start AlphaVantage collector loop
+        if self.av_collector:
+            self._tasks.append(asyncio.create_task(self._run_av_collector_loop()))
+
+        # Start GlobalRiskFlow updater loop
+        if self.global_risk_flow_updater:
+            self._tasks.append(asyncio.create_task(self._run_external_metrics_loop()))
+
         # Start conditions monitoring (synthesis layer)
         if self.conditions_monitor:
             self._tasks.append(asyncio.create_task(self.conditions_monitor.start_monitoring()))
@@ -3117,6 +3254,36 @@ class ArgusOrchestrator:
                 MinuteTickEvent(timestamp=next_minute),
             )
 
+    async def _run_av_collector_loop(self) -> None:
+        """Periodic loop for continuous Alpha Vantage polling."""
+        if self.av_collector:
+            try:
+                await self.av_collector.run_forever()
+            except Exception:
+                self.logger.error("AlphaVantageCollector loop crash", exc_info=True)
+
+    async def _run_external_metrics_loop(self) -> None:
+        """Periodic loop to compute and publish external metrics (GlobalRiskFlow)."""
+        if not self.global_risk_flow_updater:
+            return
+
+        av_cfg = self.config.get('exchanges', {}).get('alphavantage', {})
+        interval = int(av_cfg.get('external_metrics_interval_seconds', 3600))
+        
+        self.logger.info("External metrics loop started — interval=%ds", interval)
+
+        while self._running:
+            try:
+                await self.global_risk_flow_updater.update()
+            except Exception:
+                self.logger.error("External metrics update failed (will retry)", exc_info=True)
+            
+            # Wait for next interval or shutdown
+            try:
+                await asyncio.sleep(interval)
+            except asyncio.CancelledError:
+                break
+
     async def stop(self) -> None:
         """Stop all components gracefully."""
         self.logger.info("Stopping Argus...")
@@ -3132,6 +3299,10 @@ class ArgusOrchestrator:
 
         # Stop event bus workers
         self.event_bus.stop()
+
+        # Stop AlphaVantage Collector
+        if self.av_collector:
+            self.av_collector.stop()
 
         # Stop dashboard
         if self.dashboard:
@@ -3176,6 +3347,8 @@ class ArgusOrchestrator:
             self.tastytrade_options.close()
         if self.public_options:
             await self.public_options.close()
+        if self.alphavantage_client:
+            await self.alphavantage_client.close()
 
         # Close database
         await self.db.close()

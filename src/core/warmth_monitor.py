@@ -242,38 +242,39 @@ class WarmthMonitor:
         return should_alert
     
     async def _send_alert(self, status: WarmthStatus, alert_type: str) -> None:
-        """Send Telegram alert."""
+        """Send Telegram alert via tiered system."""
+        if not self.bot:
+            return
+
+        priority = 2
         if alert_type == 'hot':
-            msg = f"""
-[!!!] ARGUS: HOT SIGNAL
-
-Temperature: {status.temperature}%
-Gates Passed: {status.gates_passed}/{status.total_gates}
-
-CONDITIONS MET - CHECK FOR TRADE!
-"""
+            priority = 1
+            msg = (
+                f"🚨 <b>HOT SIGNAL: CONDITIONS MET</b>\n\n"
+                f"🌡️ Temperature: <b>{status.temperature}%</b>\n"
+                f"✅ Gates: {status.gates_passed}/{status.total_gates} passed\n\n"
+                f"Check Robinhood/Alpaca for IBIT/BITO entries."
+            )
         elif alert_type == 'warming':
-            msg = f"""
-[~] ARGUS: {status.level}
-
-Temperature: {status.temperature}%
-Gates: {status.gates_passed}/{status.total_gates} passed
-
-Getting closer to trade conditions.
-"""
+            msg = (
+                f"🌡️ <b>CONDITION WARMING: {status.level}</b>\n\n"
+                f"Temperature: {status.temperature}%\n"
+                f"Gates: {status.gates_passed}/{status.total_gates} passed\n"
+                f"Conditions are approaching trigger levels."
+            )
         else:  # cooling
-            msg = f"""
-[v] ARGUS: Cooling Down
-
-Temperature: {status.temperature}% ({status.level})
-
-Conditions have moved away from optimal.
-"""
+            priority = 2
+            msg = (
+                f"🌊 <b>CONDITION COOLING</b>\n\n"
+                f"Temperature: {status.temperature}% ({status.level})\n"
+                f"Market conditions have drifted away."
+            )
         
-        if self.bot:
-            await self.bot.send_message(msg.strip())
+        # Use send_alert if available for tiering and deduplication
+        if hasattr(self.bot, 'send_tiered_message'):
+            await self.bot.send_tiered_message(msg.strip(), priority=priority, key=f"warmth_{alert_type}", rate_limit_mins=30)
         else:
-            print(msg)
+            await self.bot.send_message(msg.strip())
     
     def format_status(self, status: WarmthStatus) -> str:
         """Format warmth status for display."""
