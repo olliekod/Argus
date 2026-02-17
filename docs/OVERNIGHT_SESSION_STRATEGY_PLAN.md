@@ -104,7 +104,25 @@ These cover Asia growth & tech, China risk, Europe industrial & financial flow, 
 
 **Goal:** Add global proxies and regime signals without new connectors.
 
-**Status:** Core implementation is **done**: Alpha Vantage collector (10 ETFs + 4 FX → `market_bars`), global risk flow computation, DB-only updater, regime merge, replay-pack injection, and overnight strategy gating (`gate_on_risk_flow`, `min_global_risk_flow`). Remaining work: verification (E2E pack + strategy gating), optional config (global ETFs in Alpaca), and docs. See **[PLAN_OVERNIGHT_PHASE2.md](PLAN_OVERNIGHT_PHASE2.md)** for the Phase 2 checklist and task list.
+**Status: COMPLETE (2026-02-17).** All core implementation and verification done:
+
+- **Alpha Vantage collector** — 10 ETFs + 4 FX daily → `market_bars` (source=alphavantage). Budget: 14 calls/day within 25 free-tier limit.
+- **Global risk flow computation** — `src/core/global_risk_flow.py`: 0.4×Asia + 0.4×Europe + 0.2×FX; weight redistribution; strict less-than lookahead prevention.
+- **DB-only updater** — `src/core/global_risk_flow_updater.py`: reads from DB (no API calls at update time); publishes `ExternalMetricEvent`; 5-min cache.
+- **Regime integration** — Regime detector subscribes to external metrics; merges `global_risk_flow` into `metrics_json`.
+- **Replay pack injection** — `src/tools/replay_pack.py` injects `global_risk_flow` into regime `metrics_json` deterministically from AV daily bars; `sort_keys=True` for reproducibility.
+- **Overnight strategy gating** — `gate_on_risk_flow` / `min_global_risk_flow` in `OvernightSessionStrategy`; reads from `visible_regimes["EQUITIES"]["metrics_json"]`.
+- **E2E verification** — `tests/test_phase2_e2e.py` (30 tests): replay pack injection, strategy gating suppression, replay harness integration, deterministic behavior, edge cases.
+- **Research loop wiring** — `OvernightSessionStrategy` in `config/research_loop.yaml`; `config/overnight_sweep.yaml` includes `gate_on_risk_flow: [false, true]`.
+
+**Symbol sets:**
+- **Overnight traded assets:** SPY, QQQ, IBIT, DIA, IWM, GLD, TLT, XLE, XLF, XLK, SMH, NVDA (liquid ETF universe) + BTC/USDT (crypto).
+- **Regime-only global ETFs (Alpha Vantage daily):** EWJ, FXI, EWT, EWY, INDA, EWG, EWU, FEZ, EWL (9 equity ETFs) + FX:USDJPY, FX:EURUSD, FX:GBPUSD, FX:AUDUSD (4 FX pairs). These are **not traded** — used only for global risk flow computation and regime features.
+
+**Remaining optional items:**
+- Add global ETFs to Alpaca/Yahoo configs if intraday bars are needed for these symbols (currently daily only via AV).
+- Enable `gate_on_risk_flow: true` as default in sweep configs after research confirms value.
+- EEM (Emerging Markets) is in the plan docs but not in the risk-flow computation symbols (by design — 9 ETFs suffice).
 
 #### 2a. Global ETF Proxies (10 Symbols — Asia + Europe)
 
