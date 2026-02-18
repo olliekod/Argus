@@ -6,12 +6,24 @@ from zoneinfo import ZoneInfo
 from src.connectors.alphavantage_collector import AlphaVantageCollector
 from src.core.bus import EventBus
 
+# Config with 10 ETFs + 4 FX (matches config.yaml budget)
+_AV_CONFIG_14 = {
+    "exchanges": {
+        "alphavantage": {
+            "enabled": True,
+            "daily_symbols": ["EWJ", "FXI", "EWT", "EWY", "INDA", "EWG", "EWU", "FEZ", "EWL", "EEM"],
+            "fx_pairs": ["EUR/USD", "USD/JPY", "GBP/USD", "AUD/USD"],
+        }
+    }
+}
+
+
 @pytest.mark.asyncio
 async def test_collector_batch_logic():
     av_client = AsyncMock()
     db = AsyncMock()
     bus = MagicMock(spec=EventBus)
-    config = {"exchanges": {"alphavantage": {"enabled": True}}}
+    config = _AV_CONFIG_14
     
     collector = AlphaVantageCollector(av_client, db, bus, config)
     
@@ -25,7 +37,7 @@ async def test_collector_batch_logic():
     db.upsert_bars_backfill.return_value = 1
     
     # Run batch (must set _running=True or it breaks early)
-    # Patch sleep to avoid the 2s delay between symbols
+    # Patch sleep to avoid 15s delay between symbols
     collector._running = True
     with patch("asyncio.sleep", AsyncMock()):
         await collector._run_batch()
@@ -42,7 +54,7 @@ def test_collector_scheduling_logic():
     av_client = MagicMock()
     db = MagicMock()
     bus = MagicMock()
-    config = {"exchanges": {"alphavantage": {"enabled": True}}}
+    config = _AV_CONFIG_14
     collector = AlphaVantageCollector(av_client, db, bus, config)
     
     target_time = dt_time(9, 0)
@@ -68,7 +80,7 @@ async def test_collector_fx_mapping():
     av_client = AsyncMock()
     db = AsyncMock()
     bus = MagicMock()
-    config = {"exchanges": {"alphavantage": {"enabled": True}}}
+    config = _AV_CONFIG_14
     collector = AlphaVantageCollector(av_client, db, bus, config)
     
     # Mock bar

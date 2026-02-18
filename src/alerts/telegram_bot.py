@@ -76,6 +76,7 @@ class TelegramBot:
 /reset_paper — Start new paper equity epoch
 /db_stats — Database size and table stats
 /follow — Show followed (best) traders
+/glossary — Definitions (Risk-off, Regime, IV Rank, etc.)
 /help — This message
 
 <b>Web Dashboard:</b>
@@ -89,6 +90,30 @@ System error alerts (if loops crash)
 
 <b>Trade Confirmation:</b>
 Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
+"""
+
+    GLOSSARY_TEXT = """<b>📖 Argus Glossary</b>
+
+<b>Global Risk Flow</b>
+Composite of Asia + Europe ETF returns and USD/JPY. Positive = <b>risk-on</b> (markets calm, appetite for risk). Negative = <b>risk-off</b> (flight to safety, vol often higher). Used to gate strategies.
+
+<b>Risk-off</b>
+Markets in defensive mode: investors selling risk assets, buying bonds/safe havens. Often coincides with higher volatility and weaker equities. Argus may reduce size or skip some entries.
+
+<b>Risk-on</b>
+Markets comfortable with risk: equities bid, volatility subdued. Favorable for selling premium (e.g. put spreads) when IV is rich.
+
+<b>Conditions (score 1–10)</b>
+Composite “warmth” from BTC IV, funding rate, and momentum. Higher = more favorable context for the system’s strategies (e.g. prime = 8+).
+
+<b>Regime</b>
+Bar-driven classification: <b>Vol</b> (VOL_LOW / VOL_NORMAL / VOL_HIGH / VOL_SPIKE), <b>Trend</b> (TREND_UP / TREND_DOWN / RANGE), <b>Risk</b> (RISK_ON / RISK_OFF / NEUTRAL). Risk aggregates SPY, <b>IBIT</b> (crypto/equity), TLT, GLD. When Bitcoin/IBIT sells off or spikes, regime can tilt risk-off. “N/A (no bars yet)” means no bars processed yet (e.g. at open before first bar).
+
+<b>BTC IV</b>
+Bitcoin ATM implied volatility (from options). High IV = more premium to sell; low IV = less opportunity.
+
+<b>Rank (IV Rank)</b>
+Where current BTC IV sits vs recent history (0–100%). High rank = IV is high relative to its own history. N/A if not computed yet.
 """
     
     def __init__(
@@ -214,6 +239,7 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
         app.add_handler(CommandHandler("reset_paper", self._cmd_reset_paper))
         app.add_handler(CommandHandler("db_stats", self._cmd_db_stats))
         app.add_handler(CommandHandler("follow", self._cmd_follow))
+        app.add_handler(CommandHandler("glossary", self._cmd_glossary))
 
         # Add message handler for yes/no responses
         app.add_handler(MessageHandler(
@@ -447,6 +473,10 @@ Reply <code>yes</code> or <code>no</code> after a Tier 1 alert
     async def _cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /help command."""
         await update.message.reply_text(self.HELP_TEXT, parse_mode="HTML")
+
+    async def _cmd_glossary(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /glossary command."""
+        await update.message.reply_text(self.GLOSSARY_TEXT, parse_mode="HTML")
 
     async def _cmd_dashboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /dashboard — single view of whether everything is working."""

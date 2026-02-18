@@ -6,7 +6,8 @@ Performs a single batch pull of daily bars and FX rates at 09:00 AM ET.
 This ensures the DB has the latest Asia close and yesterday's Europe/US close
 before the NY open.
 
-Budget: 14 symbols * 1 call = 14 calls/day (well within the 25 free tier).
+Budget: config daily_symbols (e.g. 10) + fx_pairs (4) = 14 calls/day (under 25 free tier).
+Uses 15s between requests to stay under 5 calls/min; no retries on rate limit.
 """
 
 import asyncio
@@ -20,18 +21,24 @@ from src.connectors.alphavantage_client import AlphaVantageRateLimitError
 
 from src.core.bus import EventBus
 from src.core.events import MetricEvent, TOPIC_MARKET_METRICS
-from src.core.global_risk_flow import (
-    ASIA_SYMBOLS,
-    EUROPE_SYMBOLS,
-    FX_RISK_SYMBOL,
-)
 
 logger = logging.getLogger("argus.alphavantage_collector")
 
-# Extra symbols to reach 14 instruments (10 ETFs + 4 FX)
-# Asia: 5, Europe: 4+1, FX: 1+3
-EXTRA_ETFS = ("EZU",)
-EXTRA_FX = ("FX:EURUSD", "FX:GBPUSD", "FX:AUDUSD")
+# Minimum seconds between API calls (stay under 5/min; 15s = 4/min)
+_CALL_INTERVAL_SECONDS = 15.0
+
+
+def _symbols_from_config(config: Dict[str, Any]) -> List[str]:
+    """Build ordered list: daily_symbols (ETFs) then FX pairs as FX:XXXYYY."""
+    av_cfg = (config.get("exchanges") or {}).get("alphavantage") or {}
+    symbols: List[str] = list(av_cfg.get("daily_symbols") or [])
+    for pair in av_cfg.get("fx_pairs") or []:
+        # "EUR/USD" or "USD/JPY" -> FX:EURUSD, FX:USDJPY
+        parts = pair.replace(" ", "").split("/")
+        if len(parts) == 2:
+            symbols.append(f"FX:{parts[0]}{parts[1]}")
+    return symbols
+
 
 class AlphaVantageCollector:
     """Daily batch polling of AV daily data into market_bars."""
@@ -52,14 +59,10 @@ class AlphaVantageCollector:
         av_cfg = (config.get("exchanges") or {}).get("alphavantage") or {}
         self._enabled = bool(av_cfg.get("enabled", False)) and av_client is not None
         
-        # Target basket: 10 ETFs + 4 FX
-        self._symbols = (
-            list(ASIA_SYMBOLS) + 
-            list(EUROPE_SYMBOLS) + 
-            list(EXTRA_ETFS) + 
-            [FX_RISK_SYMBOL] + 
-            list(EXTRA_FX)
-        )
+        # Use config so we never exceed intended budget (e.g. 10 + 4 = 14)
+        self._symbols = _symbols_from_config(config)
+        if not self._symbols and self._enabled:
+            logger.warning("Alpha Vantage enabled but daily_symbols and fx_pairs empty; no batch symbols")
         
         # Target ET time for batch pull
         self._target_hour = 9
@@ -143,8 +146,13 @@ class AlphaVantageCollector:
 
     async def _run_batch(self) -> None:
         """Execute pull for all symbols."""
-        
-        logger.info("Starting Alpha Vantage daily batch pull...")
+        n = len(self._symbols)
+        logger.info(
+            "Starting Alpha Vantage daily batch pull (%d requests, budget 25/day, ~15s apart)",
+            n,
+        )
+        if n > 20:
+            logger.warning("Alpha Vantage batch has %d symbols; free tier is 25/day", n)
         total_processed = 0
         total_new = 0
         
@@ -157,8 +165,8 @@ class AlphaVantageCollector:
                     new_count = await self._collect_symbol(symbol)
                     total_new += new_count
                     total_processed += 1
-                    # Spread out requests to be polite (2 seconds = 28 seconds total)
-                    await asyncio.sleep(2.0)
+                    # Stay under 5 calls/min; client also throttles, this is extra safety
+                    await asyncio.sleep(_CALL_INTERVAL_SECONDS)
                 except Exception as exc:
                     # If it's the daily limit, let it bubble up to the outer try/except
                     if isinstance(exc, AlphaVantageRateLimitError):

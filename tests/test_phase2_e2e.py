@@ -20,10 +20,18 @@ from __future__ import annotations
 
 import asyncio
 import json
-import pytest
+import sys
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from unittest.mock import AsyncMock, MagicMock, patch
 from dataclasses import dataclass
+
+import pytest
+
+# Ensure repo root on sys.path so "python tests/test_phase2_e2e.py" and pytest both work
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO) not in sys.path:
+    sys.path.insert(0, str(_REPO))
 
 from src.core.global_risk_flow import (
     ASIA_SYMBOLS,
@@ -993,3 +1001,7 @@ class TestExtractGlobalRiskFlow:
         regimes = _make_regimes(risk_flow=-0.05)
         val = OvernightSessionStrategy._extract_global_risk_flow(regimes)
         assert val == -0.05
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

@@ -132,8 +132,11 @@ class RegimeDetector:
         self._warmup_skips = 0
         self._gaps_detected = 0
 
-        # Risk Regime state (aggregated)
-        self._risk_basket = self._thresholds.get("risk_basket", ["SPY", "TLT", "GLD"])
+        # Risk Regime state (aggregated). IBIT = crypto/risk-on proxy (correlates with BTC).
+        self._risk_basket = self._thresholds.get("risk_basket", ["SPY", "IBIT", "TLT", "GLD"])
+        self._defensive_symbols = frozenset(
+            self._thresholds.get("risk_basket_defensive", ["TLT", "GLD"])
+        )
         self._risk_state = "UNKNOWN"
         self._risk_metrics: Dict[str, Any] = {}
 
@@ -547,7 +550,12 @@ class RegimeDetector:
         return "LIQ_NORMAL", spread_pct, volume_pctile
 
     def _update_risk_state(self, symbol: str, event: SymbolRegimeEvent) -> None:
-        """Update global risk state if symbol is in risk basket."""
+        """Update global risk state from risk basket (SPY, IBIT, TLT, GLD).
+
+        Risk-on proxies (SPY, IBIT): trend up + calm vol → +1; trend down or vol spike → -1.
+        Defensive (TLT, GLD): trend up (flight to safety) → -1; trend down → +1.
+        Aggregate votes to set RISK_ON / RISK_OFF / NEUTRAL. IBIT ties regime to crypto/equity correlation.
+        """
         if symbol not in self._risk_basket:
             return
 
@@ -560,16 +568,42 @@ class RegimeDetector:
             "timestamp_ms": event.timestamp_ms,
         }
 
-        spy_data = self._risk_metrics.get("SPY")
-        
-        if not spy_data or spy_data["confidence"] < 0.7:
+        votes: List[int] = []
+        min_conf = float(self._thresholds.get("risk_basket_min_confidence", 0.5))
+
+        for sym in self._risk_basket:
+            data = self._risk_metrics.get(sym)
+            if not data or data.get("confidence", 0) < min_conf:
+                continue
+            vol = data.get("vol_regime", "UNKNOWN")
+            trend = data.get("trend_regime", "UNKNOWN")
+            vol_ok = vol in ("VOL_LOW", "VOL_NORMAL")
+
+            if sym in self._defensive_symbols:
+                # TLT/GLD: up = flight to safety = risk-off vote
+                if trend == "TREND_UP":
+                    votes.append(-1)
+                elif trend == "TREND_DOWN":
+                    votes.append(1)
+                else:
+                    votes.append(0)
+            else:
+                # SPY, IBIT, etc.: risk-on proxy (same as legacy SPY logic)
+                if vol == "VOL_SPIKE" or trend == "TREND_DOWN":
+                    votes.append(-1)
+                elif trend == "TREND_UP" and vol_ok:
+                    votes.append(1)
+                else:
+                    votes.append(0)
+
+        if not votes:
             self._risk_state = "UNKNOWN"
             return
-
-        if spy_data["vol_regime"] == "VOL_SPIKE" or spy_data["trend_regime"] == "TREND_DOWN":
-            self._risk_state = "RISK_OFF"
-        elif spy_data["trend_regime"] == "TREND_UP" and spy_data["vol_regime"] in ["VOL_LOW", "VOL_NORMAL"]:
+        total = sum(votes)
+        if total > 0:
             self._risk_state = "RISK_ON"
+        elif total < 0:
+            self._risk_state = "RISK_OFF"
         else:
             self._risk_state = "NEUTRAL"
 

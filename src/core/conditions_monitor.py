@@ -333,10 +333,11 @@ class ConditionsMonitor:
         eastern = ZoneInfo("America/New_York")
         market_time = datetime.now(eastern).strftime("%H:%M:%S %Z")
         updated_et = s.timestamp.replace(tzinfo=timezone.utc).astimezone(eastern)
-        return {
+        res = {
             'score': s.score,
             'warmth_label': s.label,
             'btc_iv': f"{s.btc_iv:.0f}",
+            'iv_rank': f"{s.btc_iv_percentile:.0f}",
             'funding': f"{s.funding_rate:+.3f}%",
             'market_open': s.market_open,
             'implication': s.implication,
@@ -348,13 +349,13 @@ class ConditionsMonitor:
             'last_updated_et': updated_et.strftime("%Y-%m-%d %H:%M:%S %Z"),
             'risk_flow': "N/A",
         }
-        
         if self._get_risk_flow:
             try:
-                res['risk_flow'] = self._get_risk_flow()
+                val = self._get_risk_flow()
+                if val is not None:
+                    res['risk_flow'] = "risk-on" if val > 0 else ("risk-off" if val < 0 else "neutral")
             except Exception:
                 pass
-                
         return res
     
     async def start_monitoring(self) -> None:

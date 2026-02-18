@@ -570,8 +570,13 @@ class ArgusOrchestrator:
         if av_cfg.get('enabled', False):
             av_api_key = get_secret(self.secrets, 'alphavantage', 'api_key')
             if av_api_key:
-                self.alphavantage_client = AlphaVantageClient(api_key=av_api_key)
-                self.logger.info("Alpha Vantage client configured")
+                # No retries on rate limit so we don't burn daily quota (25/day free tier)
+                self.alphavantage_client = AlphaVantageClient(
+                    api_key=av_api_key,
+                    max_retries=0,
+                    call_interval_seconds=15.0,
+                )
+                self.logger.info("Alpha Vantage client configured (15s interval, no retries)")
                 
                 # Continuous Collector
                 self.av_collector = AlphaVantageCollector(
@@ -2496,10 +2501,8 @@ class ArgusOrchestrator:
         risk_flow = conditions.get('risk_flow', 'neutral')
         risk_icon = "🔵" if risk_flow == 'neutral' else ("🟢" if risk_flow == 'risk-on' else "🔴")
 
-        active = len(self.paper_trader_farm.active_traders) if self.paper_trader_farm else 0
-        open_positions = sum(
-            len(t.open_positions) for t in self.paper_trader_farm.active_traders.values()
-        ) if self.paper_trader_farm else 0
+        # Current regime (vol/trend/risk from regime detector; bar-driven, so "last known" at open)
+        regime_line = self._format_current_regime_for_telegram()
 
         header = f"🔔 <b>MARKET BRIEFING</b> — {now_et.strftime('%b %d, %Y')}"
         lines = [
@@ -2508,29 +2511,15 @@ class ArgusOrchestrator:
             f"🌡️ <b>Conditions: {score}/10 {label}</b>",
             f"📈 BTC IV: {btc_iv}% (Rank: {iv_rank}%)",
             f"{risk_icon} Global Risk Flow: {str(risk_flow).upper()}",
+            regime_line,
             "",
         ]
 
-        # Add instrument prices if available
-        prices = []
-        for key in ('ibit', 'bito'):
-            det = self.detectors.get(key)
-            if det and hasattr(det, '_current_ibit_data') and det._current_ibit_data:
-                price = det._current_ibit_data.get('price', 0)
-                change = det._current_ibit_data.get('change_pct', 0)
-                emoji = "↗️" if change >= 0 else "↘️"
-                prices.append(f"• {key.upper()}: ${price:.2f} {emoji} {change:+.2f}%")
-        
-        if prices:
-            lines += prices + [""]
+        # SPY, IBIT, QQQ prices (user-facing tickers)
+        price_lines = await self._format_briefing_prices()
+        if price_lines:
+            lines += price_lines + [""]
 
-        lines += [
-            f"🚜 <b>Farm Status</b>",
-            f"• Configs: {len(self.paper_trader_farm.trader_configs):,}" if self.paper_trader_farm else "• Farm: N/A",
-            f"• Active Traders: {active:,}",
-            f"• Open Positions: {open_positions:,}",
-        ]
-        
         await self.telegram.send_tiered_message("\n".join(lines), priority=2, key="market_open")
 
     async def _send_market_close_notification(self, now_et: datetime) -> None:
@@ -2731,6 +2720,58 @@ class ArgusOrchestrator:
         if self.global_risk_flow_updater:
             return self.global_risk_flow_updater._last_value
         return None
+
+    async def _format_briefing_prices(self) -> List[str]:
+        """Format SPY, IBIT, QQQ prices for market briefing. Returns list of lines."""
+        lines = []
+        bar_source = (self.config.get("data_sources") or {}).get("bars_primary", "alpaca")
+        for symbol in ("SPY", "IBIT", "QQQ"):
+            price_str = None
+            if symbol == "IBIT":
+                det = self.detectors.get("ibit")
+                if det and getattr(det, "_current_ibit_data", None):
+                    price = det._current_ibit_data.get("price", 0)
+                    change = det._current_ibit_data.get("change_pct", 0)
+                    if price:
+                        emoji = "↗️" if change >= 0 else "↘️"
+                        price_str = f"• {symbol}: ${price:.2f} {emoji} {change:+.2f}%"
+            else:
+                close = await self.db.get_latest_bar_close(bar_source, symbol, 60) if self.db else None
+                if close is not None:
+                    price_str = f"• {symbol}: ${close:.2f}"
+            if price_str:
+                lines.append(price_str)
+        return lines
+
+    def _format_current_regime_for_telegram(self) -> str:
+        """Format current equity regime (vol/trend/risk) for Telegram. Uses last emitted regime (bar-driven)."""
+        if not self.regime_detector:
+            return "📊 Regime: N/A"
+        try:
+            event = self.regime_detector.get_market_regime("EQUITIES")
+            if not event:
+                return "📊 Regime: N/A (no bars yet)"
+            risk = getattr(event, "risk_regime", "UNKNOWN")
+            spy_vol = spy_trend = None
+            if getattr(event, "metrics_json", None):
+                try:
+                    import json
+                    metrics = json.loads(event.metrics_json)
+                    spy = metrics.get("SPY") if isinstance(metrics.get("SPY"), dict) else None
+                    if spy:
+                        spy_vol = spy.get("vol_regime")
+                        spy_trend = spy.get("trend_regime")
+                except Exception:
+                    pass
+            parts = [f"Risk: {risk}"]
+            if spy_vol:
+                parts.append(f"SPY Vol: {spy_vol}")
+            if spy_trend:
+                parts.append(f"Trend: {spy_trend}")
+            return "📊 Regime: " + " | ".join(parts)
+        except Exception as e:
+            self.logger.debug("Regime format for telegram: %s", e)
+            return "📊 Regime: N/A"
 
     async def _get_detector_statuses(self) -> Dict[str, Any]:
         """Detector activity status for dashboard."""

@@ -10,6 +10,8 @@ system:
   version: "2.0.0"
   timezone: "UTC"
   log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+  # DB path used by orchestrator and research loop (pack.db_path is in research_loop.yaml)
+  database_path: "data/argus.db"
 
 # -----------------------------------------------------------------------------
 # Logging (structured, rotating)
