@@ -267,7 +267,8 @@ class RiskEngine:
 
         # ── Constraint (2): Drawdown throttle ─────────────────────────
         normalized, new_reasons, throttle_factor = self._apply_drawdown_throttle(
-            normalized, portfolio_state, risk_config.drawdown, ts_ms,
+            normalized, portfolio_state, risk_config.drawdown,
+            risk_config.aggregate_exposure_cap, ts_ms,
         )
         reasons.extend(new_reasons)
 
@@ -499,9 +500,17 @@ class RiskEngine:
         normalized: List[NormalizedAllocation],
         state: PortfolioState,
         dd_config: DrawdownConfig,
+        aggregate_exposure_cap: float,
         ts_ms: int,
     ) -> Tuple[List[NormalizedAllocation], List[ClampReason], float]:
-        """Apply drawdown-based throttling."""
+        """Apply drawdown-based throttling as a tighter aggregate cap.
+
+        For idempotence, the throttle is applied as a **cap** on total
+        exposure rather than a per-allocation multiplier.  The effective
+        cap is ``aggregate_exposure_cap * throttle``.  If total exposure
+        is already within this cap, no change is made.  This guarantees
+        clamp(clamp(x)) == clamp(x) because the cap-check is absolute.
+        """
         reasons: List[ClampReason] = []
         throttle = compute_drawdown_throttle(
             state.current_drawdown_pct, dd_config,
@@ -510,21 +519,35 @@ class RiskEngine:
         if throttle >= 1.0:
             return normalized, reasons, 1.0
 
+        # Effective cap: aggregate cap reduced by the throttle factor
+        effective_cap = aggregate_exposure_cap * throttle
+        total_abs = sum(abs(na.current_weight) for na in normalized)
+
+        if total_abs <= 0 or total_abs <= effective_cap + 1e-12:
+            # Already within the drawdown-adjusted cap — idempotent no-op
+            return normalized, reasons, throttle
+
+        scale = effective_cap / total_abs
         equity = state.equity_usd
+        logger.info(
+            "Drawdown throttle: dd=%.4f throttle=%.4f effective_cap=%.6f "
+            "total=%.6f scale=%.6f",
+            state.current_drawdown_pct, throttle, effective_cap,
+            total_abs, scale,
+        )
+
         for na in normalized:
             before_w = na.current_weight
-            na.current_weight *= throttle
+            na.current_weight = before_w * scale
             na.notional_usd = abs(na.current_weight * equity)
-            na.delta_shares_equiv *= throttle
-            na.delta_usd *= throttle
-            na.vega *= throttle
-            na.gamma *= throttle
+            na.delta_shares_equiv *= scale
+            na.delta_usd *= scale
+            na.vega *= scale
+            na.gamma *= scale
 
-            if na.is_option:
-                new_contracts = max(0, int(na.current_contracts * throttle))
-                if new_contracts < na.current_contracts:
-                    before_c = na.current_contracts
-                    na.current_contracts = new_contracts
+            if na.is_option and abs(before_w) > 1e-12:
+                new_contracts = max(0, int(na.current_contracts * scale))
+                na.current_contracts = new_contracts
 
             if abs(before_w - na.current_weight) > 1e-10:
                 reasons.append(ClampReason(
@@ -532,7 +555,10 @@ class RiskEngine:
                     allocation_id=na.allocation_id,
                     before={"weight": round(before_w, 8)},
                     after={"weight": round(na.current_weight, 8)},
-                    reason=f"Drawdown {state.current_drawdown_pct:.4f} triggered throttle={throttle:.4f}",
+                    reason=(
+                        f"Drawdown {state.current_drawdown_pct:.4f} triggered "
+                        f"throttle={throttle:.4f}; effective_cap={effective_cap:.6f}"
+                    ),
                     severity="warn",
                     ts_ms=ts_ms,
                 ))

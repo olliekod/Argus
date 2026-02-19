@@ -104,7 +104,14 @@ class TestAllocationWithRiskEngine:
         assert isinstance(attribution, RiskAttribution)
 
     def test_produces_clamp_reasons_with_drawdown(self):
-        """Drawdown in portfolio → produces clamp reasons."""
+        """Drawdown in portfolio → produces clamp reasons.
+
+        The drawdown throttle works as a tighter aggregate cap
+        (effective_cap = aggregate_cap * throttle).  For the throttle to
+        produce clamp reasons, total allocation exposure must exceed the
+        effective cap.  We use a tight aggregate cap so allocations exceed
+        effective_cap = 0.10 * 0.75 = 0.075.
+        """
         engine = AllocationEngine(
             config=AllocationConfig(kelly_fraction=0.25, per_play_cap=0.07),
             equity=10_000.0,
@@ -115,6 +122,7 @@ class TestAllocationWithRiskEngine:
             peak_equity_usd=10_000.0,
         )
         risk_config = _make_risk_config(
+            aggregate_exposure_cap=0.10,
             drawdown=DrawdownConfig(
                 threshold_pct=0.10,
                 throttle_mode="linear",

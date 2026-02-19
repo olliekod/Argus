@@ -123,9 +123,31 @@ class TestRiskEngineIdempotence:
             )
 
     def test_idempotence_with_drawdown_throttle(self):
-        """Drawdown throttle active — second pass should be stable."""
+        """Drawdown throttle active — second pass should be stable.
+
+        The drawdown throttle works as a tighter aggregate cap:
+        effective_cap = aggregate_cap * throttle.  For throttling to
+        actually trigger, total exposure must exceed this effective cap.
+        """
         engine = RiskEngine()
-        allocs = _make_allocations()
+        # Use higher weights so total (0.90) exceeds effective_cap (0.75)
+        allocs = [
+            Allocation(
+                strategy_id="strat_A", instrument="SPY",
+                weight=0.40, dollar_risk=4000.0,
+                kelly_raw=0.50, vol_adjusted=True, contracts=0,
+            ),
+            Allocation(
+                strategy_id="strat_B", instrument="IBIT",
+                weight=0.30, dollar_risk=3000.0,
+                kelly_raw=0.35, vol_adjusted=False, contracts=0,
+            ),
+            Allocation(
+                strategy_id="strat_C", instrument="QQQ",
+                weight=0.20, dollar_risk=2000.0,
+                kelly_raw=0.25, vol_adjusted=True, contracts=0,
+            ),
+        ]
         state = PortfolioState(
             as_of_ts_ms=1700000000000,
             equity_usd=10_000.0,
@@ -133,14 +155,21 @@ class TestRiskEngineIdempotence:
             peak_equity_usd=11_765.0,
         )
         config = _make_config(
+            aggregate_exposure_cap=1.0,
             drawdown=DrawdownConfig(
                 threshold_pct=0.10,
                 throttle_mode="linear",
                 k=5.0,
             ),
         )
+        # throttle = 1 - 5*(0.15-0.10) = 0.75
+        # effective_cap = 1.0 * 0.75 = 0.75
+        # total = 0.90 > 0.75, so scale = 0.75/0.90 = 0.8333
 
-        first, _, _ = engine.clamp(allocs, state, config)
+        first, reasons1, _ = engine.clamp(allocs, state, config)
+        assert any(r.constraint_id == "drawdown_throttle" for r in reasons1), \
+            "Expected drawdown throttle to fire"
+
         second, _, _ = engine.clamp(first, state, config)
 
         for a, b in zip(
