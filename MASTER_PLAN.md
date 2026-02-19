@@ -56,7 +56,7 @@ flowchart LR
 | 4B Backtesting / Replay | **Done.** Replay harness, experiment runner, conservative execution model; replay packs with bars, outcomes, regimes, option snapshots. |
 | 4C Parameter search & robustness lab | **Done.** Parameter sweeps; regime sensitivity scoring (`compute_regime_sensitivity_score`); parameter stability auto-kill (`compute_robustness_penalty`, `compute_walk_forward_penalty`); MC/bootstrap on realized trades (`mc_bootstrap.run_mc_paths`, `evaluate_mc_kill`); regime-subset stress (`run_regime_subset_stress`); Strategy Research Loop (outcomes → packs → experiments → evaluation, DB pass-through, base-params merge, `require_recent_bars_hours`). Integrated in ExperimentRunner and StrategyEvaluator. |
 | 4C optional (deploy gates) | **Done.** Deflated Sharpe (`deflated_sharpe.py`), Reality Check (`reality_check.py`), slippage sensitivity (`run_cost_sensitivity_sweep` + manifest integration); kill reasons in StrategyEvaluator; config via `DeployGatesOpts` / `evaluation.deploy_gates`. |
-| 5 Prelude (sizing and allocation) | **Done.** Forecast/sizing (`sizing.py`: fractional Kelly, vol-target overlay, `contracts_from_risk_budget`, confidence shrinkage); StrategyRegistry (`strategy_registry.py`); AllocationEngine (`allocation_engine.py`: per-play cap 7%, aggregate cap, optional vol target); config via `AllocationOpts` / `evaluation.allocation`. Research loop calls registry and allocation when config set; persists `allocations.json`. Optional `max_loss_per_contract` (float or per-strategy map) for options sizing. |
+| 5 Portfolio risk engine | **Done.** Sizing stack (Forecast, fractional Kelly, vol target, `contracts_from_risk_budget`, confidence shrinkage); StrategyRegistry; AllocationEngine (per-play cap, aggregate cap, vol target); `allocate_with_risk_engine()` integration. **Phase 5 full:** RiskEngine (`risk_engine.py`): 5-constraint pipeline (aggregate cap → drawdown throttle → correlation/cluster caps → Greek limits → tail-risk/Heston PoP for options). PortfolioState (`portfolio_state.py`); DrawdownContainment (`drawdown_containment.py`: linear/step modes, hysteresis); CorrelationExposure (`correlation_exposure.py`: Pearson correlation, union-find clustering, per-underlying caps); GreekLimits (`greek_limits.py`: delta/vega/gamma per underlying and portfolio); TailRiskScenario (`tail_risk_scenario.py`: Heston MC prob-of-touch, analytical GBM fallback, stress IV bump); RiskAttribution (`risk_attribution.py`: per-strategy + portfolio summary, JSON persistence, config hash versioning). Invariants: deterministic, monotone, idempotent, no-lookahead. Config via `RiskEngineOpts` in research loop YAML. 75 tests. |
 
 ### IV / snapshot / replay truth map
 
@@ -89,10 +89,10 @@ flowchart LR
 ### Execution sequence
 
 ```
-[Phase 5 prelude done] → Phase 5 full (complete, comprehensive) → Phase 11 LLM agents → Phases 12–15
+[Phase 5 done] → Phase 11 LLM agents → Phases 12–15
 ```
 
-Phases 6–10 remain in the roadmap but are **deferred** until after Phases 11–15. Execute in the order above. Phase 5 must be completed in its entirety before Phase 11.
+Phases 6–10 remain in the roadmap but are **deferred** until after Phases 11–15. Execute in the order above.
 
 ### Phase table
 
@@ -107,7 +107,7 @@ Phases 6–10 remain in the roadmap but are **deferred** until after Phases 11�
 | **4A** | Outcome engine | Done | Forward returns, run-up, drawdown, multi-horizon outcomes, outcome DB storage, deterministic backfills. |
 | **4B** | Backtesting engine | Done | Replay harness, position simulator, entry/exit modeling, transaction costs, slippage (conservative execution model). |
 | **4C** | Parameter search & robustness lab | **Done** | Parameter sweeps (incl. **auto parameter grid**: sweep YAML range specs, `expand_sweep_grid`, `config/vrp_sweep.yaml`); regime sensitivity scoring; parameter stability auto-kill; MC/bootstrap on realized trades; regime-subset stress; Strategy Research Loop. Deploy gates done: DSR, Reality Check, slippage sensitivity. |
-| **5** | Portfolio risk engine | **Prelude done** | Sizing stack (Forecast, fractional Kelly, vol target, options contracts), StrategyRegistry, AllocationEngine. **Phase 5 full (comprehensive):** Portfolio risk budgeting; correlation-aware exposure control (rolling correlation matrix, cluster caps); drawdown containment and dynamic risk throttles; concentration constraints (delta/vega/gamma caps per underlying and portfolio); tail-risk/scenario layer using Heston/PoP for options spread risk where appropriate; risk attribution reporting; Integration with AllocationEngine (propose → risk engine clamps → final allocations + clamp reasons). Black–Scholes/Greeks for exposure and implementation shortfall; Heston-based scenario/PoP for options-tail risk and spread sizing where applicable. See Phase 5 Full: Risk Engine Requirements (§9). |
+| **5** | Portfolio risk engine | **Done** | Sizing stack (Forecast, fractional Kelly, vol target, options contracts), StrategyRegistry, AllocationEngine, **RiskEngine** (5-constraint pipeline: aggregate cap → drawdown throttle → correlation/cluster caps → Greek limits → tail-risk Heston/PoP). Modules: `portfolio_state.py`, `drawdown_containment.py`, `correlation_exposure.py`, `greek_limits.py`, `tail_risk_scenario.py`, `risk_attribution.py`, `risk_engine.py`. Invariants: deterministic, monotone, idempotent, no-lookahead. `allocate_with_risk_engine()` integration; research loop wiring; config via `RiskEngineOpts`. 75 tests. See §9.9. |
 | **6** | Execution engine | Future (deferred) | Broker integration, order routing, fill simulation, paper then live trading. TCA ledger (decision price, arrival, NBBO, executed, spread paid). |
 | **7** | Strategy expansion | Future (deferred) | Put spread selling, volatility plays, panic snapback, FVG, session momentum, crypto–ETF relationships, Polymarket. |
 | **8** | Portfolio intelligence | Future (deferred) | Strategy aggregation, signal voting, dynamic allocation, regime-based capital shifts. **StrategyLeague** (tournament allocator): eligibility gate, smoothed weight updates, degradation detector, kill/quarantine; allocate from health metrics not raw short-run PnL. |
@@ -119,7 +119,7 @@ Phases 6–10 remain in the roadmap but are **deferred** until after Phases 11�
 | **14** | News features & HMM regime | Future | NewsAPI ingestion; HMM regime layer (regime committee member, K=4, daily, 5–10y rolling); hmm_model_snapshots, hmm_regime_series. |
 | **15** | Promotion pipeline formalization | Future | Stages: Proposed → Backtest-Passed → Paper-Trading → Shadow-Live → Production-Eligible. Researcher cannot promote; only Argus logic. |
 
-**Where we are now:** Phase 4C including deploy gates and **auto parameter grid** (sweep range expansion, `config/vrp_sweep.yaml`) is done. Phase 5 prelude (sizing, registry, allocation engine, research–allocation loop, max_loss_per_contract) is done. IV consolidation is done. **Global risk flow** is implemented (computation, DB-only updater, regime merge, replay injection, overnight gating). **Overnight Session Strategy Phase 2 (Data Enhancement) is COMPLETE** (2026-02-17): E2E verification tests (`tests/test_phase2_e2e.py`, 30 tests) confirm replay pack injection, strategy gating, harness integration, and deterministic behavior. **Alpaca = bars/outcomes only** is enforced (no IV/options from Alpaca; data_sources allowed options providers = tastytrade, public). P1/P2 audit items (10.2, 10.4, 10.7, 10.8) verified. Sprint 2 E2E check done; secrets path in tests uses `config/secrets.yaml`. **Next:** Phase 5 full (complete, comprehensive portfolio risk engine), then Phase 11 LLM agents. See §8.4.
+**Where we are now:** Phase 4C including deploy gates and **auto parameter grid** (sweep range expansion, `config/vrp_sweep.yaml`) is done. **Phase 5 (portfolio risk engine) is COMPLETE** (2026-02-19): Sizing stack, StrategyRegistry, AllocationEngine, and full RiskEngine (5-constraint pipeline: aggregate cap → drawdown throttle → correlation/cluster caps → Greek limits → tail-risk Heston/PoP). Modules: `portfolio_state.py`, `drawdown_containment.py`, `correlation_exposure.py`, `greek_limits.py`, `tail_risk_scenario.py`, `risk_attribution.py`, `risk_engine.py`. Invariants enforced: deterministic, monotone, idempotent, no-lookahead. Integration via `allocate_with_risk_engine()`; research loop wiring; config via `RiskEngineOpts`. 75 tests all passing. IV consolidation is done. **Global risk flow** is implemented. **Overnight Session Strategy Phase 2 (Data Enhancement) is COMPLETE** (2026-02-17). **Alpaca = bars/outcomes only** is enforced. P1/P2 audit items verified. **Next:** Phase 11 LLM agents. See §8.4.
 
 ---
 
@@ -259,7 +259,7 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 
 - **Strategy allocation engine (StrategyLeague)** — **Minimal allocation engine — Done.** `StrategyRegistry`, `AllocationEngine`, `AllocationConfig`; consumes `Forecast` list, outputs target weights/contracts with per-play cap (7%) and aggregate cap. **Still to do (StrategyLeague):** capital competition, smoothed weight updates, degradation detector, eligibility gate in production loop.
 - **Strategy lifecycle & kill engine** — Rolling performance metrics, degradation detection, quarantine, automatic strategy death when edge disappears. Kill triggers: rolling expectancy beyond confidence bounds, slippage/lag spikes, drawdown regime breach, data distribution shift.
-- **Portfolio risk engine (Phase 5 full)** — Comprehensive scope: portfolio risk budgeting; correlation-aware exposure control (rolling correlation matrix, cluster caps); drawdown containment and dynamic risk throttles; concentration constraints (delta/vega/gamma caps); tail-risk/scenario layer (Heston/PoP where appropriate); risk attribution reporting; AllocationEngine integration. **Per-play cap:** e.g. ≤7% of equity per play; portfolio caps for sector/underlying/vega concentration. Required before safe live deployment. See §9.9.
+- **Portfolio risk engine (Phase 5 full)** — **Done (2026-02-19).** RiskEngine with 5-constraint pipeline (aggregate cap → drawdown throttle → correlation/cluster caps → Greek limits → tail-risk Heston/PoP for options). Modules: `risk_engine.py`, `portfolio_state.py`, `drawdown_containment.py`, `correlation_exposure.py`, `greek_limits.py`, `tail_risk_scenario.py`, `risk_attribution.py`. Invariants: deterministic, monotone, idempotent, no-lookahead. AllocationEngine integration via `allocate_with_risk_engine()`; research loop wiring; config via `RiskEngineOpts`. 75 tests. See §9.9.
 - **Sizing engine (Phase 1)** — **Done.** `sizing.py`: Forecast, `fractional_kelly_size`, `vol_target_overlay`, `contracts_from_risk_budget`, `shrink_mu`, `size_position`. Quarter-Kelly, caps, vol target, confidence shrinkage. **Phase 2–3** (covariance shrinkage, portfolio risk budgeting) remains future.
 - **Sizing engine (Phase 2–3)** — Covariance shrinkage and portfolio risk budgeting; then drawdown probability constraints and ES monitoring. Two allocators: simple vol-scaling/risk-budget baseline; shrinkage-covariance allocator for multi-strategy. Tests: test_allocator_numerics.py (PSD covariance, weight sum constraints).
 - **Black–Scholes / Greeks usage** — Use for risk (delta/vega, max vega per underlying), IV/VRP inputs (already in use), and implementation shortfall (decision vs execution). **Heston/PoP in risk engine:** For options-tail scenario evaluation and spread sizing where appropriate; distinct from Phase 4C MC/bootstrap. Part of Phase 5 full.
@@ -269,7 +269,7 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 
 ### 8.4 Next steps and recommended route
 
-**Status (as of 2026-02-17)**
+**Status (as of 2026-02-19)**
 
 - **Sprint 1:** Done + verified (research–allocation loop, P1 audit 10.2/10.4, config/allocation/max_loss_per_contract).
 - **Sprint 2 code tasks:** Done + verified (ExecutionModel reset, secrets file permissions; secrets-permissions test fixed for Windows).
@@ -278,6 +278,7 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 - **Alpaca = bars/outcomes only:** Done. `_ALLOWED_OPTIONS_SNAPSHOT_PROVIDERS` excludes alpaca; VRP strategy never uses Alpaca for IV; no `allow_alpaca_iv`; tests and configs updated.
 - **Overnight Phase 1:** Done. `OvernightSessionStrategy` (ReplayStrategy: `on_bar`, `generate_intents`, session transitions, visible outcomes, risk-flow gating). Wired in `_STRATEGY_MODULES`, `config/research_loop.yaml`, `config/overnight_sweep.yaml`; 20 unit tests.
 - **Overnight Phase 2 (Data Enhancement):** **Done (2026-02-17).** E2E verification complete: replay pack injection, strategy gating, harness integration, deterministic behavior. 30 new tests in `tests/test_phase2_e2e.py`. Documentation updated. See [OVERNIGHT_SESSION_STRATEGY_PLAN.md](docs/OVERNIGHT_SESSION_STRATEGY_PLAN.md) §Phase 2.
+- **Phase 5 Full (Portfolio Risk Engine):** **Done (2026-02-19).** RiskEngine with 5-constraint pipeline; 8 new modules; AllocationEngine integration; research loop wiring; 75 tests all passing. See §9.9.
 
 **Assessment (codebase vs Master Plan):**
 
@@ -292,9 +293,9 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 
 **Your next steps (prioritized)**
 
-1. **Phase 5 full (complete, comprehensive)** — Complete the portfolio risk engine in its entirety: portfolio risk budgeting; correlation-aware exposure control; drawdown containment and dynamic risk throttles; concentration constraints (delta/vega/gamma caps); tail-risk/scenario layer (Heston/PoP where appropriate); risk attribution reporting; AllocationEngine integration. See Phase 5 Full: Risk Engine Requirements (§9.9).
+1. ~~**Phase 5 full**~~ — **Done (2026-02-19).** Portfolio risk engine complete. See §9.9.
 
-2. **Phase 11 — LLM agents (ASAP after Phase 5 full)** — Implement Jarvis and Research Proposer; tool API + RBAC + audit; ManifestValidator; DSL schema; experiment_backlog, tool_audit_log. See §8.6.
+2. **Phase 11 — LLM agents (next)** — Implement Jarvis and Research Proposer; tool API + RBAC + audit; ManifestValidator; DSL schema; experiment_backlog, tool_audit_log. See §8.6.
 
 3. **Ongoing research (continuous)**
    Run the research engine: VRP sweeps (`config/vrp_sweep.yaml`), **overnight experiments** (`config/overnight_sweep.yaml`, now including `gate_on_risk_flow` sweep). Document findings; feed into strategy priority and allocation design.
@@ -311,7 +312,7 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 
 Past implementations (auto parameter grid, Alpaca policy, research–allocation loop, P1/P2 audit, **Overnight Phase 1 and Phase 2**) are in place and verified. **Solidifying is in good shape.**
 
-**Best use of Claude now:** **Phase 5 full (complete, comprehensive)** first; then **Phase 11 (LLM agents)** after Phase 5. Phases 6–10 are deferred. Extended sweeps (Phase 13) are a follow-up after LLM.
+**Best use of Claude now:** **Phase 11 (LLM agents)** — Phase 5 is complete. Phases 6–10 are deferred. Extended sweeps (Phase 13) are a follow-up after LLM.
 
 ---
 
@@ -331,7 +332,7 @@ Use the research engine to prove edge: VRP experiments (IBIT/SPY/QQQ), Overnight
 
 **3) Future phases (separate plans when prioritized)**
 
-- **Portfolio risk engine (Phase 5 full):** Comprehensive scope per §9.9 — portfolio risk budgeting, correlation-aware exposure control, drawdown containment, concentration constraints, tail-risk/scenario layer (Heston/PoP), risk attribution, AllocationEngine integration.
+- ~~**Portfolio risk engine (Phase 5 full)**~~ — **Done (2026-02-19).** See §9.9.
 - **Strategy lifecycle:** Rolling health, degradation detection, quarantine/kill.
 - **Live vs backtest drift monitor:** Slippage drift alerts.
 - **StrategyLeague enhancements:** Capital budgeting, diversity-aware ranking, lifecycle integration.
@@ -445,11 +446,11 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 
 ### 9.5 Gaps Argus still has
 
-- Strategy allocation **prelude** (registry, AllocationEngine, sizing) and **loop wiring** (research → registry → allocation → persisted allocations when config set) are in place; full **StrategyLeague** behavior (capital competition, smoothed updates, degradation detector) is not yet implemented.
-- Portfolio risk engine (exposure limits, correlation, risk budgeting, drawdown containment).
+- Strategy allocation (registry, AllocationEngine, sizing) and **risk engine** are in place; full **StrategyLeague** behavior (capital competition, smoothed updates, degradation detector) is not yet implemented.
+- ~~Portfolio risk engine~~ — **Done (2026-02-19).** RiskEngine with 5-constraint pipeline, risk attribution, AllocationEngine integration.
 - Live vs backtest drift monitor (fills, slippage, execution degradation).
 - Strategy health monitoring (rolling metrics, degradation alerts, quarantine).
-- Cross-strategy correlation analysis and diversification enforcement.
+- ~~Cross-strategy correlation analysis and diversification enforcement~~ — **Done.** Correlation matrix, union-find clustering, per-underlying and per-cluster caps in RiskEngine.
 
 ### 9.6 What systematic managers do well
 
@@ -476,19 +477,26 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 6. Live execution  
 7. Strategy expansion  
 
-### 9.9 Phase 5 Full: Risk Engine Requirements
+### 9.9 Phase 5 Full: Risk Engine — Done (2026-02-19)
 
-The comprehensive portfolio risk engine (Phase 5 full) includes:
+The comprehensive portfolio risk engine (Phase 5 full) is **implemented**:
 
-- **Portfolio risk budgeting** — Multi-strategy, multi-asset; covariance-aware capital allocation.
-- **Correlation-aware exposure control** — Rolling correlation matrix; clustering; caps per cluster and per underlying.
-- **Drawdown containment** — Portfolio-level drawdown guardrails; dynamic risk throttles (e.g., reduce risk when drawdown > threshold).
-- **Concentration constraints** — Delta/vega/gamma caps per underlying and portfolio; options-specific `max_loss_per_contract` (exists); extend with portfolio greek limits.
-- **Tail-risk / scenario layer** — Incorporate Heston-model scenario / PoP outputs for options spread risk where appropriate (e.g., estimating distribution of underlying moves + IV dynamics for tail outcomes). **Distinct from Phase 4C MC/bootstrap** (trade resampling); do not conflate.
-- **Risk attribution reporting** — Per-strategy and portfolio risk contributions; “why risk was reduced” logs/artifacts.
-- **Integration with AllocationEngine** — Allocator proposes weights/contracts; risk engine clamps/adjusts to satisfy constraints; outputs final allocations + “clamp reasons” artifact for audit.
+- **Portfolio risk budgeting** — Multi-strategy, multi-asset; aggregate exposure cap + drawdown-adjusted cap.
+- **Correlation-aware exposure control** — Rolling Pearson correlation matrix (`correlation_exposure.py`); union-find clustering with deterministic ordering; caps per cluster and per underlying.
+- **Drawdown containment** — `drawdown_containment.py`: linear/step throttle modes with hysteresis; applied as cap-based constraint (effective_cap = aggregate_cap × throttle) for idempotence.
+- **Concentration constraints** — `greek_limits.py`: delta/vega/gamma caps per underlying and portfolio; options-specific `max_loss_per_contract`; portfolio-level greek limits.
+- **Tail-risk / scenario layer** — `tail_risk_scenario.py`: Heston MC prob-of-touch via `gpu_engine.monte_carlo_pop_heston()`; analytical GBM first-passage fallback; stress IV bump; max stress loss cap. **Distinct from Phase 4C MC/bootstrap** (trade resampling).
+- **Risk attribution reporting** — `risk_attribution.py`: per-strategy and portfolio risk contributions; `ClampReason` log; JSON persistence with `sort_keys=True`; config hash versioning (SHA256).
+- **Integration with AllocationEngine** — `allocate_with_risk_engine()` method; allocator proposes → RiskEngine clamps via 5-constraint pipeline → final allocations + clamp reasons + risk attribution.
+- **Research loop wiring** — Config via `RiskEngineOpts` in `research_loop_config.py`; `strategy_research_loop.py` instantiates RiskEngine when config set.
 
-**Modules (if exist):** `sizing.py`, `allocation_engine.py`, `strategy_registry.py`. TODO: `risk_engine.py` (or equivalent), correlation/clustering module, scenario/tail-risk layer, clamp-reason persistence.
+**Invariants (enforced and tested):** Deterministic (same inputs → same outputs); monotone (clamp never increases exposure); idempotent (clamp(clamp(x)) == clamp(x)); no-lookahead (only data ≤ as_of_ts_ms). Stable ordering (sorted by allocation_id).
+
+**Constraint ordering (fixed):** (1) Aggregate exposure cap → (2) Drawdown throttle → (3) Correlation/cluster caps → (4) Greek limits → (5) Tail-risk (Heston/PoP, options only).
+
+**Modules:** `risk_engine.py`, `portfolio_state.py`, `drawdown_containment.py`, `correlation_exposure.py`, `greek_limits.py`, `tail_risk_scenario.py`, `risk_attribution.py`. Pre-existing: `sizing.py`, `allocation_engine.py`, `strategy_registry.py`.
+
+**Tests (75):** `test_risk_engine_idempotence.py` (5), `test_risk_engine_monotone.py` (7), `test_drawdown_containment.py` (11), `test_correlation_exposure.py` (15), `test_greek_limits.py` (13), `test_tail_risk_scenario.py` (7), `test_allocation_with_risk_engine.py` (12), plus existing `test_allocation_engine.py` and `test_sizing.py`.
 
 ---
 
