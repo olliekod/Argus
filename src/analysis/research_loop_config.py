@@ -85,6 +85,73 @@ class AllocationOpts:
 
 
 @dataclass
+class RiskEngineDrawdownOpts:
+    """Drawdown containment config within risk engine."""
+    threshold_pct: float = 0.10
+    throttle_mode: str = "linear"
+    throttle_scale: float = 0.5
+    k: float = 5.0
+    recovery_threshold_pct: float = 0.05
+    min_throttle: float = 0.1
+
+
+@dataclass
+class RiskEngineCorrelationOpts:
+    """Correlation exposure config within risk engine."""
+    rolling_days: int = 60
+    min_obs: int = 45
+    estimator: str = "pearson"
+    nan_policy: str = "skip"
+    max_exposure_per_underlying_usd: float = 0.0
+    max_exposure_per_cluster_usd: float = 0.0
+    max_correlated_pair_exposure_usd: float = 0.0
+    cluster_method: str = "threshold"
+    corr_threshold_for_cluster: float = 0.8
+
+
+@dataclass
+class RiskEngineGreekLimitsOpts:
+    """Greek limits config within risk engine."""
+    per_underlying: Dict[str, Dict[str, float]] = field(default_factory=dict)
+    portfolio_max_delta_shares: float = float("inf")
+    portfolio_max_vega: float = float("inf")
+    portfolio_max_gamma: float = float("inf")
+    enforce_existing_positions: bool = True
+
+
+@dataclass
+class RiskEngineTailRiskOpts:
+    """Tail-risk scenario config within risk engine."""
+    enabled_for_options: bool = True
+    max_prob_touch: float = 0.35
+    stress_iv_bump: float = 0.20
+    max_stress_loss_pct: float = 0.05
+    mc_simulations: int = 100_000
+    mc_steps_per_year: int = 252
+    seed: int = 42
+    default_heston_kappa: float = 2.0
+    default_heston_sigma_v: float = 0.5
+    default_heston_rho: float = -0.7
+
+
+@dataclass
+class RiskEngineOpts:
+    """Configuration for Phase 5 Portfolio Risk Engine.
+
+    Nested under ``evaluation.allocation.risk_engine`` in YAML.
+    """
+    enabled: bool = False
+    aggregate_exposure_cap: float = 1.0
+    drawdown: RiskEngineDrawdownOpts = field(default_factory=RiskEngineDrawdownOpts)
+    correlation: RiskEngineCorrelationOpts = field(default_factory=RiskEngineCorrelationOpts)
+    greek_limits: RiskEngineGreekLimitsOpts = field(default_factory=RiskEngineGreekLimitsOpts)
+    tail_risk: RiskEngineTailRiskOpts = field(default_factory=RiskEngineTailRiskOpts)
+    risk_attribution_output_path: str = "logs/risk_attribution.json"
+    enforce_idempotence_check: bool = True
+    enforce_monotone_check: bool = True
+
+
+@dataclass
 class EvaluationOpts:
     input_dir: str
     kill_thresholds: Optional[str]  # path to YAML or None
@@ -94,6 +161,7 @@ class EvaluationOpts:
     deploy_gates: Optional[DeployGatesOpts] = None
     allocation: Optional[AllocationOpts] = None
     allocations_output_path: Optional[str] = None
+    risk_engine: Optional[RiskEngineOpts] = None
     equity: float = 10_000.0
     min_dsr: float = 0.0
     min_composite_score: float = 0.0
@@ -317,6 +385,101 @@ def load_research_loop_config(
             max_loss_per_contract=max_loss_cfg,
         )
 
+    # ── Risk Engine (Phase 5 full) ──────────────────────────────
+    risk_engine = None
+    re_raw = eval_raw.get("risk_engine") or (alloc_raw or {}).get("risk_engine", {})
+    if re_raw:
+        dd_raw = re_raw.get("drawdown", {})
+        corr_raw = re_raw.get("correlation", {})
+        gl_raw = re_raw.get("greek_limits", {})
+        tr_raw = re_raw.get("tail_risk", {})
+        policy_raw = re_raw.get("policy", {})
+
+        drawdown_opts = RiskEngineDrawdownOpts(
+            threshold_pct=float(dd_raw.get("threshold_pct", 0.10)),
+            throttle_mode=dd_raw.get("throttle_mode", "linear"),
+            throttle_scale=float(dd_raw.get("throttle_scale", 0.5)),
+            k=float(dd_raw.get("k", 5.0)),
+            recovery_threshold_pct=float(dd_raw.get("recovery_threshold_pct", 0.05)),
+            min_throttle=float(dd_raw.get("min_throttle", 0.1)),
+        )
+
+        corr_opts = RiskEngineCorrelationOpts(
+            rolling_days=int(corr_raw.get("rolling_days", 60)),
+            min_obs=int(corr_raw.get("min_obs", 45)),
+            estimator=corr_raw.get("estimator", "pearson"),
+            nan_policy=corr_raw.get("nan_policy", "skip"),
+            max_exposure_per_underlying_usd=float(
+                corr_raw.get("max_exposure_per_underlying_usd", 0.0)
+            ),
+            max_exposure_per_cluster_usd=float(
+                corr_raw.get("max_exposure_per_cluster_usd", 0.0)
+            ),
+            max_correlated_pair_exposure_usd=float(
+                corr_raw.get("max_correlated_pair_exposure_usd", 0.0)
+            ),
+            cluster_method=corr_raw.get("cluster_method", "threshold"),
+            corr_threshold_for_cluster=float(
+                corr_raw.get("corr_threshold_for_cluster", 0.8)
+            ),
+        )
+
+        # Parse per_underlying greek limits
+        per_und_raw = gl_raw.get("per_underlying", {})
+        per_underlying = {}
+        for und, limits in per_und_raw.items():
+            per_underlying[str(und)] = {
+                str(k): float(v) for k, v in (limits or {}).items()
+            }
+
+        gl_opts = RiskEngineGreekLimitsOpts(
+            per_underlying=per_underlying,
+            portfolio_max_delta_shares=float(
+                gl_raw.get("portfolio_max_delta_shares", float("inf"))
+            ),
+            portfolio_max_vega=float(
+                gl_raw.get("portfolio_max_vega", float("inf"))
+            ),
+            portfolio_max_gamma=float(
+                gl_raw.get("portfolio_max_gamma", float("inf"))
+            ),
+            enforce_existing_positions=bool(
+                gl_raw.get("enforce_existing_positions", True)
+            ),
+        )
+
+        tr_opts = RiskEngineTailRiskOpts(
+            enabled_for_options=bool(tr_raw.get("enabled_for_options", True)),
+            max_prob_touch=float(tr_raw.get("max_prob_touch", 0.35)),
+            stress_iv_bump=float(tr_raw.get("stress_iv_bump", 0.20)),
+            max_stress_loss_pct=float(tr_raw.get("max_stress_loss_pct", 0.05)),
+            mc_simulations=int(tr_raw.get("mc_simulations", 100_000)),
+            mc_steps_per_year=int(tr_raw.get("mc_steps_per_year", 252)),
+            seed=int(tr_raw.get("seed", 42)),
+            default_heston_kappa=float(tr_raw.get("default_heston_kappa", 2.0)),
+            default_heston_sigma_v=float(tr_raw.get("default_heston_sigma_v", 0.5)),
+            default_heston_rho=float(tr_raw.get("default_heston_rho", -0.7)),
+        )
+
+        risk_engine = RiskEngineOpts(
+            enabled=bool(re_raw.get("enabled", False)),
+            aggregate_exposure_cap=float(re_raw.get("aggregate_exposure_cap", 1.0)),
+            drawdown=drawdown_opts,
+            correlation=corr_opts,
+            greek_limits=gl_opts,
+            tail_risk=tr_opts,
+            risk_attribution_output_path=_resolve_path(
+                re_raw.get("risk_attribution_output_path", "logs/risk_attribution.json"),
+                project_root,
+            ),
+            enforce_idempotence_check=bool(
+                policy_raw.get("enforce_idempotence_check", True)
+            ),
+            enforce_monotone_check=bool(
+                policy_raw.get("enforce_monotone_check", True)
+            ),
+        )
+
     evaluation = EvaluationOpts(
         input_dir=eval_input,
         kill_thresholds=kill_thresh_path,
@@ -334,6 +497,7 @@ def load_research_loop_config(
         allocations_output_path=_resolve_path(
             eval_raw.get("allocations_output_path"), project_root
         ),
+        risk_engine=risk_engine,
         equity=float(eval_raw.get("equity", 10_000.0)),
         min_dsr=float(eval_raw.get("min_dsr", 0.0)),
         min_composite_score=float(eval_raw.get("min_composite_score", 0.0)),
