@@ -20,8 +20,26 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 import aiohttp
 
 from src.agent.delphi import DelphiToolRegistry, ToolResult
+from src.agent.pantheon.roles import (
+    ARES,
+    ATHENA,
+    PROMETHEUS,
+    ContextInjector,
+    build_stage_prompt,
+    get_role_for_stage,
+    parse_critique_response,
+    parse_manifest_response,
+    parse_verdict_response,
+)
 from src.agent.runtime_controller import RuntimeController
 from src.agent.zeus import RuntimeMode, ZeusPolicyEngine
+from src.core.manifests import (
+    AresCritique,
+    AthenaVerdict,
+    ManifestStatus,
+    ManifestValidationError,
+    StrategyManifest,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +273,9 @@ class ArgusOrchestrator:
         self.memory = ConversationBuffer(max_messages=max_history)
         self._pending_approval: Optional[Dict[str, Any]] = None
         self._active_case: Optional[CaseFile] = None
+
+        # Pantheon context injector for structured research prompts
+        self.context_injector = ContextInjector()
 
         # Allow injection of a custom LLM callable for testing.
         # Signature: async llm_call(messages, model) -> str
@@ -558,7 +579,12 @@ class ArgusOrchestrator:
 
         debate_log: List[str] = [f"**Case File {case_id}** — {message}\n"]
 
-        # Run through stages 1-5
+        # Track parsed artifacts for structured handoffs
+        current_manifest: Optional[StrategyManifest] = None
+        current_critique: Optional[AresCritique] = None
+        final_verdict: Optional[AthenaVerdict] = None
+
+        # Run through stages 1-5 using Pantheon structured prompts
         for target_stage in [
             CaseStage.PROPOSAL_V1,
             CaseStage.CRITIQUE_V1,
@@ -567,26 +593,116 @@ class ArgusOrchestrator:
             CaseStage.ADJUDICATION,
         ]:
             case.advance()
-            role, prompt_template = _CASE_FILE_ROLE_PROMPTS[target_stage]
+            role_obj = get_role_for_stage(target_stage.value)
+            role_name = role_obj.name
 
-            # Build the stage-specific prompt
-            prompt = self._build_case_prompt(case, prompt_template)
-            
-            # Adjudication (Athena) is the primary case for API escalation
+            # Build structured prompt via Pantheon
+            messages = build_stage_prompt(
+                stage_value=target_stage.value,
+                objective=message,
+                context=self.context_injector,
+                artifacts=case.artifacts,
+            )
+
+            # Determine escalation based on role priority
             justification = None
-            if target_stage == CaseStage.ADJUDICATION:
-                justification = f"Adjudicating Case {case.case_id}: requires high-reasoning judge."
+            if role_obj.escalation_priority >= 2:
+                justification = (
+                    f"{role_name} adjudicating Case {case.case_id}: "
+                    "requires high-reasoning judge."
+                )
 
-            stage_response = await self._llm_complete_for_role(prompt, role, escalation_justification=justification)
+            # Select model based on escalation priority
+            model = self.model
+            if role_obj.escalation_priority >= 1 and model == DEFAULT_MODEL:
+                model = UPGRADE_MODEL
 
-            case.add_artifact(role, stage_response)
-            debate_log.append(f"### Stage {target_stage.value} ({role})\n{stage_response}\n")
+            stage_response = await self._llm_complete(
+                messages, model, escalation_justification=justification
+            )
+
+            # Parse structured output and handle validation failures
+            parse_error = None
+            if target_stage in (CaseStage.PROPOSAL_V1, CaseStage.REVISION_V2):
+                try:
+                    current_manifest = parse_manifest_response(stage_response)
+                    current_manifest.status = (
+                        ManifestStatus.DRAFT if target_stage == CaseStage.PROPOSAL_V1
+                        else ManifestStatus.REVISED
+                    )
+                except ManifestValidationError as exc:
+                    parse_error = str(exc)
+                    logger.warning(
+                        "Prometheus produced invalid manifest at stage %d: %s",
+                        target_stage.value, exc,
+                    )
+                    # Escalation: retry with higher-tier model
+                    if model != UPGRADE_MODEL:
+                        logger.info("Escalating Prometheus to 32B for manifest retry.")
+                        stage_response = await self._llm_complete(
+                            messages, UPGRADE_MODEL,
+                            escalation_justification=f"Prometheus manifest parse failure: {exc}",
+                        )
+                        try:
+                            current_manifest = parse_manifest_response(stage_response)
+                            parse_error = None
+                        except ManifestValidationError as exc2:
+                            parse_error = str(exc2)
+
+                    if parse_error:
+                        await self._audit("manifest_parse_failure", {
+                            "case_id": case_id,
+                            "stage": target_stage.value,
+                            "error": parse_error,
+                        })
+
+            elif target_stage in (CaseStage.CRITIQUE_V1, CaseStage.FINAL_ATTACK):
+                manifest_hash = current_manifest.compute_hash() if current_manifest else ""
+                try:
+                    current_critique = parse_critique_response(stage_response, manifest_hash)
+                except ManifestValidationError as exc:
+                    logger.warning(
+                        "Ares produced invalid critique at stage %d: %s",
+                        target_stage.value, exc,
+                    )
+
+            elif target_stage == CaseStage.ADJUDICATION:
+                try:
+                    final_verdict = parse_verdict_response(stage_response)
+                    if final_verdict.decision == "PROMOTE" and current_manifest:
+                        current_manifest.status = ManifestStatus.PROMOTED
+                    elif current_manifest:
+                        current_manifest.status = ManifestStatus.REJECTED
+                except ManifestValidationError as exc:
+                    logger.warning("Athena produced invalid verdict: %s", exc)
+
+            case.add_artifact(role_name, stage_response)
+            debate_log.append(f"### Stage {target_stage.value} ({role_name})\n{stage_response}\n")
+
+            if parse_error:
+                debate_log.append(
+                    f"⚠ **Parse Warning**: {parse_error}\n"
+                )
 
             await self._audit("case_stage_completed", {
                 "case_id": case_id,
                 "stage": target_stage.value,
-                "role": role,
+                "role": role_name,
+                "has_structured_output": parse_error is None,
             })
+
+        # Append structured summary
+        if final_verdict:
+            debate_log.append(f"\n### Verdict\n")
+            debate_log.append(f"Decision: **{final_verdict.decision}**\n")
+            debate_log.append(f"Confidence: **{final_verdict.confidence:.2f}**\n")
+            debate_log.append(f"Rationale: {final_verdict.rationale}\n")
+            if final_verdict.decision == "PROMOTE" and current_manifest:
+                backtest_config = current_manifest.to_backtest_config()
+                debate_log.append(
+                    f"\n### Backtest Configuration\n```json\n"
+                    f"{json.dumps(backtest_config, indent=2)}\n```\n"
+                )
 
         self._active_case = None
         return "\n".join(debate_log)
