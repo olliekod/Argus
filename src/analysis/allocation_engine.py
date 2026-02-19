@@ -23,7 +23,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, TYPE_CHECKING, Tuple
 
 from .sizing import (
     Forecast,
@@ -31,6 +31,10 @@ from .sizing import (
     size_position,
     contracts_from_risk_budget,
 )
+
+if TYPE_CHECKING:
+    from .portfolio_state import PortfolioState
+    from .risk_engine import ClampReason, RiskAttribution, RiskEngineConfig
 
 logger = logging.getLogger("argus.allocation_engine")
 
@@ -239,6 +243,54 @@ class AllocationEngine:
             ))
 
         return result
+
+    def allocate_with_risk_engine(
+        self,
+        forecasts: List[Forecast],
+        portfolio_state: "PortfolioState",
+        risk_config: "RiskEngineConfig",
+        max_loss_per_contract: Optional[Dict[str, float]] = None,
+    ) -> Tuple[List[Allocation], List["ClampReason"], "RiskAttribution"]:
+        """Compute allocations then clamp through the risk engine.
+
+        Parameters
+        ----------
+        forecasts : list of Forecast
+            One forecast per strategy/instrument pair.
+        portfolio_state : PortfolioState
+            Current portfolio snapshot.
+        risk_config : RiskEngineConfig
+            Risk engine configuration.
+        max_loss_per_contract : dict, optional
+            For options strategies, maps strategy_id to max loss per contract.
+
+        Returns
+        -------
+        tuple
+            (clamped_allocations, clamp_reasons, risk_attribution)
+        """
+        from .risk_engine import RiskEngine
+
+        # Step 1: Compute proposed allocations as before
+        proposed = self.allocate(forecasts, max_loss_per_contract)
+
+        # Step 2: Clamp through risk engine
+        engine = RiskEngine()
+        clamped, reasons, attribution = engine.clamp(
+            proposed_allocations=proposed,
+            portfolio_state=portfolio_state,
+            risk_config=risk_config,
+        )
+
+        # Log summary
+        active = sum(1 for a in clamped if a.weight != 0)
+        logger.info(
+            "AllocationEngine + RiskEngine: %d active/%d total, "
+            "%d clamp_reasons",
+            active, len(clamped), len(reasons),
+        )
+
+        return clamped, reasons, attribution
 
     def summary(self, allocations: List[Allocation]) -> Dict[str, Any]:
         """Generate a summary dict for logging/persistence."""
