@@ -147,8 +147,13 @@ exchanges:
 news_sentiment:
   enabled: false
   interval_seconds: 3600
-  api_key: "${NEWS_SENTIMENT_API_KEY}"
-  api_url: "https://www.alphavantage.co/query"
+  feeds:
+    - "https://finance.yahoo.com/news/rssindex"
+    - "https://feeds.content.dowjones.io/public/rss/mw_topstories"
+  lexicon: "loughran_mcdonald"
+  lexicon_path: null
+  max_headlines: 50
+  newsapi_key: null
 
 # -----------------------------------------------------------------------------
 # Tastytrade Configuration

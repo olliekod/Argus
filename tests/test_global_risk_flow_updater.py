@@ -226,8 +226,8 @@ async def test_news_sentiment_updater_and_regime_integration():
         "news_sentiment": {
             "enabled": True,
             "interval_seconds": 3600,
-            "api_key": "",
-            "api_url": "https://www.alphavantage.co/query",
+            "feeds": [],
+            "max_headlines": 50,
         }
     })
 
