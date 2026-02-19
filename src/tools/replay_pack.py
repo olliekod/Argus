@@ -22,6 +22,7 @@ options data simply produce packs with an empty ``snapshots`` list.
 import asyncio
 import json
 import argparse
+import logging
 import os
 from datetime import datetime, timezone
 from pathlib import Path
@@ -30,6 +31,8 @@ from typing import Any, Dict, List, Optional
 from src.core.database import Database
 from src.core.data_sources import get_data_source_policy, DataSourcePolicy
 from src.core.liquid_etf_universe import get_liquid_etf_universe
+
+logger = logging.getLogger("argus.replay_pack")
 from src.core.global_risk_flow import (
     compute_global_risk_flow,
     ASIA_SYMBOLS,
@@ -57,12 +60,29 @@ def _atm_iv_from_quotes_json(quotes_json: str, underlying_price: float) -> Optio
     did not supply it. Order: (1) top-level atm_iv (from connector/provider),
     (2) ATM put's iv field (provider on the quote), (3) derived from bid/ask
     via GreeksEngine (Black-Scholes) when neither is present.
+
+    When underlying_price is 0 or missing, tries to use underlying_price from
+    the parsed quotes_json (serialized chain includes it).
     """
-    if not quotes_json or not underlying_price or underlying_price <= 0:
+    if not quotes_json:
+        logger.debug("atm_iv_from_quotes: empty quotes_json")
         return None
     try:
         data = json.loads(quotes_json)
         if not isinstance(data, dict):
+            logger.debug("atm_iv_from_quotes: parsed json not a dict")
+            return None
+        # Resolve underlying_price: use arg, else from serialized chain
+        underlying = float(underlying_price or 0)
+        if underlying <= 0:
+            raw = data.get("underlying_price")
+            if raw is not None:
+                try:
+                    underlying = float(raw)
+                except (TypeError, ValueError):
+                    pass
+        if underlying <= 0:
+            logger.debug("atm_iv_from_quotes: underlying_price missing or 0 (arg=%s)", underlying_price)
             return None
         # Top-level atm_iv from serialized OptionChainSnapshotEvent
         top = data.get("atm_iv")
@@ -70,6 +90,7 @@ def _atm_iv_from_quotes_json(quotes_json: str, underlying_price: float) -> Optio
             return float(top)
         puts = data.get("puts") or []
         if not puts:
+            logger.debug("atm_iv_from_quotes: no puts in chain")
             return None
         timestamp_ms = int(data.get("timestamp_ms") or 0)
         expiration_ms = int(data.get("expiration_ms") or 0)
@@ -87,13 +108,14 @@ def _atm_iv_from_quotes_json(quotes_json: str, underlying_price: float) -> Optio
                 continue
             try:
                 s = float(strike)
-                dist = abs(s - underlying_price)
+                dist = abs(s - underlying)
                 if dist < best_dist:
                     best_dist = dist
                     best_put = q
             except (TypeError, ValueError):
                 continue
         if not best_put:
+            logger.debug("atm_iv_from_quotes: no valid put with strike (puts=%d)", len(puts))
             return None
         # Prefer provider iv on the ATM put
         iv = best_put.get("iv")
@@ -111,8 +133,17 @@ def _atm_iv_from_quotes_json(quotes_json: str, underlying_price: float) -> Optio
                 s = float(strike)
             except (TypeError, ValueError):
                 continue
-            if (q.get("iv") and float(q.get("iv") or 0) > 0) or float(q.get("mid") or 0) > 0 or float(q.get("last") or 0) > 0 or (float(q.get("bid") or 0) > 0 or float(q.get("ask") or 0) > 0):
-                others_with_price.append((abs(s - underlying_price), q))
+            try:
+                iv_ok = q.get("iv") and float(q.get("iv") or 0) > 0
+                mid_ok = float(q.get("mid") or 0) > 0
+                last_ok = float(q.get("last") or 0) > 0
+                bid_ok = float(q.get("bid") or 0) > 0
+                ask_ok = float(q.get("ask") or 0) > 0
+                has_price = iv_ok or mid_ok or last_ok or bid_ok or ask_ok
+            except (TypeError, ValueError):
+                has_price = False
+            if has_price:
+                others_with_price.append((abs(s - underlying), q))
         others_with_price.sort(key=lambda x: x[0])
         candidates: List[Dict[str, Any]] = [best_put] + [q for _, q in others_with_price]
         for put in candidates:
@@ -146,14 +177,20 @@ def _atm_iv_from_quotes_json(quotes_json: str, underlying_price: float) -> Optio
                         kwargs["bid"] = float(bid)
                         kwargs["ask"] = float(ask)
                     iv_val, _ = engine.implied_volatility(
-                        mid_or_last, underlying_price, K, T_years, "put", **kwargs
+                        mid_or_last, underlying, K, T_years, "put", **kwargs
                     )
                     if iv_val and iv_val > 0:
                         return iv_val
-                except Exception:
+                except Exception as e:
+                    logger.debug("atm_iv_from_quotes: GreeksEngine failed for put K=%s: %s", put.get("strike"), e)
                     continue
+        logger.debug(
+            "atm_iv_from_quotes: no usable iv/bid_ask/mid on any put; puts=%d best_put_keys=%s",
+            len(puts), list(best_put.keys()) if best_put else [],
+        )
         return None
-    except (json.JSONDecodeError, TypeError):
+    except (json.JSONDecodeError, TypeError) as e:
+        logger.debug("atm_iv_from_quotes: parse/type error: %s", e)
         return None
 
 

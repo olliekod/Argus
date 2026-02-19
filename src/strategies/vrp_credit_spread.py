@@ -67,6 +67,8 @@ def _derive_iv_from_quotes(snapshot: Any) -> Optional[float]:
             underlying = snapshot.underlying_price
         elif isinstance(snapshot, dict):
             underlying = snapshot.get("underlying_price")
+        if not underlying or float(underlying or 0) <= 0:
+            underlying = quotes.get("underlying_price")
 
         try:
             underlying = float(underlying)
@@ -75,30 +77,71 @@ def _derive_iv_from_quotes(snapshot: Any) -> Optional[float]:
         if not underlying or underlying <= 0:
             return None
 
-        # Find closest-to-ATM put with a usable bid/ask (coerce to float for JSON string values)
+        # Find closest-to-ATM put with usable price (prefer iv, then bid/ask, then mid/last)
         best = None
         best_dist = float("inf")
         for p in puts:
             try:
                 strike = p.get("strike")
-                bid = p.get("bid")
-                ask = p.get("ask")
-                if strike is None or bid is None or ask is None:
+                if strike is None:
                     continue
                 strike = float(strike)
-                bid = float(bid)
-                ask = float(ask)
             except (TypeError, ValueError):
                 continue
             dist = abs(strike - underlying)
-            if dist < best_dist and bid > 0 and ask > 0:
-                best_dist = dist
-                best = p
+            if dist >= best_dist:
+                continue
+            # Prefer put with iv > 0 (direct from provider)
+            put_iv = p.get("iv")
+            if put_iv is not None:
+                try:
+                    iv_f = float(put_iv)
+                    if iv_f > 0 and 0.005 <= iv_f <= 5.0:
+                        best_dist = dist
+                        best = p
+                        continue
+                except (TypeError, ValueError):
+                    pass
+            bid = p.get("bid")
+            ask = p.get("ask")
+            if bid is not None and ask is not None:
+                try:
+                    bid_f, ask_f = float(bid), float(ask)
+                    if bid_f > 0 and ask_f > 0:
+                        best_dist = dist
+                        best = p
+                        continue
+                except (TypeError, ValueError):
+                    pass
 
         if best is None:
             return None
 
-        mid = (float(best["bid"]) + float(best["ask"])) / 2.0
+        # Use iv if present, else bid/ask mid, else mid/last for approximation
+        put_iv = best.get("iv")
+        if put_iv is not None:
+            try:
+                iv_f = float(put_iv)
+                if 0.005 <= iv_f <= 5.0:
+                    return round(iv_f, 6)
+            except (TypeError, ValueError):
+                pass
+        bid, ask = best.get("bid"), best.get("ask")
+        if bid is not None and ask is not None:
+            try:
+                mid = (float(bid) + float(ask)) / 2.0
+            except (TypeError, ValueError):
+                mid = None
+        else:
+            mid = None
+        if mid is None or mid <= 0:
+            mid = best.get("mid") or best.get("last")
+            try:
+                mid = float(mid) if mid is not None else None
+            except (TypeError, ValueError):
+                mid = None
+        if mid is None or mid <= 0:
+            return None
         strike = float(best["strike"])
         # Rough Brenner-Subrahmanyam approximation:  IV ≈ mid / (0.4 * S * sqrt(T))
         # Assume ~14 DTE (0.038 years) if not provided.
@@ -230,6 +273,7 @@ class VRPCreditSpreadStrategy(ReplayStrategy):
         self._logged_no_iv = False
         self._logged_no_rv = False
         self._logged_vrp_or_regime = False
+        self._logged_gating = False
 
     @property
     def strategy_id(self) -> str:
@@ -298,6 +342,14 @@ class VRPCreditSpreadStrategy(ReplayStrategy):
                         "trend": trend,
                     }
                 ))
+
+        if self.last_iv is not None and not intents and not self._logged_gating:
+            self._logged_gating = True
+            min_vrp = self._thresholds.get("min_vrp", 0.05)
+            logger.warning(
+                "VRP gating: vrp=%.4f (need>%.2f) vol=%s trend=%s rv=%s",
+                vrp, min_vrp, vol, trend, self.last_rv,
+            )
 
         return intents
 

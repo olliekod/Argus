@@ -2254,10 +2254,7 @@ class Database:
                         WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_drawdown
                         ELSE bar_outcomes.max_drawdown
                     END,
-                    realized_vol = CASE
-                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.realized_vol
-                        ELSE bar_outcomes.realized_vol
-                    END,
+                    realized_vol = excluded.realized_vol,
                     max_high_in_window = CASE
                         WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_high_in_window
                         ELSE bar_outcomes.max_high_in_window
@@ -2354,10 +2351,7 @@ class Database:
                         WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_drawdown
                         ELSE bar_outcomes.max_drawdown
                     END,
-                    realized_vol = CASE
-                        WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.realized_vol
-                        ELSE bar_outcomes.realized_vol
-                    END,
+                    realized_vol = excluded.realized_vol,
                     max_high_in_window = CASE
                         WHEN bar_outcomes.status = 'INCOMPLETE' THEN excluded.max_high_in_window
                         ELSE bar_outcomes.max_high_in_window

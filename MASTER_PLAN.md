@@ -8,9 +8,10 @@ This document is the **single source of truth** for Argus: vision, current state
 
 **Alpha** is the GPU engine: Heston-model Monte Carlo Probability of Profit (PoP) and IV surface anomaly detection. These are sophisticated, proprietary outputs that are safer to sell than raw price feeds.
 
-**Terminology (for implementers):** In this document, **“Monte Carlo”** and **“MC”** appear in two distinct contexts. Do not conflate them:
-- **GPU / Heston Monte Carlo** (Vision, §1): Options pricing and PoP — `gpu_engine.monte_carlo_pop_heston()`, etc. Used for alpha product (IV surface, probability of profit). Not used for strategy selection or robustness.
-- **MC / bootstrap in research (Phase 4C, §8):** Robustness and kill logic only. **Not** option pricing, not Heston, not random market simulation. It **is** Monte Carlo over **realized trades or PnL paths** from replay:
+**Terminology (for implementers):** In this document, **“Monte Carlo”** and **“MC”** appear in three distinct contexts. Do not conflate them:
+- **GPU / Heston Monte Carlo (alpha product)** — Options pricing and PoP — `gpu_engine.monte_carlo_pop_heston()`, etc. Used for alpha product (IV surface, probability of profit). Not used for strategy selection or robustness.
+- **Heston / PoP in risk engine (Phase 5)** — Permitted use for **options-tail scenario evaluation** and **risk sizing**: estimating distribution of underlying moves + IV dynamics for tail outcomes, spread sizing, scenario stress. This is distinct from both (a) alpha product and (b) Phase 4C MC/bootstrap. Implementers: use Heston/PoP for risk-engine scenario modeling where appropriate; do not confuse with trade-resampling robustness.
+- **MC / bootstrap in research (Phase 4C, §8)** — Robustness and kill logic only. **Not** option pricing, not Heston scenario modeling, not random market simulation. It **is** Monte Carlo over **realized trades or PnL paths** from replay:
   - **Monte Carlo (MC):** Take the historical trade list or PnL path from a replay run; generate many alternative paths by **resampling or reordering** those trades. From the distribution of paths, compute max drawdown distribution, ruin probability, worst-case paths, stability of returns. **Goal:** Kill strategies whose success depends on lucky sequencing.
   - **Bootstrap (preferred for trading):** Same idea but **block sampling** (e.g. stationary bootstrap of trade sequences), not iid resampling. Preserves volatility clusters, regime runs, and crash sequences for more realistic stress. Implement in `experiment_runner` / `regime_stress` / `strategy_evaluator` path.
   - **Regime-stress** (complement): Run replay per regime bucket; kill if strategy collapses in too many buckets. See §8.2b.
@@ -39,6 +40,8 @@ flowchart LR
 
 - **Trading pipeline:** Markets → clean ingestion → features & regimes → strategies → signal aggregation → risk engine → capital allocation → execution → profit.
 - **Parallel product:** Argus Intelligence API exposes normalized bars, regimes, options intelligence, spread candidates, and signals for subscription revenue.
+
+**Research power is central.** Research quality, honest replay, and robust evaluation are foundational. Increasing research capability is not secondary—it is upstream of performance, allocation, and deployment. Everything downstream depends on strong research and honest evaluation.
 
 ---
 
@@ -81,7 +84,17 @@ flowchart LR
 
 ---
 
-## 3. Roadmap (Phases 0–10)
+## 3. Roadmap (Phases 0–15)
+
+### Execution sequence
+
+```
+[Phase 5 prelude done] → Phase 5 full (complete, comprehensive) → Phase 11 LLM agents → Phases 12–15
+```
+
+Phases 6–10 remain in the roadmap but are **deferred** until after Phases 11–15. Execute in the order above. Phase 5 must be completed in its entirety before Phase 11.
+
+### Phase table
 
 | Phase | Goal | Status | Deliverable |
 |-------|------|--------|-------------|
@@ -94,14 +107,19 @@ flowchart LR
 | **4A** | Outcome engine | Done | Forward returns, run-up, drawdown, multi-horizon outcomes, outcome DB storage, deterministic backfills. |
 | **4B** | Backtesting engine | Done | Replay harness, position simulator, entry/exit modeling, transaction costs, slippage (conservative execution model). |
 | **4C** | Parameter search & robustness lab | **Done** | Parameter sweeps (incl. **auto parameter grid**: sweep YAML range specs, `expand_sweep_grid`, `config/vrp_sweep.yaml`); regime sensitivity scoring; parameter stability auto-kill; MC/bootstrap on realized trades; regime-subset stress; Strategy Research Loop. Deploy gates done: DSR, Reality Check, slippage sensitivity. |
-| **5** | Portfolio risk engine | **Prelude done** | Sizing stack (Forecast, fractional Kelly, vol target, options contracts), StrategyRegistry, AllocationEngine. **Full Phase 5 (future):** Exposure limits, correlation, drawdown containment, strategy budgets. Black–Scholes (or existing Greeks): delta/vega for exposure and implementation shortfall, not a separate phase. |
-| **6** | Execution engine | Future | Broker integration, order routing, fill simulation, paper then live trading. TCA ledger (decision price, arrival, NBBO, executed, spread paid). |
-| **7** | Strategy expansion | Future | Put spread selling, volatility plays, panic snapback, FVG, session momentum, crypto–ETF relationships, Polymarket. |
-| **8** | Portfolio intelligence | Future | Strategy aggregation, signal voting, dynamic allocation, regime-based capital shifts. **StrategyLeague** (tournament allocator): eligibility gate, smoothed weight updates, degradation detector, kill/quarantine; allocate from health metrics not raw short-run PnL. |
-| **9** | Intelligence API product | Future | Expose bars, regimes, options intelligence, spread candidates, signals for subscription revenue. |
-| **10** | Self-improving system | Future | Automatic idea testing, strategy mutation, performance pruning, adaptive weighting. |
+| **5** | Portfolio risk engine | **Prelude done** | Sizing stack (Forecast, fractional Kelly, vol target, options contracts), StrategyRegistry, AllocationEngine. **Phase 5 full (comprehensive):** Portfolio risk budgeting; correlation-aware exposure control (rolling correlation matrix, cluster caps); drawdown containment and dynamic risk throttles; concentration constraints (delta/vega/gamma caps per underlying and portfolio); tail-risk/scenario layer using Heston/PoP for options spread risk where appropriate; risk attribution reporting; Integration with AllocationEngine (propose → risk engine clamps → final allocations + clamp reasons). Black–Scholes/Greeks for exposure and implementation shortfall; Heston-based scenario/PoP for options-tail risk and spread sizing where applicable. See Phase 5 Full: Risk Engine Requirements (§9). |
+| **6** | Execution engine | Future (deferred) | Broker integration, order routing, fill simulation, paper then live trading. TCA ledger (decision price, arrival, NBBO, executed, spread paid). |
+| **7** | Strategy expansion | Future (deferred) | Put spread selling, volatility plays, panic snapback, FVG, session momentum, crypto–ETF relationships, Polymarket. |
+| **8** | Portfolio intelligence | Future (deferred) | Strategy aggregation, signal voting, dynamic allocation, regime-based capital shifts. **StrategyLeague** (tournament allocator): eligibility gate, smoothed weight updates, degradation detector, kill/quarantine; allocate from health metrics not raw short-run PnL. |
+| **9** | Intelligence API product | Future (deferred) | Expose bars, regimes, options intelligence, spread candidates, signals for subscription revenue. |
+| **10** | Self-improving system | Future (deferred) | Automatic idea testing, strategy mutation, performance pruning, adaptive weighting. |
+| **11** | LLM agents | **Future (ASAP after Phase 5 full)** | Jarvis (interactive ops copilot) and Research Proposer (autonomous hypothesis generator). Tool API + RBAC + audit; ManifestValidator; DSL schema; experiment_backlog, tool_audit_log. **Modular discoverability:** agents use a tool registry and schemas; when new modules (HMM, risk sizing, reports) are added, they register tools and agents automatically gain access—no retraining or manual catch-up beyond config/tool registration. No arbitrary code execution; no broker access. See §8.6. |
+| **12** | Manifest execution & research engine | Future | DSLStrategy; research_engine (poll backlog, multiprocessing, single-writer, backpressure); evaluator hardening (purge/embargo, CorrelationCheck, discovery tax, rejection_packet). |
+| **13** | Extended sweep grids | Future | HighVol sweep (`config/high_vol_sweep.yaml`); VRP max_vol_regime extension; Overnight min_global_risk_flow, min_news_sentiment. See [PLAN_EXTENDED_SWEEP_GRIDS.md](docs/PLAN_EXTENDED_SWEEP_GRIDS.md). |
+| **14** | News features & HMM regime | Future | NewsAPI ingestion; HMM regime layer (regime committee member, K=4, daily, 5–10y rolling); hmm_model_snapshots, hmm_regime_series. |
+| **15** | Promotion pipeline formalization | Future | Stages: Proposed → Backtest-Passed → Paper-Trading → Shadow-Live → Production-Eligible. Researcher cannot promote; only Argus logic. |
 
-**Where we are now:** Phase 4C including deploy gates and **auto parameter grid** (sweep range expansion, `config/vrp_sweep.yaml`) is done. Phase 5 prelude (sizing, registry, allocation engine, research–allocation loop, max_loss_per_contract) is done. IV consolidation is done. **Global risk flow** is implemented (computation, DB-only updater, regime merge, replay injection, overnight gating). **Overnight Session Strategy Phase 2 (Data Enhancement) is COMPLETE** (2026-02-17): E2E verification tests (`tests/test_phase2_e2e.py`, 30 tests) confirm replay pack injection, strategy gating, harness integration, and deterministic behavior. **Alpaca = bars/outcomes only** is enforced (no IV/options from Alpaca; data_sources allowed options providers = tastytrade, public). P1/P2 audit items (10.2, 10.4, 10.7, 10.8) verified. Sprint 2 E2E check done; secrets path in tests uses `config/secrets.yaml`. **Next:** See §8.4 (Your next steps, Claude recommendation).
+**Where we are now:** Phase 4C including deploy gates and **auto parameter grid** (sweep range expansion, `config/vrp_sweep.yaml`) is done. Phase 5 prelude (sizing, registry, allocation engine, research–allocation loop, max_loss_per_contract) is done. IV consolidation is done. **Global risk flow** is implemented (computation, DB-only updater, regime merge, replay injection, overnight gating). **Overnight Session Strategy Phase 2 (Data Enhancement) is COMPLETE** (2026-02-17): E2E verification tests (`tests/test_phase2_e2e.py`, 30 tests) confirm replay pack injection, strategy gating, harness integration, and deterministic behavior. **Alpaca = bars/outcomes only** is enforced (no IV/options from Alpaca; data_sources allowed options providers = tastytrade, public). P1/P2 audit items (10.2, 10.4, 10.7, 10.8) verified. Sprint 2 E2E check done; secrets path in tests uses `config/secrets.yaml`. **Next:** Phase 5 full (complete, comprehensive portfolio risk engine), then Phase 11 LLM agents. See §8.4.
 
 ---
 
@@ -158,7 +176,7 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 | Method | Role | Priority / caution |
 |-------|------|---------------------|
 | **BOCPD (Bayesian Online Change-Point Detection)** | Universal regime-switch primitive; gate premium-selling when P(change) &lt; x and vol regime stable; adaptive lookback from run length. | **Implement first.** Highest signal-to-complexity; addresses regime shifts (existential risk when selling spreads). |
-| **Markov / HMM regime switching** | Classify state (low-vol grind, high-vol trend, chop); map states → allowed strategy families. | Use as **one vote** among features; require confirmation from vol + microstructure; not sole driver. |
+| **Markov / HMM regime switching** | Classify state (low-vol grind, high-vol trend, chop); map states → allowed strategy families. | Use as **one vote** among features; require confirmation from vol + microstructure; not sole driver. **Implementation:** Phase 14 — `regime/hmm_regime.py`, `regime/hmm_updater.py`; HMM as regime committee member; optional DSL exposure (`regime.hmm.state`, `regime.hmm.p_crisis`, `regime.hmm.entropy`). MVP: K=4, daily, 5–10y rolling window. After BOCPD. See §8.6. |
 | **Hawkes / self-exciting order flow** | Microstructure “risk-on / risk-off”; shock detector; execution risk (slippage, adverse selection). | Optional until tape / order-flow depth; needs high-frequency prints. |
 | **Signature transform** | Path features for regime/trend/chop classification; feed into regime gate or position sizing. | Phase 2/3; implementation complexity and overfit risk. |
 | **Multifractal (MFDFA etc.)** | Risk filter: unstable scaling → reduce size / stop selling premium. | Slow-moving; weekly/monthly risk posture rather than intraday trigger. |
@@ -168,6 +186,7 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 
 ## 6. Principles (Non-Negotiables)
 
+- **Research power is foundational.** Research quality, honest replay, and robust evaluation are first-order priorities. Strong research and honest evaluation are upstream of performance, allocation, and deployment. We are not “moving away” from research power.
 - **Avoid noise bars.** Not all bars are equal; prefer volume/information bars and regime filtering; event-driven bars matter for feature engineering.
 - **Replay must be honest.** No mid-price fills, no lookahead bias, no optimistic fills; execution model must be pessimistic.
 - **Determinism.** Same input → same output for all systems (bars, indicators, regimes, signals, outcomes).
@@ -240,10 +259,10 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 
 - **Strategy allocation engine (StrategyLeague)** — **Minimal allocation engine — Done.** `StrategyRegistry`, `AllocationEngine`, `AllocationConfig`; consumes `Forecast` list, outputs target weights/contracts with per-play cap (7%) and aggregate cap. **Still to do (StrategyLeague):** capital competition, smoothed weight updates, degradation detector, eligibility gate in production loop.
 - **Strategy lifecycle & kill engine** — Rolling performance metrics, degradation detection, quarantine, automatic strategy death when edge disappears. Kill triggers: rolling expectancy beyond confidence bounds, slippage/lag spikes, drawdown regime breach, data distribution shift.
-- **Portfolio risk engine** — Exposure limits, correlation control, risk budgeting, drawdown containment. **Per-play cap:** e.g. ≤7% of equity per play (one position or correlated cluster); portfolio caps for sector/underlying/vega concentration. Required before safe live deployment. Tests: e.g. test_risk_caps.py (allocator clamps when multiple signals try to exceed caps).
+- **Portfolio risk engine (Phase 5 full)** — Comprehensive scope: portfolio risk budgeting; correlation-aware exposure control (rolling correlation matrix, cluster caps); drawdown containment and dynamic risk throttles; concentration constraints (delta/vega/gamma caps); tail-risk/scenario layer (Heston/PoP where appropriate); risk attribution reporting; AllocationEngine integration. **Per-play cap:** e.g. ≤7% of equity per play; portfolio caps for sector/underlying/vega concentration. Required before safe live deployment. See §9.9.
 - **Sizing engine (Phase 1)** — **Done.** `sizing.py`: Forecast, `fractional_kelly_size`, `vol_target_overlay`, `contracts_from_risk_budget`, `shrink_mu`, `size_position`. Quarter-Kelly, caps, vol target, confidence shrinkage. **Phase 2–3** (covariance shrinkage, portfolio risk budgeting) remains future.
 - **Sizing engine (Phase 2–3)** — Covariance shrinkage and portfolio risk budgeting; then drawdown probability constraints and ES monitoring. Two allocators: simple vol-scaling/risk-budget baseline; shrinkage-covariance allocator for multi-strategy. Tests: test_allocator_numerics.py (PSD covariance, weight sum constraints).
-- **Black–Scholes / Greeks usage** — Use for risk (delta/vega, max vega per underlying), IV/VRP inputs (already in use), and implementation shortfall (decision vs execution). Not a separate phase; part of execution and risk caps.
+- **Black–Scholes / Greeks usage** — Use for risk (delta/vega, max vega per underlying), IV/VRP inputs (already in use), and implementation shortfall (decision vs execution). **Heston/PoP in risk engine:** For options-tail scenario evaluation and spread sizing where appropriate; distinct from Phase 4C MC/bootstrap. Part of Phase 5 full.
 - **Live vs backtest drift monitor** — Compare live fills vs simulated; detect slippage drift and execution degradation. Alert if realized slippage exceeds backtest assumption by Yσ → quarantine strategy.
 - **Strategy health monitoring** — Rolling performance, degradation alerts, quarantine engine.
 - **Cross-strategy correlation analysis** — Correlation tracking and capital diversification enforcement.
@@ -273,14 +292,18 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 
 **Your next steps (prioritized)**
 
-1. **Ongoing research (continuous)**
+1. **Phase 5 full (complete, comprehensive)** — Complete the portfolio risk engine in its entirety: portfolio risk budgeting; correlation-aware exposure control; drawdown containment and dynamic risk throttles; concentration constraints (delta/vega/gamma caps); tail-risk/scenario layer (Heston/PoP where appropriate); risk attribution reporting; AllocationEngine integration. See Phase 5 Full: Risk Engine Requirements (§9.9).
+
+2. **Phase 11 — LLM agents (ASAP after Phase 5 full)** — Implement Jarvis and Research Proposer; tool API + RBAC + audit; ManifestValidator; DSL schema; experiment_backlog, tool_audit_log. See §8.6.
+
+3. **Ongoing research (continuous)**
    Run the research engine: VRP sweeps (`config/vrp_sweep.yaml`), **overnight experiments** (`config/overnight_sweep.yaml`, now including `gate_on_risk_flow` sweep). Document findings; feed into strategy priority and allocation design.
 
-2. **Optional follow-ups (good next Claude tasks)**
+4. **Optional follow-ups (deferred)**
+   - **Phases 6–10:** Execution engine, strategy expansion, portfolio intelligence, API product, self-improving system — deferred until after Phases 11–15.
+   - **Phase 13 (Extended sweeps):** HighVol sweep, VRP/Overnight extensions — quick follow-up after LLM. See [PLAN_EXTENDED_SWEEP_GRIDS.md](docs/PLAN_EXTENDED_SWEEP_GRIDS.md).
    - **P2/P3 audit:** 10.5 (bar lock/fsync), 10.6 (DXLink error handling), 10.9 (VRP RV validation), etc.
    - **Execution/slippage roadmap** (§8.4 below): paper broker interface, independent slippage measurement, backtest calibration loop.
-   - **Phase 5 full:** Portfolio risk engine (exposure limits, correlation, drawdown containment).
-   - **Optional Overnight config:** Add global ETFs to Alpaca/Yahoo configs if intraday data needed; enable `gate_on_risk_flow: true` as default after research confirms value.
 
 ---
 
@@ -288,7 +311,7 @@ Raw market data → Features (session returns, FX moves, vol, global risk flow) 
 
 Past implementations (auto parameter grid, Alpaca policy, research–allocation loop, P1/P2 audit, **Overnight Phase 1 and Phase 2**) are in place and verified. **Solidifying is in good shape.**
 
-**Best use of Claude now:** Pick one of: **Phase 5 full** (portfolio risk engine), **execution/slippage measurement** (paper broker + slippage capture), or **P2/P3 audit items**. All are larger and less bounded; Phase 5 is the most impactful for live deployment readiness.
+**Best use of Claude now:** **Phase 5 full (complete, comprehensive)** first; then **Phase 11 (LLM agents)** after Phase 5. Phases 6–10 are deferred. Extended sweeps (Phase 13) are a follow-up after LLM.
 
 ---
 
@@ -308,7 +331,7 @@ Use the research engine to prove edge: VRP experiments (IBIT/SPY/QQQ), Overnight
 
 **3) Future phases (separate plans when prioritized)**
 
-- **Portfolio risk engine (Phase 5 full):** Exposure limits, correlation, drawdown containment, cov shrinkage, portfolio vol target.
+- **Portfolio risk engine (Phase 5 full):** Comprehensive scope per §9.9 — portfolio risk budgeting, correlation-aware exposure control, drawdown containment, concentration constraints, tail-risk/scenario layer (Heston/PoP), risk attribution, AllocationEngine integration.
 - **Strategy lifecycle:** Rolling health, degradation detection, quarantine/kill.
 - **Live vs backtest drift monitor:** Slippage drift alerts.
 - **StrategyLeague enhancements:** Capital budgeting, diversity-aware ranking, lifecycle integration.
@@ -346,6 +369,41 @@ Discovery and deployment follow a single pipeline. Each stage has contracts and 
 
 **Non-negotiable invariants (auto-fail):** No lookahead; no trade on incomplete snapshots/greeks; no deployment if cost sensitivity shows edge disappears at reasonable slippage; no strategy receives allocation if it violates risk caps (including per-play ≤ 7%); no allocation change exceeds X% per rebalance (anti-churn).
 
+### 8.6 LLM agents and research automation (Phases 11–15)
+
+Two cooperating LLM-driven subsystems: **Argus Jarvis** (interactive ops copilot) and **Argus Researcher** (autonomous hypothesis generator). Both use an audited tool surface; neither has arbitrary code execution or broker access. Argus remains the deterministic judge and executor.
+
+**Modular discoverability:** A tool registry + schemas define capabilities. When new modules are added (HMM, risk sizing improvements, new reports), agents gain access by registering new tools—no retraining required, no manual catch-up beyond config/tool registration. The system is modular so adding components later is low-catchup for the agents; tools and capabilities are discoverable, not “learned.”
+
+**Tooling contract:**
+- Tools must be allowlisted (no arbitrary code paths).
+- Strict input/output schemas (JSON/Pydantic) for every tool.
+- RBAC enforced per tool category.
+- Every tool call audited.
+
+**Phase 11 — LLM agents (ASAP after Phase 5 full):**
+- **Jarvis:** CLI `argus ask "..."`; answers questions via allowlisted tools; limited controls (pause/resume research, set worker limit, run backfill) with confirm-by-default.
+- **Research Proposer:** Reads experiment results and rejection packets; writes experiment manifests to backlog; learns by iteration; proposal rate tied to throughput; ablation discipline.
+- **Tool API + RBAC:** `tool_api/` — tools_ops_read, tools_ops_control, tools_research; roles: jarvis_ops, researcher, human_admin; every call audited.
+- **ManifestValidator:** Rejects unauthorized data sources, unsupported transforms, invalid lookback, future bias; returns structured rejection reasons for Proposer learning.
+- **DSL schema:** Manifest structure (universe, features, signal_logic, risk_model, execution_model, evaluation_config, data_dependencies, as_of rules). Manifest DSL is mandatory; no Python file writing.
+- **Tables:** experiment_backlog, tool_audit_log, rejection_packets.
+
+**Invariants:**
+- Manifest DSL mandatory; no arbitrary code execution; no broker access.
+- Role-based permissions: Jarvis = read + limited control; Researcher = read + write proposals only (no control, no promotion).
+- Every tool call is audited.
+
+**Phase 12 — Manifest execution:** DSLStrategy, research_engine (poll backlog, multiprocessing, single-writer, backpressure), evaluator hardening (purge/embargo, CorrelationCheck, discovery tax).
+
+**Phases 13–15:** Extended sweep grids, News features + HMM regime layer, promotion pipeline formalization.
+
+**Operational risks:**
+- **SQLite write contention:** Single-writer pattern or result ingestion queue; batching; strict transaction scope; WAL tuning.
+- **Overfitting explosion:** Multiple-testing discovery tax; walk-forward + purge/embargo; stability checks; correlation checks; paper-trading gating.
+
+See [docs/PLAN_EXTENDED_SWEEP_GRIDS.md](docs/PLAN_EXTENDED_SWEEP_GRIDS.md) for sweep details and HMM placement.
+
 ---
 
 ## 9. Alpha, Sizing, and Deployment (Lessons)
@@ -370,8 +428,10 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 - **Layer A — Forecast normalization:** Standard object per instrument: μ̂, σ̂, edge_score, cost_hat, confidence so all strategies speak a common language.
 - **Layer B — Single-instrument sizing:** Fractional Kelly (e.g. f = c·μ/σ², c ∈ [0.10, 0.50]); vol-target overlay (weight ∝ target_vol/σ); clip to ±w_max. **Quarter-Kelly (c ≈ 0.25)** is the standard conservative choice for automated deployment; treat full Kelly as upper bound only.
 - **Layer C — Estimation error:** Shrink μ toward 0 by confidence; use covariance shrinkage for multi-asset; fractional Kelly + shrinkage + caps in practice.
-- **Layer D — Portfolio sizing:** Correlation-aware risk budgeting; gross and per-instrument caps; vol-target the portfolio.
+- **Layer D — Portfolio sizing:** Correlation-aware risk budgeting (multi-strategy, multi-asset); gross and per-instrument caps; vol-target the portfolio; portfolio-level constraints.
 - **Layer E — Hard risk constraints:** Drawdown-aware guardrails; kill-switch (scale exposure when realized drawdown > D). ES/CVaR as monitor first, not primary optimizer.
+- **Layer F — Greek / concentration limits:** Delta/vega/gamma caps per underlying and portfolio; options-specific `max_loss_per_contract` (exists); portfolio greek limits.
+- **Layer G — Scenario / tail layer:** Heston-model scenario and PoP outputs for options spread risk where appropriate (tail outcomes, IV dynamics); distinct from Phase 4C MC/bootstrap (trade resampling). Deterministic; uses only information available at decision time.
 - **Options spreads:** Size by risk budget: contracts = ⌊ risk_budget_usd / max_loss_per_contract ⌋; risk_budget_usd from portfolio-level sizing.
 
 ### 9.4 Things that kill trading systems
@@ -416,6 +476,20 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 6. Live execution  
 7. Strategy expansion  
 
+### 9.9 Phase 5 Full: Risk Engine Requirements
+
+The comprehensive portfolio risk engine (Phase 5 full) includes:
+
+- **Portfolio risk budgeting** — Multi-strategy, multi-asset; covariance-aware capital allocation.
+- **Correlation-aware exposure control** — Rolling correlation matrix; clustering; caps per cluster and per underlying.
+- **Drawdown containment** — Portfolio-level drawdown guardrails; dynamic risk throttles (e.g., reduce risk when drawdown > threshold).
+- **Concentration constraints** — Delta/vega/gamma caps per underlying and portfolio; options-specific `max_loss_per_contract` (exists); extend with portfolio greek limits.
+- **Tail-risk / scenario layer** — Incorporate Heston-model scenario / PoP outputs for options spread risk where appropriate (e.g., estimating distribution of underlying moves + IV dynamics for tail outcomes). **Distinct from Phase 4C MC/bootstrap** (trade resampling); do not conflate.
+- **Risk attribution reporting** — Per-strategy and portfolio risk contributions; “why risk was reduced” logs/artifacts.
+- **Integration with AllocationEngine** — Allocator proposes weights/contracts; risk engine clamps/adjusts to satisfy constraints; outputs final allocations + “clamp reasons” artifact for audit.
+
+**Modules (if exist):** `sizing.py`, `allocation_engine.py`, `strategy_registry.py`. TODO: `risk_engine.py` (or equivalent), correlation/clustering module, scenario/tail-risk layer, clamp-reason persistence.
+
 ---
 
 ## 10. References
@@ -427,6 +501,7 @@ Condensed from systematic-trading practice and sizing/risk discussions. Use for 
 | [scripts/verify_vrp_replay.py](scripts/verify_vrp_replay.py) | Sprint 2 E2E verifier: build pack, run VRP replay, print counts; exit 1 with diagnostics when trade_count is zero. |
 | [docs/NEXT_STEPS_IMPLEMENTATION_PLAN.md](docs/NEXT_STEPS_IMPLEMENTATION_PLAN.md) | Concrete implementation plan for research–allocation loop, P1/P2 audit, verification summary. |
 | [docs/PLAN_AUTO_PARAMETER_GRID.md](docs/PLAN_AUTO_PARAMETER_GRID.md) | Auto parameter grid (sweep range expansion): completion summary and verification. |
+| [docs/PLAN_EXTENDED_SWEEP_GRIDS.md](docs/PLAN_EXTENDED_SWEEP_GRIDS.md) | Extended sweep grids (Phase 13): HighVol, VRP max_vol_regime, Overnight min_global_risk_flow / min_news_sentiment; HMM placement and sweep matrix. |
 | [docs/MEDIUM_TERM_SCOPE.md](docs/MEDIUM_TERM_SCOPE.md) | Medium-term scope (planning only): portfolio risk, strategy lifecycle, drift monitor, StrategyLeague. |
 | [docs/AUDIT_CODEBASE.md](docs/AUDIT_CODEBASE.md) | Full codebase audit: bugs fixed, risks ranked, concrete patch plan (P1–P3). |
 | [docs/strategy_research_loop.md](docs/strategy_research_loop.md) | Strategy Research Loop: quick start, config, outputs, invariants. |

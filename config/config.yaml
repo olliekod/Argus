@@ -50,8 +50,8 @@ logging:
 data_sources:
   bars_primary: "alpaca"
   outcomes_from: "bars_primary"            # always derived from bars_primary
-  options_snapshots_primary: "tastytrade"  # authoritative IV / surface source
-  options_snapshots_secondary: "public"                             # secondary options provider for validation/fallback
+  options_snapshots_primary: "public"     # authoritative IV / Greeks (liquid universe: SPY, QQQ, IBIT, etc.)
+  options_snapshots_secondary: "tastytrade"  # fallback when Public unavailable
   options_stream_primary: "tastytrade_dxlink"
   bars_secondary: "yahoo"                              # optional sanity / backfill
 

@@ -385,9 +385,10 @@ class OutcomeEngine:
                     max_runup = (max_high / close_now) - 1
                     max_drawdown = (min_low / close_now) - 1
                 
-                # Realized volatility (stddev of log returns)
+                # Realized volatility (annualized stddev of log returns)
                 realized_vol = self._compute_realized_vol(
-                    [bar] + future_bars
+                    [bar] + future_bars,
+                    bar_duration_seconds,
                 )
         
         # Quantize all float metrics
@@ -429,8 +430,13 @@ class OutcomeEngine:
             session_regime=session,
         )
     
-    def _compute_realized_vol(self, bars: List[BarData]) -> Optional[float]:
-        """Compute realized volatility as stddev of log returns."""
+    def _compute_realized_vol(
+        self, bars: List[BarData], bar_duration_seconds: int
+    ) -> Optional[float]:
+        """Compute annualized realized volatility as stddev of log returns.
+
+        Returns volatility in same units as IV (annualized decimal, e.g. 0.15 = 15%).
+        """
         if len(bars) < 2:
             return None
         
@@ -443,10 +449,18 @@ class OutcomeEngine:
         if len(log_returns) < 2:
             return None
         
-        # Standard deviation
+        # Per-bar standard deviation
         mean = sum(log_returns) / len(log_returns)
         variance = sum((r - mean) ** 2 for r in log_returns) / (len(log_returns) - 1)
-        return math.sqrt(variance) if variance >= 0 else None
+        vol_per_bar = math.sqrt(variance) if variance >= 0 else None
+        if vol_per_bar is None:
+            return None
+
+        # Annualize: vol_annual = vol_per_bar * sqrt(periods_per_year)
+        # Trading year: 252 days * 6.5h * 3600s = 5896800 seconds
+        periods_per_year = (252 * 6.5 * 3600) / max(1, bar_duration_seconds)
+        annualize_factor = math.sqrt(periods_per_year)
+        return vol_per_bar * annualize_factor
     
     def compute_outcomes_from_bars_sync(
         self,

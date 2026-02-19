@@ -1,11 +1,17 @@
-"""Repeatable E2E replay verifier for VRP strategy.
+"""Repeatable E2E replay verifier for strategies.
 
 Builds a replay pack using the data-source policy (bars_primary, options_snapshots_primary),
-runs VRPCreditSpreadStrategy once, and prints core counts plus an IV diagnostic so you can
-confirm whether IV is actually present in the pack (atm_iv or derivable from quotes).
+runs the selected strategy, and prints core counts plus diagnostics.
+
+Strategies:
+  vrp              - Sell put spreads when VRP > 0, skip VOL_SPIKE (default)
+  high_vol         - Sell premium when VOL_SPIKE or VOL_HIGH
+  overnight_session - Long momentum at session transitions
+  router           - Regime-conditional: picks vrp, high_vol, or overnight based on conditions
 
 When --provider is omitted, uses bars_primary from config (e.g. alpaca).
-Dates: use YYYY-MM-DD (e.g. 2026-02-13). If --start/--end omitted, defaults to today.
+Dates: use YYYY-MM-DD (e.g. 2026-02-13). If --start/--end omitted, defaults to today
+in US Eastern time (so evening ET still uses the current calendar day).
 """
 
 from __future__ import annotations
@@ -16,6 +22,7 @@ import json
 import re
 import sys
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 
 # Add project root to import path for script execution
@@ -24,7 +31,26 @@ sys.path.append(str(Path(__file__).parent.parent))
 from src.core.data_sources import get_data_source_policy
 from src.analysis.experiment_runner import ExperimentConfig, ExperimentRunner
 from src.strategies.vrp_credit_spread import VRPCreditSpreadStrategy
+from src.strategies.high_vol_credit import HighVolCreditStrategy
+from src.strategies.overnight_session import OvernightSessionStrategy
+from src.strategies.regime_conditional import RegimeConditionalStrategy
 from src.tools.replay_pack import create_replay_pack
+
+_STRATEGY_REGISTRY = {
+    "vrp": (VRPCreditSpreadStrategy, {"min_vrp": 0.05}),
+    "high_vol": (HighVolCreditStrategy, {"min_iv": 0.12, "allowed_vol_regimes": ["VOL_SPIKE", "VOL_HIGH"]}),
+    "overnight_session": (OvernightSessionStrategy, {"fwd_return_threshold": 0.005, "horizon_seconds": 14400}),
+    "router": (RegimeConditionalStrategy, {}),
+}
+
+
+def _get_strategy_class_and_params(name: str) -> tuple:
+    entry = _STRATEGY_REGISTRY.get(name)
+    if not entry:
+        valid = ", ".join(_STRATEGY_REGISTRY)
+        raise ValueError(f"Unknown --strategy {name!r}. Valid: {valid}")
+    cls, params = entry
+    return cls, params
 
 
 def _parse_date(s: str) -> str:
@@ -149,9 +175,19 @@ def main() -> int:
     parser.add_argument("--provider", default=None, help="Bars/outcomes provider (default: from data_sources.bars_primary)")
     parser.add_argument("--pack_out", default=None, help="Optional output JSON path for replay pack")
     parser.add_argument("--db", default="data/argus.db", help="Path to argus.db")
+    parser.add_argument("--options-snapshot-fallback", action="store_true",
+        help="Fill primary option snapshots with secondary when gap >= 3m")
+    parser.add_argument("--include-secondary-options", action="store_true",
+        help="Include both primary and secondary option snapshot providers in pack")
+    parser.add_argument("--options-snapshot-gap-minutes", type=int, default=3,
+        help="Gap threshold in minutes for --options-snapshot-fallback (default: 3)")
+    parser.add_argument("--strategy", default="router",
+        choices=list(_STRATEGY_REGISTRY),
+        help="Strategy to run: router (auto by regime), vrp, high_vol, overnight_session (default: router)")
     args = parser.parse_args()
 
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    # Use US Eastern date for "today" so pack date matches trading calendar (e.g. evening ET = still "today")
+    today = datetime.now(ZoneInfo("America/New_York")).strftime("%Y-%m-%d")
     if args.start is None and args.end is None:
         start_date = end_date = today
     elif args.start is not None and args.end is not None:
@@ -177,6 +213,9 @@ def main() -> int:
             output_path=str(pack_path),
             provider=provider,
             db_path=args.db,
+            options_snapshot_fallback=args.options_snapshot_fallback,
+            include_secondary_options=args.include_secondary_options,
+            options_snapshot_gap_minutes=args.options_snapshot_gap_minutes,
         )
     )
 
@@ -212,27 +251,41 @@ def main() -> int:
     outcomes_count = len(pack.get("outcomes", []))
     snapshots_count = len(snapshots)
 
+    strategy_cls, strategy_params = _get_strategy_class_and_params(args.strategy)
+    print(f"Strategy: {args.strategy} ({strategy_cls.__name__})")
     runner = ExperimentRunner(output_dir="logs/experiments")
     result = runner.run(
         ExperimentConfig(
-            strategy_class=VRPCreditSpreadStrategy,
-            strategy_params={"min_vrp": 0.05},
+            strategy_class=strategy_cls,
+            strategy_params=strategy_params,
             replay_pack_paths=[str(pack_path)],
             starting_cash=10_000.0,
         )
     )
     trade_count = int(result.portfolio_summary.get("total_trades", 0))
+    execution = result.execution_summary or {}
+    fills_count = int(execution.get("fills", execution.get("fills_count", 0)))
+    rejects_count = int(execution.get("rejects", execution.get("rejects_count", 0)))
+
+    # Print router breakdown if using regime-conditional
+    if args.strategy == "router" and hasattr(result, "strategy_state"):
+        state = result.strategy_state or {}
+        if "routed_counts" in state:
+            print("Router breakdown:", state["routed_counts"])
 
     print(f"bars_count={bars_count}")
     print(f"outcomes_count={outcomes_count}")
     print(f"snapshots_count={snapshots_count}")
-    print(f"trade_count={trade_count}")
+    print(f"fills_count={fills_count} (open intents filled)")
+    print(f"trade_count={trade_count} (closed positions)")
 
-    if trade_count == 0:
-        print("WARNING: trade_count is 0. Likely reasons:")
+    if fills_count == 0 and trade_count == 0:
+        print("WARNING: no fills and no closed trades. Likely reasons:")
         for reason in _reasons_for_zero_trades(pack, provider):
             print(f"- {reason}")
         return 1
+    if fills_count > 0 and trade_count == 0:
+        print("Note: fills > 0 but trade_count=0 (VRP/HighVol open-only; no CLOSE intents).")
 
     return 0
 

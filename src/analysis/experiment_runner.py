@@ -22,6 +22,8 @@ from src.analysis.replay_harness import (
     ReplayStrategy,
     ReplayResult,
 )
+from src.strategies.vrp_credit_spread import _derive_iv_from_quotes
+from src.tools.replay_pack import _atm_iv_from_quotes_json
 from src.analysis.execution_model import ExecutionModel, ExecutionConfig
 from src.core.outcome_engine import BarData
 from src.core.data_sources import get_data_source_policy
@@ -74,6 +76,7 @@ class ExperimentRunner:
         """Convert replay pack snapshot dicts to MarketDataSnapshot for ReplayHarness.
 
         Passes quotes_json so strategies can derive IV from bid/ask when atm_iv is absent.
+        When pack atm_iv is None/0, attempts derivation so VRP and similar strategies get IV.
         """
         out: List[MarketDataSnapshot] = []
         for s in snapshot_dicts or []:
@@ -87,12 +90,28 @@ class ExperimentRunner:
             qj = s.get("quotes_json")
             if qj is not None and not isinstance(qj, str):
                 qj = json.dumps(qj)
+            atm_iv = ExperimentRunner._float_or_none(s.get("atm_iv"))
+            underlying = float(s.get("underlying_price", 0.0) or 0.0)
+            if underlying <= 0 and qj:
+                try:
+                    data = json.loads(qj) if isinstance(qj, str) else qj
+                    underlying = float(data.get("underlying_price") or 0.0)
+                except (TypeError, ValueError, Exception):
+                    pass
+            if (atm_iv is None or atm_iv <= 0) and qj:
+                derived = _derive_iv_from_quotes(s)
+                if derived is not None and derived > 0:
+                    atm_iv = derived
+                if (atm_iv is None or atm_iv <= 0) and underlying > 0:
+                    fallback_iv = _atm_iv_from_quotes_json(qj, underlying)
+                    if fallback_iv is not None and fallback_iv > 0:
+                        atm_iv = fallback_iv
             out.append(
                 MarketDataSnapshot(
                     symbol=s.get("symbol", "SPY"),
                     recv_ts_ms=recv_ts,
-                    underlying_price=float(s.get("underlying_price", 0.0)),
-                    atm_iv=ExperimentRunner._float_or_none(s.get("atm_iv")),
+                    underlying_price=underlying,
+                    atm_iv=atm_iv,
                     source=s.get("provider", ""),
                     quotes_json=qj,
                 )

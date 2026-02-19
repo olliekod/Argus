@@ -735,6 +735,14 @@ class PersistenceManager:
         import json
         quotes_json = json.dumps(option_chain_to_dict(event), sort_keys=True)
 
+        # Fill atm_iv from quotes when provider did not supply it (e.g. Tastytrade early snapshots)
+        atm_iv = event.atm_iv
+        if (atm_iv is None or (isinstance(atm_iv, (int, float)) and atm_iv <= 0)) and quotes_json:
+            from src.tools.replay_pack import _atm_iv_from_quotes_json
+            derived = _atm_iv_from_quotes_json(quotes_json, event.underlying_price or 0)
+            if derived is not None and derived > 0:
+                atm_iv = derived
+
         max_retries = 3
         for attempt in range(max_retries):
             try:
@@ -745,7 +753,7 @@ class PersistenceManager:
                         expiration_ms=event.expiration_ms,
                         underlying_price=event.underlying_price,
                         n_strikes=event.n_strikes,
-                        atm_iv=event.atm_iv,
+                        atm_iv=atm_iv,
                         timestamp_ms=event.timestamp_ms,
                         source_ts_ms=event.source_ts_ms,
                         recv_ts_ms=event.recv_ts_ms,
