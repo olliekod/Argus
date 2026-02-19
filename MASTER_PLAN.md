@@ -8,10 +8,18 @@ This document is the **single source of truth** for Argus: vision, current state
 
 **Alpha** is the GPU engine: Heston-model Monte Carlo Probability of Profit (PoP) and IV surface anomaly detection. These are sophisticated, proprietary outputs that are safer to sell than raw price feeds.
 
+### 1.1 Compute Infrastructure
+Argus is optimized for high-performance local hardware, leveraging massive GPU parallelization for Heston models and vector discovery.
+- **CPU**: Intel i7-13700K (16 Cores, 3.4 GHz base)
+- **GPU**: NVIDIA RTX 4080 Super (16GB VRAM, primary accelerator for Heston MC, local LLMs, and Vector Synthesis)
+- **Memory**: 64GB DDR5 RAM
+- **Storage**: 2TB NVMe SSD
+- **Thermal**: AIO Liquid Cooling (supporting sustained heavy simulations)
+
 **Terminology (for implementers):** In this document, **“Monte Carlo”** and **“MC”** appear in three distinct contexts. Do not conflate them:
-- **GPU / Heston Monte Carlo (alpha product)** — Options pricing and PoP — `gpu_engine.monte_carlo_pop_heston()`, etc. Used for alpha product (IV surface, probability of profit). Not used for strategy selection or robustness.
-- **Heston / PoP in risk engine (Phase 5)** — Permitted use for **options-tail scenario evaluation** and **risk sizing**: estimating distribution of underlying moves + IV dynamics for tail outcomes, spread sizing, scenario stress. This is distinct from both (a) alpha product and (b) Phase 4C MC/bootstrap. Implementers: use Heston/PoP for risk-engine scenario modeling where appropriate; do not confuse with trade-resampling robustness.
-- **MC / bootstrap in research (Phase 4C, §8)** — Robustness and kill logic only. **Not** option pricing, not Heston scenario modeling, not random market simulation. It **is** Monte Carlo over **realized trades or PnL paths** from replay:
+- **GPU / Heston Monte Carlo (alpha product)** — Options pricing and PoP — `gpu_engine.monte_carlo_pop_heston()`, etc. Runs on the **RTX 4080 Super**. Used for alpha product (IV surface, probability of profit). Not used for strategy selection or robustness.
+- **Heston / PoP in risk engine (Phase 5)** — Permitted use for **options-tail scenario evaluation** and **risk sizing**: estimating distribution of underlying moves + IV dynamics for tail outcomes, spread sizing, scenario stress. Runs on GPU. This is distinct from both (a) alpha product and (b) Phase 4C MC/bootstrap. Implementers: use Heston/PoP for risk-engine scenario modeling where appropriate; do not confuse with trade-resampling robustness.
+- **MC / bootstrap in research (Phase 4C, §8)** — Robustness and kill logic only. CPU-bound. **Not** option pricing, not Heston scenario modeling, not random market simulation. It **is** Monte Carlo over **realized trades or PnL paths** from replay:
   - **Monte Carlo (MC):** Take the historical trade list or PnL path from a replay run; generate many alternative paths by **resampling or reordering** those trades. From the distribution of paths, compute max drawdown distribution, ruin probability, worst-case paths, stability of returns. **Goal:** Kill strategies whose success depends on lucky sequencing.
   - **Bootstrap (preferred for trading):** Same idea but **block sampling** (e.g. stationary bootstrap of trade sequences), not iid resampling. Preserves volatility clusters, regime runs, and crash sequences for more realistic stress. Implement in `experiment_runner` / `regime_stress` / `strategy_evaluator` path.
   - **Regime-stress** (complement): Run replay per regime bucket; kill if strategy collapses in too many buckets. See §8.2b.
@@ -89,10 +97,11 @@ flowchart LR
 ### Execution sequence
 
 ```
-[Phase 5 done] → Phase 11 LLM agents → Phases 12–15
+[Phase 5 done] → Phase 6 Agent Ecosystem (Pantheon) → Phases 7–15
+[Phase 5 prelude done] → Phase 5 full (complete, comprehensive) → Phase 6 Agent Ecosystem (Pantheon) → Phases 7–15
 ```
 
-Phases 6–10 remain in the roadmap but are **deferred** until after Phases 11–15. Execute in the order above.
+Phases 7–11 remain in the roadmap but are **deferred** until after Phase 6. Execute in the order above. Phase 5 must be completed in its entirety before Phase 6.
 
 ### Phase table
 
@@ -108,18 +117,19 @@ Phases 6–10 remain in the roadmap but are **deferred** until after Phases 11�
 | **4B** | Backtesting engine | Done | Replay harness, position simulator, entry/exit modeling, transaction costs, slippage (conservative execution model). |
 | **4C** | Parameter search & robustness lab | **Done** | Parameter sweeps (incl. **auto parameter grid**: sweep YAML range specs, `expand_sweep_grid`, `config/vrp_sweep.yaml`); regime sensitivity scoring; parameter stability auto-kill; MC/bootstrap on realized trades; regime-subset stress; Strategy Research Loop. Deploy gates done: DSR, Reality Check, slippage sensitivity. |
 | **5** | Portfolio risk engine | **Done** | Sizing stack (Forecast, fractional Kelly, vol target, options contracts), StrategyRegistry, AllocationEngine, **RiskEngine** (5-constraint pipeline: aggregate cap → drawdown throttle → correlation/cluster caps → Greek limits → tail-risk Heston/PoP). Modules: `portfolio_state.py`, `drawdown_containment.py`, `correlation_exposure.py`, `greek_limits.py`, `tail_risk_scenario.py`, `risk_attribution.py`, `risk_engine.py`. Invariants: deterministic, monotone, idempotent, no-lookahead. `allocate_with_risk_engine()` integration; research loop wiring; config via `RiskEngineOpts`. 75 tests. See §9.9. |
-| **6** | Execution engine | Future (deferred) | Broker integration, order routing, fill simulation, paper then live trading. TCA ledger (decision price, arrival, NBBO, executed, spread paid). |
-| **7** | Strategy expansion | Future (deferred) | Put spread selling, volatility plays, panic snapback, FVG, session momentum, crypto–ETF relationships, Polymarket. |
-| **8** | Portfolio intelligence | Future (deferred) | Strategy aggregation, signal voting, dynamic allocation, regime-based capital shifts. **StrategyLeague** (tournament allocator): eligibility gate, smoothed weight updates, degradation detector, kill/quarantine; allocate from health metrics not raw short-run PnL. |
-| **9** | Intelligence API product | Future (deferred) | Expose bars, regimes, options intelligence, spread candidates, signals for subscription revenue. |
-| **10** | Self-improving system | Future (deferred) | Automatic idea testing, strategy mutation, performance pruning, adaptive weighting. |
-| **11** | LLM agents | **Future (ASAP after Phase 5 full)** | Jarvis (interactive ops copilot) and Research Proposer (autonomous hypothesis generator). Tool API + RBAC + audit; ManifestValidator; DSL schema; experiment_backlog, tool_audit_log. **Modular discoverability:** agents use a tool registry and schemas; when new modules (HMM, risk sizing, reports) are added, they register tools and agents automatically gain access—no retraining or manual catch-up beyond config/tool registration. No arbitrary code execution; no broker access. See §8.6. |
+| **4C** | Parameter search & robustness lab | **Done** | Parameter sweeps; regime sensitivity scoring; parameter stability auto-kill; MC/bootstrap on realized trades; regime-subset stress; Strategy Research Loop. |
+| **6** | Agent Ecosystem (Pantheon) | **Future (ASAP after P5)** | Argus Orchestrator, Delphi Tool Plane (RBAC/Audit), Factory Discovery Engine (Poseidon/Prometheus/Ares/Athena), Hades Lab integration. See §10. |
+| **7** | Execution engine | Future (deferred) | Broker integration, order routing, paper then live trading. |
+| **8** | Strategy expansion | Future (deferred) | Put spread selling, volatility plays, panic snapback, FVG. |
+| **9** | Portfolio intelligence | Future (deferred) | Strategy aggregation, signal voting, StrategyLeague allocator. |
+| **10** | Intelligence API product | Future (deferred) | Expose bars, regimes, options intelligence for subscription revenue. |
+| **11** | Self-improving system | Future (deferred) | Automatic idea testing, strategy mutation, performance pruning. |
 | **12** | Manifest execution & research engine | Future | DSLStrategy; research_engine (poll backlog, multiprocessing, single-writer, backpressure); evaluator hardening (purge/embargo, CorrelationCheck, discovery tax, rejection_packet). |
 | **13** | Extended sweep grids | Future | HighVol sweep (`config/high_vol_sweep.yaml`); VRP max_vol_regime extension; Overnight min_global_risk_flow, min_news_sentiment. See [PLAN_EXTENDED_SWEEP_GRIDS.md](docs/PLAN_EXTENDED_SWEEP_GRIDS.md). |
 | **14** | News features & HMM regime | Future | NewsAPI ingestion; HMM regime layer (regime committee member, K=4, daily, 5–10y rolling); hmm_model_snapshots, hmm_regime_series. |
 | **15** | Promotion pipeline formalization | Future | Stages: Proposed → Backtest-Passed → Paper-Trading → Shadow-Live → Production-Eligible. Researcher cannot promote; only Argus logic. |
 
-**Where we are now:** Phase 4C including deploy gates and **auto parameter grid** (sweep range expansion, `config/vrp_sweep.yaml`) is done. **Phase 5 (portfolio risk engine) is COMPLETE** (2026-02-19): Sizing stack, StrategyRegistry, AllocationEngine, and full RiskEngine (5-constraint pipeline: aggregate cap → drawdown throttle → correlation/cluster caps → Greek limits → tail-risk Heston/PoP). Modules: `portfolio_state.py`, `drawdown_containment.py`, `correlation_exposure.py`, `greek_limits.py`, `tail_risk_scenario.py`, `risk_attribution.py`, `risk_engine.py`. Invariants enforced: deterministic, monotone, idempotent, no-lookahead. Integration via `allocate_with_risk_engine()`; research loop wiring; config via `RiskEngineOpts`. 75 tests all passing. IV consolidation is done. **Global risk flow** is implemented. **Overnight Session Strategy Phase 2 (Data Enhancement) is COMPLETE** (2026-02-17). **Alpaca = bars/outcomes only** is enforced. P1/P2 audit items verified. **Next:** Phase 11 LLM agents. See §8.4.
+**Where we are now:** Phase 4C including deploy gates and **auto parameter grid** is done. **Phase 5 (portfolio risk engine) is COMPLETE** (2026-02-19): Sizing stack, StrategyRegistry, AllocationEngine, and full RiskEngine (5-constraint pipeline: aggregate cap → drawdown throttle → correlation/cluster caps → Greek limits → tail-risk Heston/PoP). Modules: `portfolio_state.py`, `drawdown_containment.py`, `correlation_exposure.py`, `greek_limits.py`, `tail_risk_scenario.py`, `risk_attribution.py`, `risk_engine.py`. Invariants enforced: deterministic, monotone, idempotent, no-lookahead. Integration via `allocate_with_risk_engine()`; research loop wiring; config via `RiskEngineOpts`. 75 tests all passing. IV consolidation is done. **Global risk flow** is implemented. **Overnight Session Strategy Phase 2 (Data Enhancement) is COMPLETE** (2026-02-17). **Alpaca = bars/outcomes only** is enforced. P1/P2 audit items verified. **Next:** Phase 6 Agent Ecosystem (Pantheon).
 
 ---
 
@@ -521,3 +531,49 @@ The comprehensive portfolio risk engine (Phase 5 full) is **implemented**:
 | [argus_strategy_backlog.md](argus_strategy_backlog.md) | Idea parking lot and strategy evaluation framework; master plan is authoritative for priority order. |
 | [src/core/iv_consensus.py](src/core/iv_consensus.py) | IVConsensusEngine: expiry-aware consolidation of DXLink + public snapshot IV/greeks, policies (prefer_dxlink, winner_based, blended), discrepancy rollup. |
 | Phase 4C implementation plan  | Regime sensitivity, parameter stability auto-kill, MC/bootstrap (regime-stress + bootstrap) implementation details; clarifies that “MC/bootstrap” here is not the GPU Heston Monte Carlo. |
+
+---
+
+## 10. Phase 6: Agent Ecosystem (Pantheon)
+
+Argus is transitioning from a deterministic trading tool to an **Agentic AI Ecosystem** that handles development, operations, strategy research, and market discovery.
+
+### 10.1 The Pantheon Roles
+Under the hood of the single **Argus** conversational interface, the system orchestrates specialized roles:
+
+- **Argus (Orchestrator)**: The single point of contact for the user. Translates conversation into goal-directed orchestration.
+- **Poseidon (Intel)**: Scans for market pain points, competitor gaps, and willingness-to-pay (WTP) proxies.
+- **Prometheus (Forger)**: Generates strategy hypotheses and product experiment proposals.
+- **Ares (Skeptic)**: Red-teams proposals, finds failure modes, and flags regulatory/competition risks.
+- **Athena (Judge)**: Adjudicates between Prometheus and Ares; ranks proposals based on evidence and scoring rubrics.
+- **Hephaestus (Builder)**: Generates PRDs, API contracts, and MVP code scaffolds (requires human review).
+- **Hermes (Router)**: Enforces schemas, converts artifacts, and ensures the firewall between subsystems.
+
+### 10.2 Delphi: The Tool Plane Firewall
+Any action taken by a Pantheon role must pass through the **Delphi** registry.
+- **Rules**: No `exec/eval` of LLM output. Every action maps to an allowlisted Python function.
+- **RBAC**: Roles (Poseidon, Ares, etc.) have restricted toolsets.
+- **Audit**: Every call is logged with actor, arguments, and result to `factory.db`.
+- **Budgets**: Caps on API spend, CPU time, and total tool calls per 24h.
+
+### 10.3 Approval & Autonomy Matrix
+
+| Action Category | Autonomy | Requirement |
+| :--- | :--- | :--- |
+| **Discovery** | Fully Autonomous | Ingestion, clustering, and initial scorecarding. |
+| **Research Loop** | Fully Autonomous | Running backtests, parameter sweeps, and robustness tests. |
+| **Synthesis** | Fully Autonomous | Generating memos, rankings, and deep-dives. |
+| **Code Scaffolding** | Human Review | Generating PRDs or mock code; no direct merge allowed. |
+| **Configuration** | **Approval Required** | Any change to production `config.yaml` or live risk limits. |
+| **Deployment** | **Approval Required** | Any live trading toggle or external outreach. |
+| **Spending** | **Approval Required** | Any action that increases API or infrastructure costs. |
+
+---
+
+## 11. Factory: Vertical Discovery Pipeline
+
+The **Factory** (`src/factory/`) is a distinct business module for vertical discovery.
+
+- **Storage**: Isolated `factory.db` for unstructured data ingestion (News, Reddit, Forums, Marketplace reviews).
+- **Artifacts**: Schema-enforced outputs stored in a versioned filesystem: `pain_point_clusters.json`, `competitor_matrix.csv`, `vertical_scorecards/`.
+- **Evidence Grading**: Every claim must be attributed to a source with a confidence weight (High/Medium/Low).
