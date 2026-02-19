@@ -49,6 +49,7 @@ from .core.regime_detector import RegimeDetector
 from .core.market_regime_detector import MarketRegimeDetector
 from .core.gap_risk_tracker import GapRiskTracker
 from .core.reddit_monitor import RedditMonitor
+from .core.sentiment_collector import SentimentCollector
 from .core.conditions_monitor import ConditionsMonitor
 from .connectors.bybit_ws import BybitWebSocket
 from .connectors.deribit_client import DeribitClient
@@ -62,7 +63,7 @@ from .connectors.tastytrade_streamer import TastytradeStreamer
 from .connectors.alphavantage_client import AlphaVantageClient
 from .connectors.alphavantage_collector import AlphaVantageCollector
 from .core.global_risk_flow_updater import GlobalRiskFlowUpdater
-from .core.news_sentiment_updater import NewsSentimentUpdater
+from .core.news_sentiment_updater import NewsSentimentUpdater, format_news_sentiment_telegram
 from .core.greeks_cache import GreeksCache, enrich_snapshot_iv
 from .core.iv_consensus import IVConsensusConfig, IVConsensusEngine
 from .strategies.spread_generator import SpreadCandidateGenerator, SpreadGeneratorConfig
@@ -1080,6 +1081,7 @@ class ArgusOrchestrator:
             get_dashboard=self._get_dashboard,
             get_zombies=self._get_zombies,
             get_followed=self._get_followed_traders,
+            get_sentiment=self._get_sentiment_summary,
         )
         
         # Wire up Soak Guardian alerts (filtered)
@@ -2521,12 +2523,79 @@ class ArgusOrchestrator:
             "",
         ]
 
+        if self.news_sentiment_updater:
+            news_payload = self.news_sentiment_updater.get_last_payload()
+            try:
+                news_payload = await self.news_sentiment_updater.update()
+            except Exception as exc:
+                self.logger.warning("Failed to refresh news sentiment for market open: %s", exc)
+            lines.append(format_news_sentiment_telegram(news_payload))
+            lines.append("")
+
         # SPY, IBIT, QQQ prices (user-facing tickers)
         price_lines = await self._format_briefing_prices()
         if price_lines:
             lines += price_lines + [""]
 
         await self.telegram.send_tiered_message("\n".join(lines), priority=2, key="market_open")
+
+    async def _get_sentiment_summary(self) -> str:
+        """Build a combined sentiment summary for Telegram /sentiment command."""
+        lines = ["<b>📊 Sentiment Snapshot</b>", ""]
+
+        # News sentiment
+        news_payload = None
+        if self.news_sentiment_updater:
+            news_payload = self.news_sentiment_updater.get_last_payload()
+            if not news_payload:
+                try:
+                    news_payload = await self.news_sentiment_updater.update()
+                except Exception as exc:
+                    self.logger.warning("Failed to update news sentiment for /sentiment: %s", exc)
+            lines.append("<b>News</b>")
+            lines.append(format_news_sentiment_telegram(news_payload))
+        else:
+            lines.append("<b>News</b>")
+            lines.append("⚪ News: N/A")
+
+        lines.append("")
+
+        # Fear & Greed
+        lines.append("<b>Fear & Greed</b>")
+        try:
+            fg = await SentimentCollector().get_sentiment()
+        except Exception as exc:
+            self.logger.warning("Failed to fetch Fear & Greed sentiment: %s", exc)
+            fg = None
+
+        if fg:
+            trend = fg.fear_greed_trend
+            lines.append(
+                f"🧭 Fear & Greed: {fg.fear_greed_value}/100 ({fg.fear_greed_label}) | trend: {trend} ({fg.fear_greed_change:+d})"
+            )
+        else:
+            lines.append("🧭 Fear & Greed: N/A")
+
+        lines.append("")
+
+        # Reddit sentiment
+        lines.append("<b>Reddit</b>")
+        reddit = None
+        if self.reddit_monitor:
+            try:
+                reddit = await self.reddit_monitor.fetch_sentiment()
+            except Exception as exc:
+                self.logger.warning("Failed to fetch Reddit sentiment: %s", exc)
+
+        if reddit:
+            top = ", ".join(f"{ticker}({count})" for ticker, count in reddit.top_tickers[:3]) or "none"
+            lines.append(
+                f"💬 Reddit score: {reddit.sentiment_score:+.1f} | posts: {reddit.posts_analyzed} | top tickers: {top}"
+            )
+        else:
+            lines.append("💬 Reddit: Not configured / unavailable")
+
+        return "\n".join(lines)
 
     async def _send_market_close_notification(self, now_et: datetime) -> None:
         """Send end-of-day summary when market closes."""

@@ -19,3 +19,6 @@ horizon_seconds:
 
 gate_on_risk_flow:
   values: [false, true]
+
+gate_on_news_sentiment:
+  values: [false, true]

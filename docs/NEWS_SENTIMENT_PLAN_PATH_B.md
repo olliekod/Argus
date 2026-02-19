@@ -2,7 +2,14 @@
 
 **Goal:** Replace the Alpha Vantage NEWS_SENTIMENT implementation with a **headlines + keyword/lexicon** approach that uses **no Alpha Vantage API calls** (preserving quota for equity/FX). Optionally enhance with a lightweight sklearn model (e.g. RandomForest) if labeled data becomes available.
 
-**Status:** Plan — replaces existing Path (a) implementation.
+**Status:** Implemented (Path B complete).
+
+## Quick Wins Status
+
+- ✅ Added overnight sweep toggle for `gate_on_news_sentiment`.
+- ✅ Added Telegram market-open news sentiment digest line.
+- ✅ Added Telegram `/sentiment` command (news + Fear & Greed + Reddit).
+- ✅ Marked Path B plan complete.
 
 ---
 
