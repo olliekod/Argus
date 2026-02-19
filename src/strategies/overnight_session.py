@@ -15,6 +15,8 @@ entry_window_minutes : int      Minutes for entry window (default 30)
 horizon_seconds      : int      Outcome horizon to read AND hold duration (default 14400)
 gate_on_risk_flow    : bool     Gate on GlobalRiskFlow (default False)
 min_global_risk_flow : float    Skip entry when risk flow < this (default -0.005)
+gate_on_news_sentiment: bool    Gate on news_sentiment score (default False)
+min_news_sentiment   : float    Skip entry when news sentiment < this (default -0.50)
 """
 
 from __future__ import annotations
@@ -42,6 +44,8 @@ _DEFAULT_CFG: Dict[str, Any] = {
     "horizon_seconds": 14400,        # 4h default (sweep across 3600/14400/28800)
     "gate_on_risk_flow": False,
     "min_global_risk_flow": -0.005,
+    "gate_on_news_sentiment": False,
+    "min_news_sentiment": -0.50,
 }
 
 # Crypto session transitions that trigger entry consideration
@@ -75,11 +79,15 @@ class OvernightSessionStrategy(ReplayStrategy):
     horizon_seconds * 1000``.  This keeps experiments comparable and
     removes hidden coupling to harness TTL settings.
 
-    Risk-flow gating
-    ----------------
+    Risk-flow/news-sentiment gating
+    --------------------------------
     When ``gate_on_risk_flow`` is ``True``, entry is suppressed if the
     ``global_risk_flow`` metric from ``visible_regimes`` is below
     ``min_global_risk_flow``.
+
+    When ``gate_on_news_sentiment`` is ``True``, entry is suppressed if the
+    ``news_sentiment.score`` metric from ``visible_regimes`` is below
+    ``min_news_sentiment``.
 
     V1 is **long-only**.  Symmetric overnight shorts on equities are
     unsafe during overnight gaps; a future V2 may add them with
@@ -158,6 +166,32 @@ class OvernightSessionStrategy(ReplayStrategy):
                     risk_flow, self._cfg["min_global_risk_flow"],
                 )
                 return  # skip entry evaluation; closes still happen
+
+
+        # ── News sentiment gating ───────────────────────────────────
+        if self._cfg["gate_on_news_sentiment"]:
+            news_sentiment = self._extract_news_sentiment(visible_regimes)
+            if news_sentiment is not None and news_sentiment < self._cfg["min_news_sentiment"]:
+                logger.info(
+                    "Skipped entry due to news_sentiment=%.6f < min=%.6f",
+                    news_sentiment, self._cfg["min_news_sentiment"],
+                )
+                return
+
+        # Optional divergence telemetry: risk-on-ish flow with negative news
+        risk_flow = self._extract_global_risk_flow(visible_regimes)
+        news_sentiment = self._extract_news_sentiment(visible_regimes)
+        if (
+            risk_flow is not None
+            and risk_flow > 0
+            and news_sentiment is not None
+            and news_sentiment < 0
+        ):
+            logger.info(
+                "Regime divergence: risk_flow=%.6f but news_sentiment=%.6f",
+                risk_flow,
+                news_sentiment,
+            )
 
         # ── Entry evaluation ──────────────────────────────────────────
         if self._is_entry_window(sim_ts_ms, session_regime):
@@ -302,4 +336,33 @@ class OvernightSessionStrategy(ReplayStrategy):
             metrics = json.loads(metrics_raw)
             return metrics.get("global_risk_flow")
         except (json.JSONDecodeError, TypeError):
+            return None
+
+
+    @staticmethod
+    def _extract_news_sentiment(
+        visible_regimes: Optional[Dict[str, Dict[str, Any]]],
+    ) -> Optional[float]:
+        """Extract ``news_sentiment.score`` from EQUITIES metrics_json."""
+        if not visible_regimes:
+            return None
+
+        market_regime = visible_regimes.get("EQUITIES")
+        if not market_regime:
+            return None
+
+        metrics_raw = market_regime.get("metrics_json", "")
+        if not metrics_raw:
+            return None
+
+        try:
+            metrics = json.loads(metrics_raw)
+            value = metrics.get("news_sentiment")
+            if isinstance(value, dict):
+                score = value.get("score")
+                return float(score) if score is not None else None
+            if isinstance(value, (int, float)):
+                return float(value)
+            return None
+        except (json.JSONDecodeError, TypeError, ValueError):
             return None

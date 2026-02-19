@@ -143,6 +143,13 @@ exchanges:
       - "GBP/USD"
       - "AUD/USD"
 
+
+news_sentiment:
+  enabled: false
+  interval_seconds: 3600
+  api_key: "${NEWS_SENTIMENT_API_KEY}"
+  api_url: "https://www.alphavantage.co/query"
+
 # -----------------------------------------------------------------------------
 # Tastytrade Configuration
 # -----------------------------------------------------------------------------

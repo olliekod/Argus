@@ -38,6 +38,17 @@ from src.core.global_risk_flow import (
 )
 
 
+def get_news_sentiment_for_replay(sim_ts_ms: int) -> Dict[str, Any]:
+    """Deterministic replay helper for news sentiment.
+
+    Current phase uses a constant stub payload. This function is the
+    extension point for future historical sentiment lookup keyed by
+    ``sim_ts_ms``.
+    """
+    _ = sim_ts_ms
+    return {"score": 0.0, "label": "stub", "n_headlines": 0}
+
+
 
 def _atm_iv_from_quotes_json(quotes_json: str, underlying_price: float) -> Optional[float]:
     """Fill ATM put IV from quotes_json when snapshot has no atm_iv.
@@ -443,7 +454,7 @@ async def create_replay_pack(
             "snapshots": snapshots,
         }
 
-        # 6b. Inject GlobalRiskFlow into Regimes
+        # 6b. Inject external metrics into Regimes
         # regimes in DB have metrics_json: str. We parse, inject, and re-serialize.
         # This ensures the replay-pack consumer (RegimeDetector or Strategy)
         # sees the metric as if it were emitted by the live system.
@@ -462,25 +473,34 @@ async def create_replay_pack(
             if regime_ts_ms is None:
                 regime_ts_ms = _bar_timestamp_to_ms(regime.get("timestamp"))
             
+            # Parse metrics_json once; skip invalid JSON rows.
+            m_json = regime.get("metrics_json", "{}")
+            try:
+                metrics = json.loads(m_json)
+            except json.JSONDecodeError:
+                continue
+
+            changed = False
+
             risk_flow = compute_global_risk_flow(av_bars_by_sym, regime_ts_ms)
             if risk_flow is not None:
-                # Parse metrics_json
-                m_json = regime.get("metrics_json", "{}")
-                try:
-                    metrics = json.loads(m_json)
-                    new_val = round(risk_flow, 8)
-                    
-                    # Only update if missing or changed to avoid unnecessary reserialization
-                    if metrics.get("global_risk_flow") != new_val:
-                        metrics["global_risk_flow"] = new_val
-                        # Local reserialization with sort_keys for determinism
-                        regime["metrics_json"] = json.dumps(metrics, sort_keys=True)
-                        injected_count += 1
-                except json.JSONDecodeError:
-                    pass
+                new_risk = round(risk_flow, 8)
+                if metrics.get("global_risk_flow") != new_risk:
+                    metrics["global_risk_flow"] = new_risk
+                    changed = True
+
+            news_sentiment = get_news_sentiment_for_replay(regime_ts_ms)
+            if metrics.get("news_sentiment") != news_sentiment:
+                metrics["news_sentiment"] = news_sentiment
+                changed = True
+
+            if changed:
+                # Local reserialization with sort_keys for determinism.
+                regime["metrics_json"] = json.dumps(metrics, sort_keys=True)
+                injected_count += 1
         
         if injected_count > 0:
-            print(f"  Injected global_risk_flow into {injected_count} regimes.")
+            print(f"  Injected external metrics into {injected_count} regimes.")
 
         # 7. Write
         Path(output_path).parent.mkdir(parents=True, exist_ok=True)
