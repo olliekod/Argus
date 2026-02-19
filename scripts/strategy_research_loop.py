@@ -601,7 +601,7 @@ def run_allocation(
 
     logger.info("Built %d forecasts for allocation.", len(forecasts))
 
-    # 3. Run AllocationEngine
+    # 3. Run AllocationEngine (with or without RiskEngine)
     alloc_config = AllocationConfig(
         kelly_fraction=alloc_opts.kelly_fraction,
         per_play_cap=alloc_opts.per_play_cap,
@@ -609,10 +609,100 @@ def run_allocation(
         min_edge_over_cost=alloc_opts.min_edge_over_cost,
     )
     engine = AllocationEngine(config=alloc_config, equity=config.evaluation.equity)
-    allocations = engine.allocate(
-        forecasts,
-        max_loss_per_contract=max_loss_per_contract or None,
-    )
+
+    clamp_reasons_list = []
+    risk_attribution_dict = {}
+    risk_engine_opts = config.evaluation.risk_engine
+
+    if risk_engine_opts and risk_engine_opts.enabled:
+        # Build RiskEngineConfig from parsed opts
+        from src.analysis.risk_engine import RiskEngineConfig
+        from src.analysis.drawdown_containment import DrawdownConfig
+        from src.analysis.correlation_exposure import CorrelationConfig
+        from src.analysis.greek_limits import GreekLimitsConfig
+        from src.analysis.tail_risk_scenario import TailRiskConfig
+        from src.analysis.portfolio_state import PortfolioState, build_portfolio_state_from_context
+        from src.analysis.risk_attribution import persist_risk_attribution
+
+        risk_config = RiskEngineConfig(
+            enabled=True,
+            aggregate_exposure_cap=risk_engine_opts.aggregate_exposure_cap,
+            drawdown=DrawdownConfig(
+                threshold_pct=risk_engine_opts.drawdown.threshold_pct,
+                throttle_mode=risk_engine_opts.drawdown.throttle_mode,
+                throttle_scale=risk_engine_opts.drawdown.throttle_scale,
+                k=risk_engine_opts.drawdown.k,
+                recovery_threshold_pct=risk_engine_opts.drawdown.recovery_threshold_pct,
+                min_throttle=risk_engine_opts.drawdown.min_throttle,
+            ),
+            correlation=CorrelationConfig(
+                rolling_days=risk_engine_opts.correlation.rolling_days,
+                min_obs=risk_engine_opts.correlation.min_obs,
+                estimator=risk_engine_opts.correlation.estimator,
+                nan_policy=risk_engine_opts.correlation.nan_policy,
+                max_exposure_per_underlying_usd=risk_engine_opts.correlation.max_exposure_per_underlying_usd,
+                max_exposure_per_cluster_usd=risk_engine_opts.correlation.max_exposure_per_cluster_usd,
+                max_correlated_pair_exposure_usd=risk_engine_opts.correlation.max_correlated_pair_exposure_usd,
+                cluster_method=risk_engine_opts.correlation.cluster_method,
+                corr_threshold_for_cluster=risk_engine_opts.correlation.corr_threshold_for_cluster,
+            ),
+            greek_limits=GreekLimitsConfig(
+                per_underlying=dict(risk_engine_opts.greek_limits.per_underlying),
+                portfolio_max_delta_shares=risk_engine_opts.greek_limits.portfolio_max_delta_shares,
+                portfolio_max_vega=risk_engine_opts.greek_limits.portfolio_max_vega,
+                portfolio_max_gamma=risk_engine_opts.greek_limits.portfolio_max_gamma,
+                enforce_existing_positions=risk_engine_opts.greek_limits.enforce_existing_positions,
+            ),
+            tail_risk=TailRiskConfig(
+                enabled_for_options=risk_engine_opts.tail_risk.enabled_for_options,
+                max_prob_touch=risk_engine_opts.tail_risk.max_prob_touch,
+                stress_iv_bump=risk_engine_opts.tail_risk.stress_iv_bump,
+                max_stress_loss_pct=risk_engine_opts.tail_risk.max_stress_loss_pct,
+                mc_simulations=risk_engine_opts.tail_risk.mc_simulations,
+                mc_steps_per_year=risk_engine_opts.tail_risk.mc_steps_per_year,
+                seed=risk_engine_opts.tail_risk.seed,
+                default_heston_kappa=risk_engine_opts.tail_risk.default_heston_kappa,
+                default_heston_sigma_v=risk_engine_opts.tail_risk.default_heston_sigma_v,
+                default_heston_rho=risk_engine_opts.tail_risk.default_heston_rho,
+            ),
+            risk_attribution_output_path=risk_engine_opts.risk_attribution_output_path,
+            enforce_idempotence_check=risk_engine_opts.enforce_idempotence_check,
+            enforce_monotone_check=risk_engine_opts.enforce_monotone_check,
+        )
+
+        # Build PortfolioState for the evaluation as_of_ts_ms
+        as_of_ts_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+        portfolio_state = build_portfolio_state_from_context(
+            as_of_ts_ms=as_of_ts_ms,
+            equity_usd=config.evaluation.equity,
+        )
+
+        allocations, clamp_reasons, risk_attribution = engine.allocate_with_risk_engine(
+            forecasts=forecasts,
+            portfolio_state=portfolio_state,
+            risk_config=risk_config,
+            max_loss_per_contract=max_loss_per_contract or None,
+        )
+
+        clamp_reasons_list = [cr.to_dict() for cr in clamp_reasons]
+        risk_attribution_dict = risk_attribution.to_dict()
+
+        # Persist risk attribution artifact
+        if risk_engine_opts.risk_attribution_output_path:
+            persist_risk_attribution(
+                risk_attribution,
+                risk_engine_opts.risk_attribution_output_path,
+            )
+
+        logger.info(
+            "Risk engine applied: %d clamp reasons, config_hash=%s",
+            len(clamp_reasons), risk_config.config_hash(),
+        )
+    else:
+        allocations = engine.allocate(
+            forecasts,
+            max_loss_per_contract=max_loss_per_contract or None,
+        )
 
     # 4. Persist allocations as JSON
     alloc_output = {
@@ -641,10 +731,25 @@ def run_allocation(
         ],
     }
 
+    # Include risk engine artifacts if enabled
+    if risk_engine_opts and risk_engine_opts.enabled:
+        alloc_output["risk_engine"] = {
+            "enabled": True,
+            "config_hash": risk_config.config_hash(),
+            "clamp_reasons_count": len(clamp_reasons_list),
+        }
+
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     with open(out, "w") as f:
-        json.dump(alloc_output, f, indent=2)
+        json.dump(alloc_output, f, indent=2, sort_keys=False)
+
+    # Persist clamp reasons alongside allocations
+    if clamp_reasons_list:
+        clamp_path = out.parent / "clamp_reasons.json"
+        with open(clamp_path, "w") as f:
+            json.dump(clamp_reasons_list, f, indent=2)
+        logger.info("Clamp reasons written to %s", clamp_path)
 
     active = sum(1 for a in allocations if a.weight != 0)
     logger.info(
