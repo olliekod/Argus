@@ -62,6 +62,7 @@ from .connectors.tastytrade_streamer import TastytradeStreamer
 from .connectors.alphavantage_client import AlphaVantageClient
 from .connectors.alphavantage_collector import AlphaVantageCollector
 from .core.global_risk_flow_updater import GlobalRiskFlowUpdater
+from .core.news_sentiment_updater import NewsSentimentUpdater
 from .core.greeks_cache import GreeksCache, enrich_snapshot_iv
 from .core.iv_consensus import IVConsensusConfig, IVConsensusEngine
 from .strategies.spread_generator import SpreadCandidateGenerator, SpreadGeneratorConfig
@@ -211,6 +212,7 @@ class ArgusOrchestrator:
         self.alphavantage_client: Optional[AlphaVantageClient] = None
         self.av_collector: Optional[AlphaVantageCollector] = None
         self.global_risk_flow_updater: Optional[GlobalRiskFlowUpdater] = None
+        self.news_sentiment_updater: Optional[NewsSentimentUpdater] = None
         self.spread_generator: Optional[SpreadCandidateGenerator] = None
         self._greeks_cache: GreeksCache = GreeksCache()
         self._iv_consensus = IVConsensusEngine(IVConsensusConfig(policy="prefer_dxlink"))
@@ -592,6 +594,10 @@ class ArgusOrchestrator:
         self.global_risk_flow_updater = GlobalRiskFlowUpdater(
             bus=self.event_bus,
             db=self.db,
+            config=self.config,
+        )
+        self.news_sentiment_updater = NewsSentimentUpdater(
+            bus=self.event_bus,
             config=self.config,
         )
 
@@ -3304,24 +3310,47 @@ class ArgusOrchestrator:
                 self.logger.error("AlphaVantageCollector loop crash", exc_info=True)
 
     async def _run_external_metrics_loop(self) -> None:
-        """Periodic loop to compute and publish external metrics (GlobalRiskFlow)."""
-        if not self.global_risk_flow_updater:
+        """Periodic loop to compute and publish external metrics.
+
+        Supports global_risk_flow and news_sentiment with independent
+        intervals. The loop is non-blocking across metric updaters.
+        """
+        if not self.global_risk_flow_updater and not self.news_sentiment_updater:
             return
 
         av_cfg = self.config.get('exchanges', {}).get('alphavantage', {})
-        interval = int(av_cfg.get('external_metrics_interval_seconds', 3600))
-        
-        self.logger.info("External metrics loop started — interval=%ds", interval)
+        ns_cfg = self.config.get('news_sentiment', {})
+        grf_interval = int(av_cfg.get('external_metrics_interval_seconds', 3600))
+        ns_interval = int(ns_cfg.get('interval_seconds', 3600))
+        ns_enabled = bool(ns_cfg.get('enabled', False))
+
+        base_sleep = max(1, min(grf_interval, ns_interval if ns_enabled else grf_interval))
+        next_grf_run = 0.0
+        next_ns_run = 0.0
+
+        self.logger.info(
+            "External metrics loop started — global_risk_flow=%ds, news_sentiment=%s(%ds)",
+            grf_interval,
+            "enabled" if ns_enabled else "disabled",
+            ns_interval,
+        )
 
         while self._running:
+            now = time.time()
             try:
-                await self.global_risk_flow_updater.update()
+                if self.global_risk_flow_updater and now >= next_grf_run:
+                    await self.global_risk_flow_updater.update()
+                    next_grf_run = now + grf_interval
+
+                if self.news_sentiment_updater and ns_enabled and now >= next_ns_run:
+                    await self.news_sentiment_updater.update()
+                    next_ns_run = now + ns_interval
             except Exception:
                 self.logger.error("External metrics update failed (will retry)", exc_info=True)
-            
+
             # Wait for next interval or shutdown
             try:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(base_sleep)
             except asyncio.CancelledError:
                 break
 
@@ -3348,6 +3377,9 @@ class ArgusOrchestrator:
         # Stop dashboard
         if self.dashboard:
             await self.dashboard.stop()
+
+        if self.news_sentiment_updater:
+            await self.news_sentiment_updater.close()
 
         # Stop monitoring loops
         if self.conditions_monitor:

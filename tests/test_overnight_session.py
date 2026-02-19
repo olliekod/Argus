@@ -82,11 +82,14 @@ def _make_outcome(
 
 def _make_regimes(
     risk_flow: Optional[float] = None,
+    news_sentiment: Optional[Any] = None,
 ) -> Dict[str, Dict[str, Any]]:
-    """Build a visible_regimes dict with optional global_risk_flow."""
+    """Build a visible_regimes dict with optional external metrics."""
     metrics = {}
     if risk_flow is not None:
         metrics["global_risk_flow"] = risk_flow
+    if news_sentiment is not None:
+        metrics["news_sentiment"] = news_sentiment
 
     return {
         "EQUITIES": {
@@ -111,6 +114,7 @@ class TestDefaults:
         assert s._cfg["horizon_seconds"] == 14400
         assert s._cfg["gate_on_risk_flow"] is False
         assert s._cfg["entry_window_minutes"] == 30
+        assert s._cfg["gate_on_news_sentiment"] is False
 
     def test_custom_params(self):
         s = OvernightSessionStrategy(params={
@@ -121,6 +125,7 @@ class TestDefaults:
         assert s._cfg["horizon_seconds"] == 28800
         # Other defaults remain
         assert s._cfg["entry_window_minutes"] == 30
+        assert s._cfg["gate_on_news_sentiment"] is False
 
     def test_strategy_id(self):
         s = OvernightSessionStrategy()
@@ -532,3 +537,50 @@ class TestLongOnlyV1:
         for intent in intents:
             if intent.intent_type == "OPEN":
                 assert intent.side == "BUY"
+
+
+class TestNewsSentimentGating:
+    """Verify news sentiment gating logic."""
+
+    def test_gated_by_stub_news_sentiment(self):
+        """No LONG entries with gate enabled and threshold above stub sentiment."""
+        s = OvernightSessionStrategy(params={
+            "fwd_return_threshold": 0.001,
+            "horizon_seconds": 14400,
+            "gate_on_news_sentiment": True,
+            "min_news_sentiment": 0.5,
+        })
+
+        s.on_bar(_make_bar(1000, symbol="SPY"), 1000, "CLOSED", {})
+        s.generate_intents(1000)
+
+        ts = 2000
+        outcomes = {ts - 60000: _make_outcome(ts - 60000, 14400, 0.02)}
+        regimes = _make_regimes(news_sentiment={"score": 0.0, "label": "stub", "n_headlines": 0})
+
+        s.on_bar(_make_bar(ts, symbol="SPY"), ts, "PRE", outcomes, visible_regimes=regimes)
+        intents = s.generate_intents(ts)
+
+        long_entries = [i for i in intents if i.intent_type == "OPEN" and i.side == "BUY"]
+        assert len(long_entries) == 0
+
+    def test_news_sentiment_allows_entry_when_above_threshold(self):
+        s = OvernightSessionStrategy(params={
+            "fwd_return_threshold": 0.001,
+            "horizon_seconds": 14400,
+            "gate_on_news_sentiment": True,
+            "min_news_sentiment": 0.5,
+        })
+
+        s.on_bar(_make_bar(1000, symbol="SPY"), 1000, "CLOSED", {})
+        s.generate_intents(1000)
+
+        ts = 2000
+        outcomes = {ts - 60000: _make_outcome(ts - 60000, 14400, 0.02)}
+        regimes = _make_regimes(news_sentiment={"score": 0.75, "label": "bullish", "n_headlines": 10})
+
+        s.on_bar(_make_bar(ts, symbol="SPY"), ts, "PRE", outcomes, visible_regimes=regimes)
+        intents = s.generate_intents(ts)
+
+        long_entries = [i for i in intents if i.intent_type == "OPEN" and i.side == "BUY"]
+        assert len(long_entries) == 1

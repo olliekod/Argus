@@ -9,6 +9,7 @@ from dataclasses import replace, dataclass
 from src.core.bus import EventBus
 from src.core.regime_detector import RegimeDetector
 from src.core.global_risk_flow_updater import GlobalRiskFlowUpdater
+from src.core.news_sentiment_updater import NewsSentimentUpdater
 from src.core.events import (
     TOPIC_EXTERNAL_METRICS,
     TOPIC_REGIMES_MARKET,
@@ -160,6 +161,7 @@ async def test_replay_pack_injection_determinism(tmp_path):
     m2 = p2["regimes"][0]["metrics_json"]
     assert m1 == m2
     assert "global_risk_flow" in m1
+    assert "news_sentiment" in m1
 
 @pytest.mark.asyncio
 async def test_bus_to_regime_integration():
@@ -203,4 +205,46 @@ async def test_bus_to_regime_integration():
     metrics = json.loads(last_event.metrics_json)
     assert metrics["global_risk_flow"] == 0.5555
     
+    bus.stop()
+
+
+@pytest.mark.asyncio
+async def test_news_sentiment_updater_and_regime_integration():
+    """News sentiment publishes ExternalMetricEvent and appears in metrics_json."""
+    bus = EventBus()
+    detector = RegimeDetector(bus)
+
+    regime_events = []
+
+    def on_market_regime(event):
+        regime_events.append(event)
+
+    bus.subscribe(TOPIC_REGIMES_MARKET, on_market_regime)
+    bus.start()
+
+    updater = NewsSentimentUpdater(bus=bus, config={
+        "news_sentiment": {
+            "enabled": True,
+            "interval_seconds": 3600,
+            "api_key": "",
+            "api_url": "https://www.alphavantage.co/query",
+        }
+    })
+
+    payload = await updater.update()
+    assert payload == {"score": 0.0, "label": "stub", "n_headlines": 0}
+
+    # Emit a bar to force a market regime event with merged metrics_json
+    bus.publish(TOPIC_MARKET_BARS, BarEvent(
+        symbol="SPY", open=400, high=401, low=399, close=400.5,
+        volume=1000, timestamp=time.time(), source="yahoo"
+    ))
+
+    await asyncio.sleep(0.2)
+
+    assert len(regime_events) > 0
+    metrics = json.loads(regime_events[-1].metrics_json)
+    assert metrics["news_sentiment"] == payload
+
+    await updater.close()
     bus.stop()
