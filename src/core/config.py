@@ -6,14 +6,29 @@ Loads and validates YAML configuration files.
 """
 
 import os
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 import yaml
 
 
 class ConfigurationError(Exception):
     """Raised when configuration is invalid."""
     pass
+
+
+@dataclass(frozen=True)
+class ZeusConfig:
+    """Deterministic governance configuration for the Zeus policy layer."""
+
+    monthly_budget_cap: float = 15.0
+    high_risk_tools: List[str] = field(default_factory=lambda: [
+        "config_edit",
+        "live_trading_toggle",
+        "budget_cap_increase",
+    ])
+    ollama_service_name: str = "ollama"
+    governance_db_path: str = "data/argus.db"
 
 
 def load_yaml(path: str) -> Dict[str, Any]:
