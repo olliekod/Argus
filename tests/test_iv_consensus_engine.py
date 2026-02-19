@@ -109,7 +109,7 @@ def test_determinism_same_events_same_outputs():
 
 
 @pytest.mark.asyncio
-async def test_orchestrator_wires_dxlink_streamer_callback(monkeypatch):
+async def test_orchestrator_wires_dxlink_streamer_callback(monkeypatch, tmp_path):
     captured = {}
 
     class FakeClient:
@@ -128,7 +128,17 @@ async def test_orchestrator_wires_dxlink_streamer_callback(monkeypatch):
             return None
 
     monkeypatch.setattr("src.orchestrator.TastytradeStreamer", FakeStreamer)
-    monkeypatch.setenv("ARGUS_SECRETS", "config/secrets.yaml")
+
+    # Create a minimal secrets file for the orchestrator
+    secrets_file = tmp_path / "secrets.yaml"
+    secrets_file.write_text(
+        "tastytrade:\n  username: test\n  password: test\n"
+        "binance:\n  api_key: test\n  api_secret: test\n"
+        "okx:\n  api_key: test\n  api_secret: test\n  passphrase: test\n"
+        "bybit:\n  api_key: test\n  api_secret: test\n"
+        "telegram:\n  bot_token: test\n  chat_id: test\n"
+    )
+    monkeypatch.setenv("ARGUS_SECRETS", str(secrets_file))
 
     orch = ArgusOrchestrator(config_dir="config")
     orch.tastytrade_options = FakeOptions()
