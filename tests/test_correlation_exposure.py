@@ -37,12 +37,14 @@ class TestCorrelationMatrix:
 
     def test_uncorrelated(self):
         """Unrelated series → correlation near 0."""
+        import math
+        n = 50
         aligned = {
-            "A": [1, 0, 1, 0, 1, 0, 1, 0, 1, 0] * 5,
-            "B": [0, 1, 0, 1, 0, 1, 0, 1, 0, 1] * 5,
+            "A": [math.sin(i * 0.7) for i in range(n)],
+            "B": [math.cos(i * 1.3 + 2.0) for i in range(n)],
         }
         matrix = compute_correlation_matrix(aligned, min_obs=10)
-        # Not exactly 0 but should be close
+        # Should be weakly correlated
         assert abs(matrix[("A", "B")]) < 0.5
 
     def test_insufficient_observations(self):
