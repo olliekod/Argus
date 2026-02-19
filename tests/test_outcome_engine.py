@@ -591,7 +591,7 @@ class TestGoldenVector:
         assert r.window_end_ms == BASE_TS_MS + BAR_DUR_MS + 300_000
 
     def test_golden_bar0_realized_vol(self):
-        """Realized vol for bar 0 should match stddev of log returns."""
+        """Realized vol for bar 0 should match annualized stddev of log returns."""
         engine = _make_engine()
         results = engine.compute_outcomes_from_bars_sync(
             self.GOLDEN_BARS, PROVIDER, SYMBOL, BAR_DUR, [300])
@@ -604,7 +604,11 @@ class TestGoldenVector:
         log_rets = [math.log(closes[i] / closes[i-1]) for i in range(1, len(closes))]
         mean = sum(log_rets) / len(log_rets)
         var = sum((lr - mean) ** 2 for lr in log_rets) / (len(log_rets) - 1)
-        expected_vol = math.sqrt(var)
+        vol_per_bar = math.sqrt(var)
+
+        # Annualize: 252 trading days * 6.5h * 3600s / bar_duration_seconds
+        periods_per_year = (252 * 6.5 * 3600) / BAR_DUR
+        expected_vol = vol_per_bar * math.sqrt(periods_per_year)
 
         assert r.realized_vol == _quantize(expected_vol, QUANTIZE)
 
