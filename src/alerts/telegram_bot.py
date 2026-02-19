@@ -71,6 +71,7 @@ class TelegramBot:
 /pnl — Per-trader P&L stats (mean/median/std/deciles)
 /signals — IBIT/BITO signal conditions
 /status — Conditions score + data freshness
+/sentiment — News + Fear & Greed + Reddit snapshot
 /zombies — Detect stale/orphaned positions (7-14 DTE aligned)
 /zombie_clean — Close detected zombie positions
 /reset_paper — Start new paper equity epoch
@@ -157,6 +158,7 @@ Where current BTC IV sits vs recent history (0–100%). High rank = IV is high r
         self._get_dashboard: Optional[Callable] = None
         self._get_zombies: Optional[Callable] = None
         self._get_followed: Optional[Callable] = None
+        self._get_sentiment: Optional[Callable] = None
         self._on_trade_confirmation: Optional[Callable] = None
         
         # Track last signal for yes/no confirmation
@@ -191,6 +193,7 @@ Where current BTC IV sits vs recent history (0–100%). High rank = IV is high r
         get_dashboard: Optional[Callable] = None,
         get_zombies: Optional[Callable] = None,
         get_followed: Optional[Callable] = None,
+        get_sentiment: Optional[Callable] = None,
         on_trade_confirmation: Optional[Callable] = None,
     ):
         """Set callback functions for data access."""
@@ -203,6 +206,7 @@ Where current BTC IV sits vs recent history (0–100%). High rank = IV is high r
         self._get_dashboard = get_dashboard
         self._get_zombies = get_zombies
         self._get_followed = get_followed
+        self._get_sentiment = get_sentiment
         self._on_trade_confirmation = on_trade_confirmation
     
     async def start_polling(self) -> None:
@@ -240,6 +244,7 @@ Where current BTC IV sits vs recent history (0–100%). High rank = IV is high r
         app.add_handler(CommandHandler("db_stats", self._cmd_db_stats))
         app.add_handler(CommandHandler("follow", self._cmd_follow))
         app.add_handler(CommandHandler("glossary", self._cmd_glossary))
+        app.add_handler(CommandHandler("sentiment", self._cmd_sentiment))
 
         # Add message handler for yes/no responses
         app.add_handler(MessageHandler(
@@ -477,6 +482,18 @@ Where current BTC IV sits vs recent history (0–100%). High rank = IV is high r
     async def _cmd_glossary(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /glossary command."""
         await update.message.reply_text(self.GLOSSARY_TEXT, parse_mode="HTML")
+
+    async def _cmd_sentiment(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /sentiment command."""
+        try:
+            if not self._get_sentiment:
+                await update.message.reply_text("Sentiment summary not available.")
+                return
+            summary = await self._get_sentiment()
+            await update.message.reply_text(summary, parse_mode="HTML")
+        except Exception as e:
+            logger.error(f"Error in /sentiment: {e}")
+            await update.message.reply_text(f"Error: {e}")
 
     async def _cmd_dashboard(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /dashboard — single view of whether everything is working."""

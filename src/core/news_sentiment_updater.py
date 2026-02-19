@@ -23,6 +23,18 @@ _DEFAULT_FEEDS = [
 ]
 
 
+def format_news_sentiment_telegram(payload: Optional[Dict[str, Any]]) -> str:
+    """Format a concise news sentiment summary line for Telegram."""
+    if not payload or payload.get("label") == "stub":
+        return "⚪ News: (stub/unavailable)"
+
+    score = float(payload.get("score", 0.0) or 0.0)
+    label = str(payload.get("label") or "?")
+    n_headlines = int(payload.get("n_headlines", 0) or 0)
+    emoji = "🟢" if label == "bullish" else "🔴" if label == "bearish" else "⚪"
+    return f"{emoji} News: {label} ({score:+.2f}) | {n_headlines} headlines"
+
+
 class NewsSentimentUpdater:
     """Collect and publish a ``news_sentiment`` external metric."""
 
@@ -48,6 +60,7 @@ class NewsSentimentUpdater:
             lexicon=str(ns_cfg.get("lexicon") or "loughran_mcdonald"),
             lexicon_path=ns_cfg.get("lexicon_path"),
         )
+        self._last_payload: Optional[Dict[str, Any]] = None
 
         if self._enabled:
             logger.info("NewsSentimentUpdater enabled (source=headlines_lexicon)")
@@ -56,6 +69,10 @@ class NewsSentimentUpdater:
 
     async def close(self) -> None:
         await self._fetcher.close()
+
+    def get_last_payload(self) -> Optional[Dict[str, Any]]:
+        """Return the last computed/published payload, if available."""
+        return self._last_payload
 
     @staticmethod
     def _label_from_score(score: float) -> str:
@@ -82,6 +99,7 @@ class NewsSentimentUpdater:
         if not self._enabled:
             payload = self._stub_payload()
             self._publish(payload, now_ms)
+            self._last_payload = payload
             return payload
 
         try:
@@ -90,11 +108,13 @@ class NewsSentimentUpdater:
             logger.warning("NewsSentiment headline fetch failed: %s", exc)
             payload = self._stub_payload()
             self._publish(payload, now_ms)
+            self._last_payload = payload
             return payload
 
         if not headlines:
             payload = self._stub_payload()
             self._publish(payload, now_ms)
+            self._last_payload = payload
             logger.info("NewsSentiment updated: score=0.0000 label=stub n_headlines=0 sources=none")
             return payload
 
@@ -111,6 +131,7 @@ class NewsSentimentUpdater:
         if not scores:
             payload = self._stub_payload()
             self._publish(payload, now_ms)
+            self._last_payload = payload
             return payload
 
         avg_score = sum(scores) / len(scores)
@@ -120,6 +141,7 @@ class NewsSentimentUpdater:
             "n_headlines": len(scores),
         }
         self._publish(payload, now_ms)
+        self._last_payload = payload
         logger.info(
             "NewsSentiment updated: score=%.4f label=%s n_headlines=%d sources=%s",
             payload["score"],
