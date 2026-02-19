@@ -234,6 +234,13 @@ async def test_news_sentiment_updater_and_regime_integration():
     payload = await updater.update()
     assert payload == {"score": 0.0, "label": "stub", "n_headlines": 0}
 
+    # Wait for the metric to be registered in the detector (bus uses worker threads)
+    for _ in range(30):
+        with detector._lock:
+            if detector._risk_metrics.get("news_sentiment") == payload:
+                break
+        await asyncio.sleep(0.05)
+
     # Emit a bar to force a market regime event with merged metrics_json
     bus.publish(TOPIC_MARKET_BARS, BarEvent(
         symbol="SPY", open=400, high=401, low=399, close=400.5,

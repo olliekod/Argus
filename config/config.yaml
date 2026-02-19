@@ -145,7 +145,7 @@ exchanges:
 
 
 news_sentiment:
-  enabled: false
+  enabled: true
   interval_seconds: 3600
   feeds:
     - "https://finance.yahoo.com/news/rssindex"
@@ -153,7 +153,7 @@ news_sentiment:
   lexicon: "loughran_mcdonald"
   lexicon_path: null
   max_headlines: 50
-  newsapi_key: null
+  newsapi_key: "501b61e3cfdb418f9f177c7dca942084"
 
 # -----------------------------------------------------------------------------
 # Tastytrade Configuration

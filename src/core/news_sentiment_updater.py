@@ -33,11 +33,14 @@ class NewsSentimentUpdater:
         self._enabled: bool = bool(ns_cfg.get("enabled", False))
         self._max_headlines = max(1, int(ns_cfg.get("max_headlines", 50) or 50))
 
-        feeds_cfg = ns_cfg.get("feeds") or _DEFAULT_FEEDS
-        feeds: List[str] = [str(feed).strip() for feed in feeds_cfg if str(feed).strip()]
+        feeds_cfg = ns_cfg.get("feeds", _DEFAULT_FEEDS)
+        feeds: List[str] = [str(feed).strip() for feed in (feeds_cfg or []) if str(feed).strip()]
+        # Use default feeds only when key is missing; explicit feeds=[] means no fetches
+        if not feeds and "feeds" not in ns_cfg:
+            feeds = list(_DEFAULT_FEEDS)
 
         self._fetcher = HeadlineFetcher(
-            feeds=feeds or list(_DEFAULT_FEEDS),
+            feeds=feeds,
             newsapi_key=ns_cfg.get("newsapi_key"),
             max_headlines=self._max_headlines,
         )
