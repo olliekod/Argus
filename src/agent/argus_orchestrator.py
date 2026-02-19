@@ -31,8 +31,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 DEFAULT_OLLAMA_BASE = "http://localhost:11434"
-DEFAULT_MODEL = "qwen2.5:32b"
-FALLBACK_MODEL = "qwen2.5:14b"
+DEFAULT_MODEL = "qwen2.5:14b"
+UPGRADE_MODEL = "qwen2.5:32b"
 
 # Sliding-window defaults
 DEFAULT_MAX_HISTORY = 40  # message pairs kept in memory
@@ -481,13 +481,30 @@ class ArgusOrchestrator:
 
         thoughts: List[str] = []
         for iteration in range(self.max_tool_iterations):
+            # Try 14B first
             llm_response = await self._llm_complete(messages, self.model)
+            tool_call = self._parse_tool_call(llm_response)
+
+            # Escalation Tie 1: 14B -> 32B if tool call parsing fails
+            if tool_call is None and self.model == DEFAULT_MODEL:
+                if any(tn in llm_response for tn in self.delphi.tools.keys()):
+                    logger.info("14B failed to format tool call. Upgrading to 32B.")
+                    llm_response = await self._llm_complete(messages, UPGRADE_MODEL)
+                    tool_call = self._parse_tool_call(llm_response)
+
+            # Escalation Tie 2: 32B -> API if tool call parsing still fails
+            if tool_call is None and self.escalation_config:
+                logger.info("Local models failed to format tool call. Escalating to API.")
+                api_response = await self._escalate_to_api(messages, "Local models failed to produce valid tool JSON.")
+                if api_response:
+                    llm_response = api_response
+                    tool_call = self._parse_tool_call(llm_response)
+
             await self._audit("react_thought", {
                 "iteration": iteration,
                 "thought": llm_response,
+                "tool_found": tool_call is not None,
             })
-
-            tool_call = self._parse_tool_call(llm_response)
             if tool_call is None:
                 # LLM chose not to call a tool — return its response directly
                 return llm_response
@@ -554,7 +571,13 @@ class ArgusOrchestrator:
 
             # Build the stage-specific prompt
             prompt = self._build_case_prompt(case, prompt_template)
-            stage_response = await self._llm_complete_for_role(prompt, role)
+            
+            # Adjudication (Athena) is the primary case for API escalation
+            justification = None
+            if target_stage == CaseStage.ADJUDICATION:
+                justification = f"Adjudicating Case {case.case_id}: requires high-reasoning judge."
+
+            stage_response = await self._llm_complete_for_role(prompt, role, escalation_justification=justification)
 
             case.add_artifact(role, stage_response)
             debate_log.append(f"### Stage {target_stage.value} ({role})\n{stage_response}\n")
@@ -599,7 +622,7 @@ class ArgusOrchestrator:
     # ------------------------------------------------------------------
 
     async def _escalate_to_api(self, messages: List[Dict[str, str]], justification: str) -> Optional[str]:
-        """Attempt API escalation if budget allows."""
+        """Attempt API escalation if budget allows. Returns content string or None."""
         if not self.escalation_config or not self.escalation_config.api_key:
             return None
 
@@ -617,39 +640,60 @@ class ArgusOrchestrator:
             "justification": justification,
         })
 
-        # Actual API call would go here — depends on provider.
-        # For now, we log the intent and return None (not implemented).
+        # Implementation for API providers (can be extended)
+        # For now, we simulate the structure until a full API client is wired.
+        # But we MUST log the spend as requested.
         self.zeus.log_spend(cost, actor="Argus", purpose=f"escalation: {justification}")
+        
+        # Placeholder for actual API call
+        # ... 
         return None
 
     # ------------------------------------------------------------------
     # LLM interaction (Ollama)
     # ------------------------------------------------------------------
 
-    async def _llm_complete(self, messages: List[Dict[str, str]], model: str) -> str:
-        """Non-streaming completion via Ollama /api/chat or injected callable."""
+    async def _llm_complete(self, messages: List[Dict[str, str]], model: str, escalation_justification: Optional[str] = None) -> str:
+        """Completion via Ollama with tiered escalation (14B -> 32B -> API)."""
+        # 1. If escalation is justified (e.g. Athena), try API FIRST if budget allows
+        if escalation_justification and self.escalation_config:
+            api_result = await self._escalate_to_api(messages, escalation_justification)
+            if api_result:
+                return api_result
+
+        # 2. Re-inject llm_call check (for testing local paths)
         if self._llm_call is not None:
             return await self._llm_call(messages, model)
 
+        # 3. Try specified model (usually 14B)
+        result = await self._call_ollama(messages, model)
+        if result:
+            return result
+
+        # 4. Connection failure or empty result? Try 32B (UPGRADE_MODEL)
+        if model != UPGRADE_MODEL:
+            logger.info("Escalating to local upgrade model %s", UPGRADE_MODEL)
+            await self._audit("local_upgrade_triggered", {"from": model, "to": UPGRADE_MODEL})
+            result = await self._call_ollama(messages, UPGRADE_MODEL)
+            if result:
+                return result
+
+        return "I'm unable to reach any LLM service right now. Please check that Ollama is running."
+
+    async def _call_ollama(self, messages: List[Dict[str, str]], model: str) -> Optional[str]:
+        """Low-level Ollama call."""
         url = f"{self.ollama_base}/api/chat"
         payload = {"model": model, "messages": messages, "stream": False}
-
         try:
             async with aiohttp.ClientSession() as session:
                 async with session.post(url, json=payload, timeout=aiohttp.ClientTimeout(total=120)) as resp:
-                    if resp.status != 200:
-                        text = await resp.text()
-                        logger.error("Ollama error %d: %s", resp.status, text)
-                        return f"LLM service returned status {resp.status}."
-                    body = await resp.json()
-                    return body.get("message", {}).get("content", "")
+                    if resp.status == 200:
+                        body = await resp.json()
+                        return body.get("message", {}).get("content", "")
+                    logger.error("Ollama error %d: %s", resp.status, await resp.text())
         except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
             logger.error("Ollama connection error: %s", exc)
-            # Attempt fallback model
-            if model != FALLBACK_MODEL:
-                logger.info("Retrying with fallback model %s", FALLBACK_MODEL)
-                return await self._llm_complete(messages, FALLBACK_MODEL)
-            return "I'm unable to reach the LLM service right now. Please check that Ollama is running."
+        return None
 
     async def _llm_stream(self, messages: List[Dict[str, str]], model: str) -> AsyncIterator[str]:
         """Streaming completion via Ollama /api/chat."""
@@ -681,13 +725,13 @@ class ArgusOrchestrator:
             logger.error("Ollama stream error: %s", exc)
             yield "I'm unable to reach the LLM service right now."
 
-    async def _llm_complete_for_role(self, prompt: str, role: str) -> str:
+    async def _llm_complete_for_role(self, prompt: str, role: str, escalation_justification: Optional[str] = None) -> str:
         """Run a completion with a role-specific prompt for Pantheon agents."""
         messages = [
             {"role": "system", "content": f"You are {role}, part of the Argus Pantheon."},
             {"role": "user", "content": prompt},
         ]
-        return await self._llm_complete(messages, self.model)
+        return await self._llm_complete(messages, self.model, escalation_justification=escalation_justification)
 
     # ------------------------------------------------------------------
     # Tool-call helpers

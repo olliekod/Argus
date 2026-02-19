@@ -634,3 +634,62 @@ class TestParseToolCall:
         orch = self._make_orchestrator(tmp_path)
         result = orch._parse_tool_call('{"action": "get_status"}')
         assert result is None
+
+
+# ---------------------------------------------------------------------------
+# Tiered Escalation tests
+# ---------------------------------------------------------------------------
+
+class TestTieredEscalation:
+    @pytest.mark.asyncio
+    async def test_escalation_from_14b_to_32b_on_parse_failure(self, tmp_path):
+        zeus, delphi, runtime = _make_stack(tmp_path)
+
+        @delphi.register(name="my_tool", description="Test tool", risk_level=RiskLevel.READ_ONLY)
+        def my_tool() -> str:
+            return "ok"
+
+        calls = []
+
+        async def _failing_parse_llm(messages, model):
+            calls.append(model)
+            if model == "qwen2.5:14b":
+                return "I'll use my_tool but in bad format."
+            return json.dumps({"tool": "my_tool", "args": {}})
+
+        orch = ArgusOrchestrator(zeus, delphi, runtime, llm_call=_failing_parse_llm)
+        # Default is 14b now
+        await orch.chat("run my_tool")
+
+        assert "qwen2.5:14b" in calls
+        assert "qwen2.5:32b" in calls
+
+    @pytest.mark.asyncio
+    async def test_athena_escalation_to_api(self, tmp_path):
+        zeus, delphi, runtime = _make_stack(tmp_path)
+
+        esc_config = EscalationConfig(
+            provider=EscalationProvider.CLAUDE,
+            api_key="test-key",
+            estimated_cost_per_call=0.05,
+        )
+
+        api_called = False
+
+        async def _local_llm(messages, model):
+            return "local response"
+
+        orch = ArgusOrchestrator(zeus, delphi, runtime, llm_call=_local_llm, escalation_config=esc_config)
+
+        # Mock _escalate_to_api to verify it's called
+        async def mocked_escalate(messages, justification):
+            nonlocal api_called
+            api_called = True
+            return "api adjudication"
+
+        orch._escalate_to_api = mocked_escalate
+
+        # Research protocol triggers Athena at Stage 5
+        await orch.chat("research strategy X")
+
+        assert api_called is True

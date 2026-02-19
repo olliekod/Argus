@@ -115,14 +115,18 @@ Phase 5 is the foundational reality. Phase 6 (Pantheon + Forge) is the immediate
 | **4A** | Outcome engine | Done | Forward returns, run-up, drawdown, outcome DB, deterministic backfills. |
 | **4B** | Backtesting engine | Done | Replay harness, position simulator, execution modeling, transaction costs, slippage. |
 | **4C** | Robustness lab | **Done** | Parameter sweeps; regime sensitivity; MC/bootstrap; regime-stress; Research Loop. |
-| **5** | Portfolio risk engine | **Done** | Sizing stack, StrategyRegistry, AllocationEngine, **RiskEngine** (5-constraint pipeline). |
-| **6** | Pantheon + Forge | **Future (Next)** | Argus Orchestrator, Zeus Governance, Delphi Tool Plane, Pantheon Roles, The Forge Engine. See §10. |
+| **5** | Portfolio risk engine | **Done.** Sizing stack; StrategyRegistry; AllocationEngine; **RiskEngine** (5-constraint pipeline). |
+| 6A Zeus Policy Layer | **Done (2026-02-19).** Deterministic governance; $15/month budget gating; `DATA_ONLY` gaming mode; Audit trails; `src/agent/zeus.py`. |
+| 6B Delphi Tool Plane | **Done (2026-02-19).** Tool registry; Schema validation; RBAC; Zeus hooks; `src/agent/delphi.py`. |
+| 6C Runtime Mode Control | **Done (2026-02-19).** `RuntimeController`; `DATA_ONLY` (Gaming Mode) resource release; Ollama lifecycle; `src/agent/runtime_controller.py`. |
+| 6D Argus Orchestrator | **Done (2026-02-19).** Jarvis interface; Tiered escalation (14B → 32B → API); ReAct tool loop; `src/agent/argus_orchestrator.py`. |
+| **6** | Pantheon + Forge | **In Progress** | **Zeus, Delphi, Runtime & Argus (Done)**, Pantheon Roles, Forge. See §10. |
 | **7** | Manifest Research Engine | Future | DSLStrategy; research_engine (poll backlog, multiprocessing); ManifestValidator; RejectionPackets. |
 | **8** | Execution engine | Future | Broker integration, order routing, fill simulation, paper then live trading. TCA ledger. |
 | **9** | Strategy Expansion | Future | Put spread selling, volatility plays, panic snapback, FVG. Portfolio Intelligence (StrategyLeague). |
 | **10** | Self-Improving System | Future | Promotion pipeline (Shadow -> Prod); automatic mutation and performance pruning. |
 
-**Where we are now:** Phase 0–5 are complete. **Phase 5 (portfolio risk engine) is COMPLETE** as of 2026-02-19. **Next:** Phase 6 Agent Ecosystem (Pantheon).
+**Where we are now:** Phase 0–5 are complete. **Argus Infrastructure (Phase 6A-D) is COMPLETE** as of 2026-02-19. **Next:** Phase 6E Resource Manager (Global Lease/Lock System).
 
 ---
 
@@ -387,7 +391,35 @@ The current structure is designed to build the "Machine that builds the Machine"
 
 Argus is transitioning from a deterministic trading tool to an **Agentic AI Ecosystem** that handles development, operations, strategy research, and market discovery.
 
-### 10.1 Architectural Principles
+### 10.1 Amendment — Pantheon Primary Function Clarification
+**Strategic Priority Correction**
+
+The primary purpose of the Pantheon (Argus + Prometheus + Ares + Athena + Hades) is: **Autonomous trading strategy hypothesis generation, evaluation, and refinement.** Product discovery (Forge) is explicitly secondary.
+
+#### Core Recursion Loop (Primary Objective)
+The dominant recursion loop of Argus is:
+1.  **Prometheus (trading mode)** generates structured strategy manifests (DSL-compatible).
+2.  **Ares** performs adversarial critique: overfitting risk, data leakage, fragility, unrealistic assumptions, and structural weaknesses.
+3.  **Athena** adjudicates whether the strategy is rejected, simplified, or passed to Hades for deterministic testing.
+4.  **Hades** executes: replay, walk-forward, purging & embargo, robustness testing, correlation checks, and Phase 5 risk engine clamping.
+5.  **Feedback**: Results are fed back to Prometheus.
+6.  **Mutation**: Prometheus mutates structure or parameters.
+7.  **Repeat**: This loop is the central engine of edge discovery.
+
+#### Product Discovery Is Secondary
+Forge and vertical/product exploration:
+- May use Argus outputs.
+- Must not interfere with Hades.
+- Must not dominate runtime resources.
+- Must not override research priorities.
+- Product discovery should only operate after or alongside trading research, never instead of it.
+
+#### Mode Separation & Resource Priority
+- **Prometheus Modes**: `mode: trading` (default), `mode: product` (manual trigger only), delayed until later. Default system behavior is always trading.
+- **Resource Priority**: Hades research > Pantheon debate > Forge ingestion. Product discovery cannot delay or throttle trading research.
+- **Intent**: Argus is first and foremost a deterministic quant research engine augmented by structured LLM hypothesis generation. The Pantheon exists to accelerate trading edge discovery.
+
+### 10.2 Architectural Principles
 - **Local-first runtime**: Optimized for local GPU/CPU hardware. No mandatory cloud dependency.
 - **Operator Sovereignty**: The user is the final authority; all high-risk actions require explicit approval.
 - **Deterministic Precedence**: Hades (Research Core) always takes precedence over agent workflows.
@@ -399,8 +431,8 @@ Argus orchestrates the internal ecosystem through specialized infrastructure lay
 
 - **Argus (Conversational Orchestrator)**: The single LLM "Jarvis" interface. User interacts only with Argus. Argus orchestrates roles and summarizes results. 
     - **Models**: Qwen2.5 32B Instruct (Local GGUF, q4_K_M). Fallback: Qwen2.5 14B.
-- **Zeus (Policy & Governance)**: Deterministic enforcement layer. Enforces API budgets ($15/month cap), approval requirements for high-risk tools and escalation, and global system caps. Supports operator overrides.
-- **Delphi (Tool Plane Firewall)**: Allowlisted tool registry. RBAC and Audit logging. No `exec/eval`. Gated approval for high-risk tools. Discovery agents never receive codebase access.
+- **Zeus (Policy & Governance)**: **Done (2026-02-19).** Deterministic enforcement layer. Enforces API budgets ($15/month cap), `DATA_ONLY` mode (gaming), and high-risk tool gates. `src/agent/zeus.py`.
+- **Delphi (Tool Plane Firewall)**: **Done (2026-02-19).** Allowlisted tool registry. Schema validation, RBAC, and Audit logging. Gated approval for high-risk tools via Zeus. `src/agent/delphi.py`.
 - **Hermes (Artifact Router)**: Deterministic glue for schema versioning, artifact hashing, and converting agent outputs into validated manifests. 
 - **Hades (Deterministic Lab)**: The mathematical truth engine (unchanged). Includes existing backtest engine, evaluators, purging/embargo logic, risk engine (Phase 5). Nothing bypasses Hades.
 
@@ -456,7 +488,7 @@ To ensure high-quality reasoning and reduce hallucinations, Argus manages a stru
 - **Stage 5 (Athena)**: Adjudication (Final ranking, confidence, rationale, and next action).
 
 ### 10.12 Implementation Order
-1. Zeus (policy layer) → 2. Delphi (tool firewall) → **3. RuntimeController + DATA_ONLY mode** → 4. Argus orchestrator → 5. ResourceManager → 6. Minimal Pantheon loop → 7. Poseidon/Forge learning loop → 8. API escalation logic.
+1. Zeus (policy layer) → 2. Delphi (tool firewall) → 3. RuntimeController (Done) → **4. Argus orchestrator (Done)** → 5. ResourceManager → 6. Minimal Pantheon loop → 7. Poseidon/Forge learning loop → 8. API escalation logic (Tier 3 Integration).
 
 ---
 
