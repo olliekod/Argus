@@ -19,8 +19,10 @@ from src.agent.argus_orchestrator import (
 )
 from src.agent.delphi import DelphiToolRegistry, RiskLevel
 from src.agent.runtime_controller import RuntimeController
+from src.agent.pantheon.roles import parse_critique_response
 from src.agent.zeus import RuntimeMode, ZeusPolicyEngine
 from src.core.config import ZeusConfig
+from src.core.manifests import ManifestValidationError
 
 
 # ---------------------------------------------------------------------------
@@ -663,6 +665,74 @@ class TestTieredEscalation:
 
         assert "qwen2.5:14b" in calls
         assert "qwen2.5:32b" in calls
+
+
+    @pytest.mark.asyncio
+    async def test_prometheus_32b_parse_retry_escalates(self, tmp_path):
+        zeus, delphi, runtime = _make_stack(tmp_path)
+
+        esc_config = EscalationConfig(
+            provider=EscalationProvider.CLAUDE,
+            api_key="test-key",
+            estimated_cost_per_call=0.05,
+        )
+
+        call_log = []
+        prometheus_calls = 0
+
+        async def mocked_llm_complete(messages, model, escalation_justification=None):
+            nonlocal prometheus_calls
+            call_log.append({
+                "model": model,
+                "escalation_justification": escalation_justification,
+            })
+
+            system_prompt = messages[0]["content"] if messages else ""
+            if "Prometheus" in system_prompt:
+                prometheus_calls += 1
+                if prometheus_calls <= 2:
+                    return "<manifest>{not valid json}</manifest>"
+                if escalation_justification:
+                    return "<manifest>{not valid json}</manifest>"
+                return "<manifest>{\"name\": \"x\"}</manifest>"
+
+            if "Ares" in system_prompt:
+                return "<critique>{not valid json}</critique>"
+
+            return "<verdict>{not valid json}</verdict>"
+
+        orch = ArgusOrchestrator(zeus, delphi, runtime, llm_call=_noop_llm, escalation_config=esc_config)
+        orch._llm_complete = mocked_llm_complete
+
+        await orch.chat("research a momentum strategy approach")
+
+        assert len(call_log) >= 3
+        assert call_log[0]["model"] == "qwen2.5:14b"
+        assert call_log[1]["model"] == "qwen2.5:32b"
+        assert call_log[2]["model"] == "qwen2.5:32b"
+        assert call_log[2]["escalation_justification"] is not None
+
+    def test_ares_validation_enforcement(self):
+        critique_response = """
+<critique>
+{
+  "manifest_hash": "abc123",
+  "findings": [
+    {
+      "category": "execution",
+      "severity": "blocker",
+      "description": "Single finding only",
+      "evidence": "Not enough adversarial depth",
+      "recommendation": "Provide at least three findings"
+    }
+  ],
+  "summary": "Insufficient critique"
+}
+</critique>
+"""
+
+        with pytest.raises(ManifestValidationError):
+            parse_critique_response(critique_response, manifest_hash="abc123")
 
     @pytest.mark.asyncio
     async def test_athena_escalation_to_api(self, tmp_path):
