@@ -21,6 +21,7 @@ import aiohttp
 
 from src.agent.delphi import DelphiToolRegistry, ToolResult
 from src.agent.pantheon.factory import FactoryPipe
+from src.agent.resource_manager import AgentResourceManager
 from src.agent.pantheon.hermes import HermesRouter
 from src.agent.pantheon.roles import (
     ARES,
@@ -34,6 +35,7 @@ from src.agent.pantheon.roles import (
     parse_verdict_response,
 )
 from src.agent.runtime_controller import RuntimeController
+from src.connectors.api_llm_clients import AnthropicClient, OpenAIClient
 from src.agent.zeus import RuntimeMode, ZeusPolicyEngine
 from src.core.manifests import (
     AresCritique,
@@ -165,7 +167,7 @@ class EscalationProvider(str, Enum):
 @dataclass
 class EscalationConfig:
     provider: EscalationProvider = EscalationProvider.CLAUDE
-    model: str = "claude-3-5-sonnet-20241022"
+    model: str = ""
     api_base: str = ""
     api_key: str = ""
     estimated_cost_per_call: float = 0.05
@@ -264,6 +266,8 @@ class ArgusOrchestrator:
         llm_call: Optional[Callable[..., Any]] = None,
         factory_pipe: Optional[FactoryPipe] = None,
         hermes_router: Optional[HermesRouter] = None,
+        resource_manager: Optional[AgentResourceManager] = None,
+        max_concurrent_llm_calls: int = 2,
     ):
         self.zeus = zeus
         self.delphi = delphi
@@ -288,6 +292,11 @@ class ArgusOrchestrator:
         # Persistent strategy memory + promotion handoff pipeline
         self.factory_pipe = factory_pipe or FactoryPipe()
         self.hermes_router = hermes_router or HermesRouter()
+
+        # Runtime resource controls for bounded LLM concurrency
+        self.resource_manager = resource_manager or AgentResourceManager(
+            max_concurrent_llm_calls=max_concurrent_llm_calls
+        )
 
         # Initialise system prompt
         self._refresh_system_prompt()
@@ -821,14 +830,33 @@ class ArgusOrchestrator:
             "justification": justification,
         })
 
-        # Implementation for API providers (can be extended)
-        # For now, we simulate the structure until a full API client is wired.
-        # But we MUST log the spend as requested.
-        self.zeus.log_spend(cost, actor="Argus", purpose=f"escalation: {justification}")
-        
-        # Placeholder for actual API call
-        # ... 
-        return None
+        if self.escalation_config.provider == EscalationProvider.CLAUDE:
+            client = AnthropicClient(
+                api_key=self.escalation_config.api_key,
+                model=self.escalation_config.model or AnthropicClient.DEFAULT_MODEL,
+                api_base=self.escalation_config.api_base,
+            )
+        elif self.escalation_config.provider == EscalationProvider.OPENAI:
+            client = OpenAIClient(
+                api_key=self.escalation_config.api_key,
+                model=self.escalation_config.model or OpenAIClient.DEFAULT_MODEL,
+                api_base=self.escalation_config.api_base,
+            )
+        else:
+            return None
+
+        try:
+            response = await client.complete(messages)
+            content = response.get("message", {}).get("content", "")
+            self.zeus.log_spend(cost, actor="Argus", purpose=f"escalation: {justification}")
+            return content
+        except (aiohttp.ClientError, asyncio.TimeoutError) as exc:
+            logger.error("API escalation failed: %s", exc)
+            await self._audit("escalation_error", {
+                "provider": self.escalation_config.provider.value,
+                "error": str(exc),
+            })
+            return None
 
     # ------------------------------------------------------------------
     # LLM interaction (Ollama)
@@ -836,30 +864,31 @@ class ArgusOrchestrator:
 
     async def _llm_complete(self, messages: List[Dict[str, str]], model: str, escalation_justification: Optional[str] = None) -> str:
         """Completion via Ollama with tiered escalation (14B -> 32B -> API)."""
-        # 1. If escalation is justified (e.g. Athena), try API FIRST if budget allows
-        if escalation_justification and self.escalation_config:
-            api_result = await self._escalate_to_api(messages, escalation_justification)
-            if api_result:
-                return api_result
+        async with self.resource_manager.llm_slot():
+            # 1. If escalation is justified (e.g. Athena), try API FIRST if budget allows
+            if escalation_justification and self.escalation_config:
+                api_result = await self._escalate_to_api(messages, escalation_justification)
+                if api_result:
+                    return api_result
 
-        # 2. Re-inject llm_call check (for testing local paths)
-        if self._llm_call is not None:
-            return await self._llm_call(messages, model)
+            # 2. Re-inject llm_call check (for testing local paths)
+            if self._llm_call is not None:
+                return await self._llm_call(messages, model)
 
-        # 3. Try specified model (usually 14B)
-        result = await self._call_ollama(messages, model)
-        if result:
-            return result
-
-        # 4. Connection failure or empty result? Try 32B (UPGRADE_MODEL)
-        if model != UPGRADE_MODEL:
-            logger.info("Escalating to local upgrade model %s", UPGRADE_MODEL)
-            await self._audit("local_upgrade_triggered", {"from": model, "to": UPGRADE_MODEL})
-            result = await self._call_ollama(messages, UPGRADE_MODEL)
+            # 3. Try specified model (usually 14B)
+            result = await self._call_ollama(messages, model)
             if result:
                 return result
 
-        return "I'm unable to reach any LLM service right now. Please check that Ollama is running."
+            # 4. Connection failure or empty result? Try 32B (UPGRADE_MODEL)
+            if model != UPGRADE_MODEL:
+                logger.info("Escalating to local upgrade model %s", UPGRADE_MODEL)
+                await self._audit("local_upgrade_triggered", {"from": model, "to": UPGRADE_MODEL})
+                result = await self._call_ollama(messages, UPGRADE_MODEL)
+                if result:
+                    return result
+
+            return "I'm unable to reach any LLM service right now. Please check that Ollama is running."
 
     async def _call_ollama(self, messages: List[Dict[str, str]], model: str) -> Optional[str]:
         """Low-level Ollama call."""
