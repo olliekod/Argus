@@ -160,7 +160,8 @@ Where current BTC IV sits vs recent history (0–100%). High rank = IV is high r
         self._get_followed: Optional[Callable] = None
         self._get_sentiment: Optional[Callable] = None
         self._on_trade_confirmation: Optional[Callable] = None
-        
+        self._on_chat: Optional[Callable] = None
+
         # Track last signal for yes/no confirmation
         self._last_signal_id: Optional[str] = None
         self._last_signal_time: Optional[datetime] = None
@@ -208,7 +209,11 @@ Where current BTC IV sits vs recent history (0–100%). High rank = IV is high r
         self._get_followed = get_followed
         self._get_sentiment = get_sentiment
         self._on_trade_confirmation = on_trade_confirmation
-    
+
+    def set_chat_callback(self, callback: Callable) -> None:
+        """Set the callback for free-form chat messages routed to the AI agent."""
+        self._on_chat = callback
+
     async def start_polling(self) -> None:
         """Start listening for incoming messages."""
         if self._polling_task and not self._polling_task.done():
@@ -1018,20 +1023,37 @@ Where current BTC IV sits vs recent history (0–100%). High rank = IV is high r
             await update.message.reply_text(f"❌ Error: {e}")
 
     async def _handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-        """Handle non-command messages (yes/no trade confirmations)."""
+        """Handle non-command messages (trade confirmations or AI chat)."""
         if not update.message or not update.message.text:
             return
-        
-        text = update.message.text.strip().lower()
-        
-        # Check for yes/no response
-        if text.startswith("yes") or text.startswith("no"):
-            await self._handle_trade_confirmation(update, text)
-        else:
-            # Unknown message, provide help
-            await update.message.reply_text(
-                "❓ Unknown command. Type /help for available commands."
-            )
+
+        text = update.message.text.strip()
+        lower = text.lower()
+
+        # Priority 1: yes/no trade confirmations
+        if lower.startswith("yes") or lower.startswith("no"):
+            await self._handle_trade_confirmation(update, lower)
+            return
+
+        # Priority 2: route to AI agent if chat callback is wired
+        if self._on_chat:
+            try:
+                response = await self._on_chat(text)
+                await update.message.reply_text(
+                    f"🧠 {response}",
+                    parse_mode=None,
+                )
+            except Exception as e:
+                logger.error(f"AI chat error: {e}")
+                await update.message.reply_text(
+                    "⚠️ Brain offline. Check Ollama status."
+                )
+            return
+
+        # Fallback: no AI agent available
+        await update.message.reply_text(
+            "❓ Unknown command. Type /help for available commands."
+        )
     
     async def _handle_trade_confirmation(self, update: Update, text: str) -> None:
         """Handle yes/no trade confirmation."""

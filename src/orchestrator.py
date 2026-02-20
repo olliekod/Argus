@@ -19,7 +19,7 @@ from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from .core.config import load_all_config, validate_secrets, get_secret
+from .core.config import load_all_config, validate_secrets, get_secret, ZeusConfig
 from .core.database import Database
 from .core.logger import setup_logger, get_logger, uptime_seconds
 from .core.bus import EventBus
@@ -84,6 +84,10 @@ from .soak.tape import TapeRecorder
 from .soak.resource_monitor import ResourceMonitor
 from .soak.summary import build_soak_summary
 from .core.liquid_etf_universe import get_liquid_etf_universe
+from .agent.zeus import ZeusPolicyEngine, RuntimeMode
+from .agent.delphi import DelphiToolRegistry
+from .agent.runtime_controller import RuntimeController
+from .agent.argus_orchestrator import ArgusOrchestrator as AgentOrchestrator
 
 # Default options/IV underlyings: IBIT + liquid ETF universe (no BITO)
 _DEFAULT_OPTIONS_SYMBOLS = sorted({"IBIT"} | set(get_liquid_etf_universe()))
@@ -315,6 +319,9 @@ class ArgusOrchestrator:
         # Market hours config
         self._mh_cfg = self.config.get('market_hours', {})
 
+        # AI agent stack (initialized in setup())
+        self.ai_agent: Optional[AgentOrchestrator] = None
+
         self.logger.info("Argus Orchestrator initialized")
     
     def _phase(self, name: str):
@@ -482,6 +489,37 @@ class ArgusOrchestrator:
         # Wire soak guardian alerts to telegram
         if self.telegram:
             self.soak_guardian._alert_cb = self._send_soak_alert
+
+        # Phase 6b: AI agent stack (Zeus, Delphi, RuntimeController, AgentOrchestrator)
+        try:
+            zeus_config = ZeusConfig(
+                monthly_budget_cap=15.0,
+                governance_db_path=str(
+                    Path(self.config.get('system', {}).get('database_path', 'data/argus.db')).parent
+                    / "argus_governance.db"
+                ),
+            )
+            zeus = ZeusPolicyEngine(zeus_config)
+            delphi = DelphiToolRegistry(
+                zeus=zeus,
+                role_tool_allowlist={"Argus": {"*"}},
+            )
+            delphi.discover_tools()
+
+            class _SimpleResourceHandle:
+                gpu_enabled: bool = True
+
+            runtime = RuntimeController(zeus=zeus, resource_manager=_SimpleResourceHandle())
+            self.ai_agent = AgentOrchestrator(
+                zeus=zeus,
+                delphi=delphi,
+                runtime=runtime,
+            )
+            self.logger.info("AI agent stack initialized (Zeus + Delphi + RuntimeController)")
+        except Exception:
+            self.logger.warning("AI agent stack failed to initialize — chat disabled", exc_info=True)
+            self.ai_agent = None
+        self._phase("ai_agent_init")
 
         # Phase 7: Detectors (with bus attachment)
         await self._setup_detectors()
@@ -1083,18 +1121,46 @@ class ArgusOrchestrator:
             get_followed=self._get_followed_traders,
             get_sentiment=self._get_sentiment_summary,
         )
-        
+
+        # Wire AI chat bridge
+        if self.ai_agent is not None:
+            self.telegram.set_chat_callback(self._handle_ai_chat)
+
         # Wire up Soak Guardian alerts (filtered)
         if hasattr(self, 'soak_guardian'):
             self.soak_guardian._alert_cb = self._handle_soak_alert
     
+    async def _handle_ai_chat(self, message: str) -> str:
+        """Route a Telegram chat message through the AI agent with safety guards."""
+        if self.ai_agent is None:
+            return "AI agent is not initialized. Check startup logs."
+
+        # Mode awareness: if Zeus is in DATA_ONLY, the GPU/LLM is down
+        try:
+            current_mode = self.ai_agent.zeus.current_mode
+        except Exception:
+            current_mode = None
+
+        if current_mode == RuntimeMode.DATA_ONLY:
+            return (
+                "AI is currently hibernating (Gaming/DATA_ONLY mode). "
+                "GPU resources are reserved for other tasks. "
+                "Switch to ACTIVE mode to re-enable chat."
+            )
+
+        try:
+            return await self.ai_agent.chat(message)
+        except Exception as exc:
+            self.logger.error("AI chat failed: %s", exc, exc_info=True)
+            return "Brain offline. Check Ollama status."
+
     async def _on_conditions_alert(self, snapshot) -> None:
         """Handle conditions threshold crossing alert."""
         if not self.telegram:
             return
         if self.research_enabled and not self.research_alerts_enabled:
             return
-        
+
         details = {
             'BTC IV': f"{snapshot.btc_iv:.0f}% ({snapshot.iv_signal})",
             'Funding': f"{snapshot.funding_rate:+.3f}% ({snapshot.funding_signal})",
