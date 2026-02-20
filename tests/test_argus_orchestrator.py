@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import asyncio
 from typing import Any, Dict, List
 from unittest.mock import AsyncMock
 
@@ -21,6 +22,7 @@ from src.agent.delphi import DelphiToolRegistry, RiskLevel
 from src.agent.runtime_controller import RuntimeController
 from src.agent.pantheon.roles import parse_critique_response
 from src.agent.zeus import RuntimeMode, ZeusPolicyEngine
+from src.agent.resource_manager import AgentResourceManager
 from src.core.config import ZeusConfig
 from src.core.manifests import ManifestValidationError
 
@@ -478,7 +480,7 @@ class TestEscalation:
         assert result is None
 
     @pytest.mark.asyncio
-    async def test_budget_checked_for_every_escalation(self, tmp_path):
+    async def test_budget_checked_for_every_escalation(self, tmp_path, monkeypatch):
         zeus, delphi, runtime = _make_stack(tmp_path, monthly_budget_cap=15.0)
 
         esc_config = EscalationConfig(
@@ -492,11 +494,35 @@ class TestEscalation:
             escalation_config=esc_config,
         )
 
+        async def _mock_complete(self, messages):
+            return {"message": {"content": "mocked-api"}}
+
+        monkeypatch.setattr("src.connectors.api_llm_clients.AnthropicClient.complete", _mock_complete)
+
         spend_before = zeus.monthly_spend
         await orch._escalate_to_api([], "testing budget track")
         spend_after = zeus.monthly_spend
         # Spend should have been logged
         assert spend_after > spend_before
+
+
+class TestResourceManager:
+    @pytest.mark.asyncio
+    async def test_llm_slots_block_when_limit_reached(self):
+        manager = AgentResourceManager(max_concurrent_llm_calls=2)
+        active = 0
+        peak = 0
+
+        async def _worker():
+            nonlocal active, peak
+            async with manager.llm_slot():
+                active += 1
+                peak = max(peak, active)
+                await asyncio.sleep(0.05)
+                active -= 1
+
+        await asyncio.gather(*[_worker() for _ in range(5)])
+        assert peak == 2
 
 
 # ---------------------------------------------------------------------------

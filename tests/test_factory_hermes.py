@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import Mock
 
 import pytest
@@ -145,3 +146,20 @@ def test_evidence_grading(tmp_path):
 
     assert stored is not None
     assert stored["strategy"]["grading"] == "Gold"
+
+
+def test_factory_concurrent_writes_are_consistent(tmp_path):
+    factory = FactoryPipe(db_path=str(tmp_path / "factory.db"))
+
+    def _persist(i: int) -> int:
+        case = _build_case(case_id=f"case_{i}", confidence=0.65, blockers_final=i % 2)
+        return factory.persist_case(case)
+
+    with ThreadPoolExecutor(max_workers=6) as pool:
+        ids = list(pool.map(_persist, range(12)))
+
+    assert len(ids) == 12
+    for i in range(12):
+        stored = factory.get_case(f"case_{i}")
+        assert stored is not None
+        assert len(stored["evidence"]) == 5

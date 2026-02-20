@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -36,6 +37,7 @@ class FactoryPipe:
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
         self.grader = EvidenceGrader()
+        self._write_lock = threading.Lock()
         self._init_schema()
 
     def _connect(self) -> sqlite3.Connection:
@@ -45,9 +47,10 @@ class FactoryPipe:
         return conn
 
     def _init_schema(self) -> None:
-        with self._connect() as conn:
-            conn.executescript(
-                """
+        with self._write_lock:
+            with self._connect() as conn:
+                conn.executescript(
+                    """
                 CREATE TABLE IF NOT EXISTS strategies (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     case_id TEXT NOT NULL UNIQUE,
@@ -68,7 +71,7 @@ class FactoryPipe:
                     FOREIGN KEY(strategy_id) REFERENCES strategies(id) ON DELETE CASCADE
                 );
                 """
-            )
+                )
 
     def persist_case(self, case: Any) -> int:
         """Persist a completed case object and all stage artifacts."""
@@ -116,43 +119,44 @@ class FactoryPipe:
         strategy_name = final_manifest.get("name", objective[:120]) if final_manifest else objective[:120]
         grading = self.grader.grade(athena_confidence, final_blockers)
 
-        with self._connect() as conn:
-            cur = conn.execute(
-                """
-                INSERT OR REPLACE INTO strategies
-                    (case_id, name, status, final_manifest, athena_confidence, grading)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    case_id,
-                    strategy_name,
-                    status,
-                    json.dumps(final_manifest) if final_manifest is not None else None,
-                    athena_confidence,
-                    grading,
-                ),
-            )
-
-            strategy_id = cur.lastrowid
-            if strategy_id == 0:
-                row = conn.execute(
-                    "SELECT id FROM strategies WHERE case_id = ?", (case_id,)
-                ).fetchone()
-                strategy_id = int(row["id"])
-
-            conn.execute("DELETE FROM evidence WHERE strategy_id = ?", (strategy_id,))
-            for artifact in artifacts:
-                role = str(artifact.get("role", ""))
-                stage = int(artifact.get("stage", -1))
-                content = artifact.get("content", "")
-                manifest_hash = self._derive_manifest_hash(content, role, latest_manifest_hash)
-                conn.execute(
+        with self._write_lock:
+            with self._connect() as conn:
+                cur = conn.execute(
                     """
-                    INSERT INTO evidence(strategy_id, stage, role, content, manifest_hash)
-                    VALUES (?, ?, ?, ?, ?)
+                    INSERT OR REPLACE INTO strategies
+                        (case_id, name, status, final_manifest, athena_confidence, grading)
+                    VALUES (?, ?, ?, ?, ?, ?)
                     """,
-                    (strategy_id, stage, role, content, manifest_hash),
+                    (
+                        case_id,
+                        strategy_name,
+                        status,
+                        json.dumps(final_manifest) if final_manifest is not None else None,
+                        athena_confidence,
+                        grading,
+                    ),
                 )
+
+                strategy_id = cur.lastrowid
+                if strategy_id == 0:
+                    row = conn.execute(
+                        "SELECT id FROM strategies WHERE case_id = ?", (case_id,)
+                    ).fetchone()
+                    strategy_id = int(row["id"])
+
+                conn.execute("DELETE FROM evidence WHERE strategy_id = ?", (strategy_id,))
+                for artifact in artifacts:
+                    role = str(artifact.get("role", ""))
+                    stage = int(artifact.get("stage", -1))
+                    content = artifact.get("content", "")
+                    manifest_hash = self._derive_manifest_hash(content, role, latest_manifest_hash)
+                    conn.execute(
+                        """
+                        INSERT INTO evidence(strategy_id, stage, role, content, manifest_hash)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (strategy_id, stage, role, content, manifest_hash),
+                    )
 
         return strategy_id
 
