@@ -733,7 +733,13 @@ def parse_critique_response(response: str, manifest_hash: str = "") -> AresCriti
     if "manifest_hash" not in data:
         data["manifest_hash"] = manifest_hash
 
+    if manifest_hash and data.get("manifest_hash") != manifest_hash:
+        raise ManifestValidationError(
+            "Ares critique manifest_hash does not match the manifest under review."
+        )
+
     critique = AresCritique.from_dict(data)
+    critique.validate()
     return critique
 
 

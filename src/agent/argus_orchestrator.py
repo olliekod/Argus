@@ -624,47 +624,100 @@ class ArgusOrchestrator:
             # Parse structured output and handle validation failures
             parse_error = None
             if target_stage in (CaseStage.PROPOSAL_V1, CaseStage.REVISION_V2):
-                try:
-                    current_manifest = parse_manifest_response(stage_response)
-                    current_manifest.status = (
-                        ManifestStatus.DRAFT if target_stage == CaseStage.PROPOSAL_V1
-                        else ManifestStatus.REVISED
-                    )
-                except ManifestValidationError as exc:
-                    parse_error = str(exc)
-                    logger.warning(
-                        "Prometheus produced invalid manifest at stage %d: %s",
-                        target_stage.value, exc,
-                    )
-                    # Escalation: retry with higher-tier model
-                    if model != UPGRADE_MODEL:
-                        logger.info("Escalating Prometheus to 32B for manifest retry.")
-                        stage_response = await self._llm_complete(
-                            messages, UPGRADE_MODEL,
-                            escalation_justification=f"Prometheus manifest parse failure: {exc}",
-                        )
-                        try:
-                            current_manifest = parse_manifest_response(stage_response)
-                            parse_error = None
-                        except ManifestValidationError as exc2:
-                            parse_error = str(exc2)
+                parse_error = None
+                parse_attempts = [(model, stage_response)]
 
-                    if parse_error:
-                        await self._audit("manifest_parse_failure", {
-                            "case_id": case_id,
-                            "stage": target_stage.value,
-                            "error": parse_error,
-                        })
+                # If we started on 14B, also try 32B locally.
+                if model == DEFAULT_MODEL:
+                    logger.info("Escalating Prometheus to 32B for manifest retry.")
+                    retry_response = await self._llm_complete(messages, UPGRADE_MODEL)
+                    parse_attempts.append((UPGRADE_MODEL, retry_response))
+
+                for _, response_text in parse_attempts:
+                    stage_response = response_text
+                    try:
+                        current_manifest = parse_manifest_response(stage_response)
+                        current_manifest.status = (
+                            ManifestStatus.DRAFT if target_stage == CaseStage.PROPOSAL_V1
+                            else ManifestStatus.REVISED
+                        )
+                        parse_error = None
+                        break
+                    except ManifestValidationError as exc:
+                        parse_error = str(exc)
+                        logger.warning(
+                            "Prometheus produced invalid manifest at stage %d: %s",
+                            target_stage.value, exc,
+                        )
+
+                # If local tiers failed (or we started at 32B), attempt API escalation.
+                if parse_error:
+                    escalation_response = await self._llm_complete(
+                        messages,
+                        UPGRADE_MODEL,
+                        escalation_justification=(
+                            f"Prometheus manifest parse failure at stage {target_stage.value}: {parse_error}"
+                        ),
+                    )
+                    stage_response = escalation_response
+                    try:
+                        current_manifest = parse_manifest_response(stage_response)
+                        current_manifest.status = (
+                            ManifestStatus.DRAFT if target_stage == CaseStage.PROPOSAL_V1
+                            else ManifestStatus.REVISED
+                        )
+                        parse_error = None
+                    except ManifestValidationError as exc:
+                        parse_error = str(exc)
+
+                if parse_error:
+                    await self._audit("manifest_parse_failure", {
+                        "case_id": case_id,
+                        "stage": target_stage.value,
+                        "error": parse_error,
+                    })
 
             elif target_stage in (CaseStage.CRITIQUE_V1, CaseStage.FINAL_ATTACK):
                 manifest_hash = current_manifest.compute_hash() if current_manifest else ""
-                try:
-                    current_critique = parse_critique_response(stage_response, manifest_hash)
-                except ManifestValidationError as exc:
-                    logger.warning(
-                        "Ares produced invalid critique at stage %d: %s",
-                        target_stage.value, exc,
+                parse_error = None
+                parse_attempts = [(model, stage_response)]
+
+                # If we started on 14B, also try 32B locally.
+                if model == DEFAULT_MODEL:
+                    retry_response = await self._llm_complete(messages, UPGRADE_MODEL)
+                    parse_attempts.append((UPGRADE_MODEL, retry_response))
+
+                for _, response_text in parse_attempts:
+                    stage_response = response_text
+                    try:
+                        current_critique = parse_critique_response(stage_response, manifest_hash)
+                        parse_error = None
+                        break
+                    except ManifestValidationError as exc:
+                        parse_error = str(exc)
+                        logger.warning(
+                            "Ares produced invalid critique at stage %d: %s",
+                            target_stage.value, exc,
+                        )
+
+                if parse_error:
+                    escalation_response = await self._llm_complete(
+                        messages,
+                        UPGRADE_MODEL,
+                        escalation_justification=(
+                            f"Ares critique parse failure at stage {target_stage.value}: {parse_error}"
+                        ),
                     )
+                    stage_response = escalation_response
+                    try:
+                        current_critique = parse_critique_response(stage_response, manifest_hash)
+                        parse_error = None
+                    except ManifestValidationError as exc:
+                        parse_error = str(exc)
+                        logger.warning(
+                            "Ares produced invalid critique after escalation at stage %d: %s",
+                            target_stage.value, exc,
+                        )
 
             elif target_stage == CaseStage.ADJUDICATION:
                 try:
