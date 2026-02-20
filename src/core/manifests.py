@@ -234,6 +234,7 @@ class StrategyManifest:
     timeframe: int = 60
     holding_period: str = "intraday"
     risk_per_trade_pct: float = 0.02
+    case_id: str = ""  # Pantheon research case ID for provenance tracking
     status: ManifestStatus = ManifestStatus.DRAFT
     version: int = MANIFEST_SCHEMA_VERSION
 
@@ -279,7 +280,7 @@ class StrategyManifest:
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize to a JSON-compatible dict."""
-        return {
+        d: Dict[str, Any] = {
             "name": self.name,
             "objective": self.objective,
             "signals": sorted(self.signals),
@@ -294,9 +295,11 @@ class StrategyManifest:
             "timeframe": self.timeframe,
             "holding_period": self.holding_period,
             "risk_per_trade_pct": self.risk_per_trade_pct,
+            "case_id": self.case_id,
             "status": self.status.value,
             "version": self.version,
         }
+        return d
 
     def to_json(self) -> str:
         """Serialize to deterministic JSON string."""
@@ -321,6 +324,7 @@ class StrategyManifest:
                 timeframe=int(data.get("timeframe", 60)),
                 holding_period=str(data.get("holding_period", "intraday")),
                 risk_per_trade_pct=float(data.get("risk_per_trade_pct", 0.02)),
+                case_id=str(data.get("case_id", "")),
                 status=ManifestStatus(data.get("status", "DRAFT")),
                 version=int(data.get("version", MANIFEST_SCHEMA_VERSION)),
             )

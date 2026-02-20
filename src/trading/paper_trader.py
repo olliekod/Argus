@@ -104,20 +104,24 @@ class PaperTrade:
     trader_id: str
     strategy_type: str
     symbol: str
-    
+
     timestamp: str
     strikes: str                   # e.g., "$48/$44"
     expiry: Optional[str]          # e.g., "2026-02-21"
-    
+
     entry_credit: float            # Credit received
     contracts: int
-    
+
     status: str = "open"           # open, closed, expired
     close_timestamp: Optional[str] = None
     close_price: Optional[float] = None
     realized_pnl: Optional[float] = None
-    
+
     market_conditions: Optional[Dict] = None
+
+    # ─── Research Provenance ─────────────────────────────────────────────
+    strategy_id: Optional[str] = None   # e.g., "OPTIONS_SPREAD_V1" — links to SignalEvent.strategy_id
+    case_id: Optional[str] = None       # Pantheon research case ID for return attribution
     
     def to_dict(self) -> Dict:
         """Convert to dictionary."""
@@ -136,6 +140,8 @@ class PaperTrade:
             'close_price': self.close_price,
             'realized_pnl': self.realized_pnl,
             'market_conditions': self.market_conditions,
+            'strategy_id': self.strategy_id,
+            'case_id': self.case_id,
         }
 
 
@@ -278,6 +284,8 @@ class PaperTrader:
         entry_credit: float,
         contracts: int,
         market_conditions: Dict,
+        strategy_id: Optional[str] = None,
+        case_id: Optional[str] = None,
     ) -> Optional[PaperTrade]:
         """
         Execute a paper trade entry.
@@ -292,6 +300,8 @@ class PaperTrader:
             entry_credit: Credit received per contract
             contracts: Number of contracts
             market_conditions: Snapshot of conditions at entry
+            strategy_id: Research strategy identifier for return attribution
+            case_id: Pantheon research case ID for return attribution
 
         Returns:
             Created paper trade, or None if invalid
@@ -339,6 +349,8 @@ class PaperTrader:
             entry_credit=entry_credit,
             contracts=contracts,
             market_conditions=market_conditions,
+            strategy_id=strategy_id,
+            case_id=case_id,
         )
 
         self.open_positions.append(trade)

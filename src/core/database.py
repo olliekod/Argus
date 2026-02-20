@@ -517,9 +517,17 @@ class Database:
                 regime_snapshot_json TEXT,
                 features_snapshot_json TEXT,
                 explain TEXT,
+                case_id TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migration: add case_id to signals if missing
+        try:
+            await self._connection.execute(
+                "ALTER TABLE signals ADD COLUMN case_id TEXT"
+            )
+        except Exception:
+            pass  # column already exists
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_signals_lookup "
             "ON signals(strategy_id, symbol, timestamp_ms DESC)"
@@ -537,6 +545,7 @@ class Database:
                 timestamp_ms INTEGER NOT NULL,
                 symbol TEXT NOT NULL,
                 strategy_id TEXT NOT NULL,
+                case_id TEXT,
                 ret_1bar REAL,
                 ret_5bar REAL,
                 ret_10bar REAL,
@@ -546,6 +555,13 @@ class Database:
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        # Migration: add case_id to signal_outcomes if missing
+        try:
+            await self._connection.execute(
+                "ALTER TABLE signal_outcomes ADD COLUMN case_id TEXT"
+            )
+        except Exception:
+            pass  # column already exists
         await self._connection.execute(
             "CREATE INDEX IF NOT EXISTS idx_outcomes_lookup "
             "ON signal_outcomes(strategy_id, timestamp_ms DESC)"
