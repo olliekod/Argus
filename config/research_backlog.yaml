@@ -1,0 +1,55 @@
+# ═══════════════════════════════════════════════════════════════════════════
+# Argus Research Backlog
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Research objectives for the autonomous Research Engine.
+# Each objective will be run through the full 5-stage Pantheon debate:
+#   Prometheus (Proposal) -> Ares (Critique) -> Prometheus (Revision)
+#   -> Ares (Final Attack) -> Athena (Adjudication)
+#
+# Format:
+#   objectives:
+#     - objective: "description of the research objective"
+#       priority: high | normal | low
+#       status: pending | completed | skipped
+#       constraints:
+#         - "optional constraint 1"
+#         - "optional constraint 2"
+#
+# Or simply:
+#   objectives:
+#     - "A plain string objective (defaults to priority=normal, status=pending)"
+#
+# Completed objectives are marked with status: completed automatically.
+# ═══════════════════════════════════════════════════════════════════════════
+
+objectives:
+  - objective: "BTC/USDT mean-reversion strategy using RSI extremes with volatility regime filtering"
+    priority: high
+    status: pending
+    constraints:
+      - "Must use vol_regime filter to avoid VOL_SPIKE periods"
+      - "Holding period intraday only"
+      - "Risk per trade <= 2%"
+
+  - objective: "IBIT momentum breakout strategy using EMA crossover with trend regime confirmation"
+    priority: high
+    status: pending
+    constraints:
+      - "Use ema_slope and trend_regime for confirmation"
+      - "Entry only in TREND_UP regime"
+
+  - objective: "Multi-asset volatility premium capture using Bollinger Band compression and ATR breakout"
+    priority: normal
+    status: pending
+    constraints:
+      - "Universe: IBIT, SPY, QQQ"
+      - "Bollinger Band squeeze as entry trigger"
+
+  - objective: "VWAP reversion strategy for liquid ETFs during regular trading hours"
+    priority: normal
+    status: pending
+
+  - objective: "Crypto-equity correlation breakdown detector using rolling correlation and regime shifts"
+    priority: low
+    status: pending
