@@ -176,7 +176,9 @@ class PaperTraderFarm:
                 close_timestamp TEXT,
                 close_price REAL,
                 realized_pnl REAL,
-                market_conditions TEXT
+                market_conditions TEXT,
+                strategy_id TEXT,
+                case_id TEXT
             )
         """)
         
@@ -214,6 +216,8 @@ class PaperTraderFarm:
         migrations = [
             ("trader_id", "ALTER TABLE paper_trades ADD COLUMN trader_id TEXT"),
             ("close_reason", "ALTER TABLE paper_trades ADD COLUMN close_reason TEXT"),
+            ("strategy_id", "ALTER TABLE paper_trades ADD COLUMN strategy_id TEXT"),
+            ("case_id", "ALTER TABLE paper_trades ADD COLUMN case_id TEXT"),
         ]
         for col, sql in migrations:
             try:
@@ -691,8 +695,8 @@ class PaperTraderFarm:
             INSERT OR REPLACE INTO paper_trades
             (id, trader_id, strategy_type, symbol, timestamp, strikes, expiry,
              entry_credit, contracts, status, close_timestamp, close_price,
-             realized_pnl, market_conditions)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             realized_pnl, market_conditions, strategy_id, case_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             trade.id,
             trade.trader_id,
@@ -708,6 +712,8 @@ class PaperTraderFarm:
             trade.close_price,
             trade.realized_pnl,
             json.dumps(trade.market_conditions) if trade.market_conditions else None,
+            trade.strategy_id,
+            trade.case_id,
         ))
 
     async def _save_trades_batch(self, trades: List[PaperTrade]) -> None:
@@ -720,6 +726,7 @@ class PaperTraderFarm:
                 t.strikes, t.expiry, t.entry_credit, t.contracts, t.status,
                 t.close_timestamp, t.close_price, t.realized_pnl,
                 json.dumps(t.market_conditions) if t.market_conditions else None,
+                t.strategy_id, t.case_id,
             )
             for t in trades
         ]
@@ -727,8 +734,8 @@ class PaperTraderFarm:
             INSERT OR REPLACE INTO paper_trades
             (id, trader_id, strategy_type, symbol, timestamp, strikes, expiry,
              entry_credit, contracts, status, close_timestamp, close_price,
-             realized_pnl, market_conditions)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             realized_pnl, market_conditions, strategy_id, case_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, rows)
     
     async def check_exits(self, current_prices: Dict[str, Dict[str, float]]) -> List[PaperTrade]:

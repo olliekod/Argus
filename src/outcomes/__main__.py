@@ -875,6 +875,90 @@ async def _cmd_coverage(args):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+#  Research Loop (Hades Port)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+
+async def _cmd_research_loop(args):
+    """Run the Hades strategy research loop.
+
+    Wraps ``scripts/strategy_research_loop.py`` logic as a first-class CLI command.
+    Supports --case-id to tag runs with a Pantheon research case.
+    """
+    import logging as _logging
+
+    _logging.basicConfig(
+        level=_logging.INFO,
+        format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+        force=True,
+    )
+    _logger = _logging.getLogger("argus.research_loop")
+
+    # Import the research loop machinery
+    try:
+        from src.analysis.research_loop_config import (
+            ConfigValidationError,
+            load_research_loop_config,
+        )
+    except ImportError as exc:
+        print(f"ERROR: Could not import research loop config: {exc}")
+        print("Ensure src/analysis/research_loop_config.py exists.")
+        sys.exit(1)
+
+    config_path = getattr(args, "config_rl", None) or "config/research_loop.yaml"
+    case_id = getattr(args, "case_id", None)
+    dry_run = getattr(args, "dry_run", False)
+    once = getattr(args, "once", False)
+
+    try:
+        config = load_research_loop_config(config_path)
+    except FileNotFoundError:
+        print(f"ERROR: Config file not found: {config_path}")
+        sys.exit(1)
+    except ConfigValidationError as exc:
+        print(f"ERROR: Invalid config: {exc}")
+        sys.exit(1)
+
+    if case_id:
+        _logger.info("Research loop tagged with case_id=%s", case_id)
+
+    # Import the cycle runner from the scripts module
+    try:
+        from scripts.strategy_research_loop import run_cycle
+    except ImportError:
+        # Fallback: add repo root to path and retry
+        _repo = Path(__file__).resolve().parent.parent.parent
+        if str(_repo) not in sys.path:
+            sys.path.insert(0, str(_repo))
+        from scripts.strategy_research_loop import run_cycle
+
+    if once or dry_run:
+        try:
+            run_cycle(config, dry_run=dry_run)
+        except Exception:
+            _logger.exception("Research cycle failed.")
+            sys.exit(1)
+    else:
+        import time as _time
+
+        _logger.info(
+            "Starting daemon mode (interval=%.1fh).",
+            config.loop.interval_hours,
+        )
+        while True:
+            try:
+                run_cycle(config)
+            except Exception:
+                _logger.exception("Research cycle failed — will retry next interval.")
+            _logger.info(
+                "Sleeping %.1fh until next cycle...",
+                config.loop.interval_hours,
+            )
+            _time.sleep(config.loop.interval_hours * 3600)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 #  Main
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -985,6 +1069,21 @@ def main():
     bfb.add_argument("--end", default=None,
                      help="End date (YYYY-MM-DD). Omit = now.")
 
+    # ── research-loop ──
+    rl = sub.add_parser("research-loop",
+                         help="Run the Hades strategy research loop "
+                              "(outcomes -> packs -> experiments -> evaluation)")
+    rl.add_argument("--research-config", dest="config_rl",
+                    default="config/research_loop.yaml",
+                    help="Path to research loop YAML config "
+                         "(default: config/research_loop.yaml)")
+    rl.add_argument("--once", action="store_true", default=False,
+                    help="Run a single cycle and exit (default: daemon mode)")
+    rl.add_argument("--dry-run", action="store_true", default=False,
+                    help="Validate config and log steps without executing")
+    rl.add_argument("--case-id", default=None,
+                    help="Pantheon case ID to associate with this research run")
+
     args = parser.parse_args()
 
     dispatch = {
@@ -1000,6 +1099,7 @@ def main():
         "health": _cmd_health,
         "discover": _cmd_discover,
         "backfill-bars": _cmd_backfill_bars,
+        "research-loop": _cmd_research_loop,
     }
 
     handler = dispatch.get(args.command)

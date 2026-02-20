@@ -164,10 +164,13 @@ class SignalEvent:
     regime_snapshot: Dict[str, str] = field(default_factory=dict)
     features_snapshot: Dict[str, float] = field(default_factory=dict)
     
+    # ─── Research Provenance ─────────────────────────────────────────────
+    case_id: str = ""           # Pantheon research case (e.g., "research_1708970820_3847")
+
     # ─── Identification ────────────────────────────────────────────────────
     explain: str = ""           # short deterministic explanation
     idempotency_key: str = ""   # computed from strategy+symbol+ts
-    
+
     v: int = SIGNAL_SCHEMA_VERSION
 
 
@@ -205,7 +208,8 @@ class SignalOutcomeEvent:
     timestamp_ms: int           # signal timestamp
     symbol: str
     strategy_id: str
-    
+    case_id: str = ""           # Pantheon research case provenance
+
     # Markouts (relative returns)
     ret_1bar: Optional[float] = None
     ret_5bar: Optional[float] = None
@@ -256,6 +260,7 @@ def signal_to_dict(event: SignalEvent) -> Dict[str, Any]:
         "data_quality_flags": event.data_quality_flags,
         "regime_snapshot": _normalize_snapshot(event.regime_snapshot),
         "features_snapshot": _normalize_snapshot(event.features_snapshot),
+        "case_id": event.case_id,
         "explain": event.explain,
         "idempotency_key": event.idempotency_key,
         "v": event.v,
@@ -291,6 +296,7 @@ def dict_to_signal(d: Dict[str, Any]) -> SignalEvent:
         features_snapshot={
             k: float(v) for k, v in d.get("features_snapshot", {}).items()
         },
+        case_id=str(d.get("case_id", "")),
         explain=str(d.get("explain", "")),
         idempotency_key=str(d.get("idempotency_key", "")),
         v=int(d.get("v", SIGNAL_SCHEMA_VERSION)),
@@ -333,6 +339,7 @@ def outcome_to_dict(event: SignalOutcomeEvent) -> Dict[str, Any]:
         "timestamp_ms": event.timestamp_ms,
         "symbol": event.symbol,
         "strategy_id": event.strategy_id,
+        "case_id": event.case_id,
         "ret_1bar": _round_float(event.ret_1bar) if event.ret_1bar is not None else None,
         "ret_5bar": _round_float(event.ret_5bar) if event.ret_5bar is not None else None,
         "ret_10bar": _round_float(event.ret_10bar) if event.ret_10bar is not None else None,
@@ -351,6 +358,7 @@ def dict_to_outcome(d: Dict[str, Any]) -> SignalOutcomeEvent:
         timestamp_ms=_to_int_ms(d["timestamp_ms"]),
         symbol=str(d["symbol"]),
         strategy_id=str(d["strategy_id"]),
+        case_id=str(d.get("case_id", "")),
         ret_1bar=float(d["ret_1bar"]) if d.get("ret_1bar") is not None else None,
         ret_5bar=float(d["ret_5bar"]) if d.get("ret_5bar") is not None else None,
         ret_10bar=float(d["ret_10bar"]) if d.get("ret_10bar") is not None else None,
