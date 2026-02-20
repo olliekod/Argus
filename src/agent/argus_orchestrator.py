@@ -20,6 +20,8 @@ from typing import Any, AsyncIterator, Callable, Dict, List, Optional
 import aiohttp
 
 from src.agent.delphi import DelphiToolRegistry, ToolResult
+from src.agent.pantheon.factory import FactoryPipe
+from src.agent.pantheon.hermes import HermesRouter
 from src.agent.pantheon.roles import (
     ARES,
     ATHENA,
@@ -260,6 +262,8 @@ class ArgusOrchestrator:
         max_history: int = DEFAULT_MAX_HISTORY,
         max_tool_iterations: int = DEFAULT_MAX_TOOL_ITERATIONS,
         llm_call: Optional[Callable[..., Any]] = None,
+        factory_pipe: Optional[FactoryPipe] = None,
+        hermes_router: Optional[HermesRouter] = None,
     ):
         self.zeus = zeus
         self.delphi = delphi
@@ -280,6 +284,10 @@ class ArgusOrchestrator:
         # Allow injection of a custom LLM callable for testing.
         # Signature: async llm_call(messages, model) -> str
         self._llm_call = llm_call
+
+        # Persistent strategy memory + promotion handoff pipeline
+        self.factory_pipe = factory_pipe or FactoryPipe()
+        self.hermes_router = hermes_router or HermesRouter()
 
         # Initialise system prompt
         self._refresh_system_prompt()
@@ -756,6 +764,10 @@ class ArgusOrchestrator:
                     f"\n### Backtest Configuration\n```json\n"
                     f"{json.dumps(backtest_config, indent=2)}\n```\n"
                 )
+
+        self.factory_pipe.persist_case(case)
+        if final_verdict and final_verdict.decision == "PROMOTE":
+            self.hermes_router.route_promotion(case)
 
         self._active_case = None
         return "\n".join(debate_log)

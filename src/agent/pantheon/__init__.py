@@ -1,5 +1,7 @@
 """Pantheon Intelligence Engine — structured research agents."""
 
+from .factory import EvidenceGrader, FactoryPipe
+from .hermes import HadesBacktestConfig, HermesRouter
 from .roles import (
     PantheonRole,
     ContextInjector,
@@ -11,6 +13,10 @@ from .roles import (
 )
 
 __all__ = [
+    "EvidenceGrader",
+    "FactoryPipe",
+    "HadesBacktestConfig",
+    "HermesRouter",
     "PantheonRole",
     "ContextInjector",
     "PROMETHEUS",
