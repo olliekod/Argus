@@ -215,6 +215,15 @@ def evaluate_tail_risk(
 
     # Max loss per contract
     spread_width = abs(short_strike - long_strike)
+    if spread_width < 1e-9:
+        # Degenerate spread (same strike) — reject as untestable
+        return TailRiskResult(
+            prob_touch=prob_touch,
+            prob_touch_stressed=prob_touch_stressed,
+            allowed_contracts=0,
+            capped=True,
+            reason="degenerate_spread_zero_width",
+        )
     max_loss_per_contract = (spread_width - credit) * _OPTION_MULTIPLIER
     if max_loss_per_contract <= 0:
         max_loss_per_contract = spread_width * _OPTION_MULTIPLIER
@@ -327,20 +336,36 @@ def _analytical_prob_touch(
 ) -> float:
     """Analytical first-passage approximation for GBM (conservative fallback).
 
-    Uses the reflection principle result for GBM:
-    P(min S_t <= B | S_0 = S) = N(d1) + (B/S)^(2r/sigma^2) * N(d2)
+    Handles both downside barriers (put spreads, barrier < S) and upside
+    barriers (call spreads, barrier > S) using the reflection principle.
 
-    This is conservative (GBM has lighter tails than Heston with vol clustering).
+    For downside: P(min S_t <= B | S_0 = S)
+    For upside:   P(max S_t >= B | S_0 = S)
     """
     if S <= 0 or sigma <= 0 or T <= 0:
         return 0.0
 
-    if S <= barrier:
+    if barrier > S:
+        # Upside barrier (call spread): P(max S_t >= B)
+        # Use symmetry: compute P(max S_t >= B) using reflection for upper barrier
+        try:
+            from scipy.stats import norm as scipy_norm
+            r = 0.045
+            log_ratio = math.log(barrier / S)
+            d1 = (-log_ratio + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            d2 = (-log_ratio + (r - 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+            exponent = 2.0 * r / (sigma ** 2)
+            p = scipy_norm.cdf(d1) + ((barrier / S) ** exponent) * scipy_norm.cdf(d2)
+            return max(0.0, min(1.0, p))
+        except ImportError:
+            return 0.5
+    elif S <= barrier:
         return 1.0  # Already touching
 
+    # Downside barrier (put spread): P(min S_t <= B)
     try:
         from scipy.stats import norm as scipy_norm
-        r = 0.045  # risk-free rate
+        r = 0.045
 
         log_ratio = math.log(barrier / S)
         d1 = (log_ratio + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))

@@ -83,8 +83,16 @@ def _valid_manifest_json() -> str:
     })
 
 
-def _valid_critique_json(manifest_hash: str = "test_hash") -> str:
+def _manifest_hash_for_test() -> str:
+    """Compute the hash of the canonical test manifest so critiques match."""
+    m = parse_manifest_response(f"<manifest>{_valid_manifest_json()}</manifest>")
+    return m.compute_hash()
+
+
+def _valid_critique_json(manifest_hash: str = "") -> str:
     """A valid Ares critique as JSON."""
+    if not manifest_hash:
+        manifest_hash = _manifest_hash_for_test()
     return json.dumps({
         "manifest_hash": manifest_hash,
         "findings": [
@@ -365,11 +373,12 @@ class TestParseManifestResponse:
 
 class TestParseCritiqueResponse:
     def test_parse_valid_critique(self):
+        expected_hash = _manifest_hash_for_test()
         response = (
             "<thought>Analyzing the proposal...</thought>\n"
             f"<critique>{_valid_critique_json()}</critique>"
         )
-        critique = parse_critique_response(response, "test_hash")
+        critique = parse_critique_response(response, expected_hash)
         assert len(critique.findings) == 3
         assert critique.has_blockers
         assert len(critique.blockers) == 1

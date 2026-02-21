@@ -102,12 +102,12 @@ def compute_sharpe_stats(returns: Sequence[float]) -> dict:
 
     sharpe = mean / std
 
-    # Skewness (sample)
-    m3 = sum((r - mean) ** 3 for r in returns) / n
+    # Skewness (sample, using n-1 consistent with variance)
+    m3 = sum((r - mean) ** 3 for r in returns) / (n - 1)
     skew = m3 / (std ** 3)
 
-    # Excess kurtosis (sample)
-    m4 = sum((r - mean) ** 4 for r in returns) / n
+    # Excess kurtosis (sample, using n-1 consistent with variance)
+    m4 = sum((r - mean) ** 4 for r in returns) / (n - 1)
     kurtosis = (m4 / (std ** 4)) - 3.0
 
     return {
@@ -195,18 +195,22 @@ def compute_deflated_sharpe_ratio(
 
     t_minus_1 = n_obs - 1
 
-    # Denominator: sqrt(1 - skew * SR_0 + ((kurt - 1) / 4) * SR_0^2)
+    # Standard error of the Sharpe ratio per Bailey & López de Prado (2014):
+    # SE(SR) = sqrt((1 - skew*SR + ((raw_kurt-1)/4)*SR^2) / (T-1))
+    # where SR is the *observed* Sharpe ratio and raw_kurt is the raw
+    # kurtosis (not excess).  Since our `kurtosis` parameter is excess
+    # kurtosis (= raw - 3), we convert: (raw_kurt - 1) = (kurtosis + 2).
     denom_sq = (
         1.0
-        - skewness * threshold_sr
-        + ((kurtosis - 1.0) / 4.0) * (threshold_sr ** 2)
+        - skewness * observed_sharpe
+        + ((kurtosis + 2.0) / 4.0) * (observed_sharpe ** 2)
     )
 
     # Guard against negative or zero denominator
     if denom_sq <= 0:
         logger.warning(
-            "DSR denominator non-positive (%.6f); skew=%.4f, kurt=%.4f, sr0=%.4f",
-            denom_sq, skewness, kurtosis, threshold_sr,
+            "DSR denominator non-positive (%.6f); skew=%.4f, kurt=%.4f, sr=%.4f",
+            denom_sq, skewness, kurtosis, observed_sharpe,
         )
         return 0.0
 

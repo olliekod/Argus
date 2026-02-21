@@ -219,6 +219,9 @@ class RiskEngine:
         )
     """
 
+    def __init__(self) -> None:
+        self._was_throttled: bool = False
+
     def clamp(
         self,
         proposed_allocations: List[Allocation],
@@ -241,6 +244,10 @@ class RiskEngine:
         tuple
             (clamped_allocations, clamp_reasons, risk_attribution)
         """
+        if portfolio_state.as_of_ts_ms <= 0:
+            logger.warning(
+                "as_of_ts_ms is 0; using wall-clock time (breaks determinism)"
+            )
         ts_ms = portfolio_state.as_of_ts_ms or int(time.time() * 1000)
         equity = portfolio_state.equity_usd
         reasons: List[ClampReason] = []
@@ -250,10 +257,11 @@ class RiskEngine:
             abs(a.weight) for a in proposed_allocations
         )
 
-        # Sort allocations by stable key for deterministic ordering
+        # Sort allocations by stable key for deterministic ordering.
+        # Include weight as tiebreaker for identical strategy+instrument pairs.
         sorted_allocs = sorted(
             proposed_allocations,
-            key=lambda a: f"{a.strategy_id}:{a.instrument}",
+            key=lambda a: (a.strategy_id, a.instrument, a.weight),
         )
 
         # ── Step 0: Normalize to canonical units ──────────────────────
@@ -352,9 +360,19 @@ class RiskEngine:
         for alloc in allocations:
             alloc_id = f"{alloc.strategy_id}:{alloc.instrument}"
 
-            # Determine instrument type from metadata
-            is_option = alloc.contracts > 0
-            instrument_type = "option_spread" if is_option else "equity"
+            # Determine instrument type: check position records first,
+            # fall back to contracts > 0 heuristic.
+            instrument_type = "equity"
+            for pos in state.current_positions:
+                if (pos.strategy_id == alloc.strategy_id
+                        and pos.underlying == alloc.instrument
+                        and pos.instrument_type in ("option_spread", "option_single")):
+                    instrument_type = pos.instrument_type
+                    break
+            else:
+                if alloc.contracts > 0:
+                    instrument_type = "option_spread"
+            is_option = instrument_type in ("option_spread", "option_single")
 
             notional = abs(alloc.weight * equity)
             max_loss = abs(alloc.dollar_risk)
@@ -433,7 +451,13 @@ class RiskEngine:
         """Convert NormalizedAllocation back to Allocation objects."""
         result: List[Allocation] = []
         for na in normalized:
-            dollar_risk = round(na.current_weight * equity, 2)
+            # Preserve original dollar_risk (risk budget), scaled proportionally
+            # if the weight was clamped down.
+            if abs(na.proposed_weight) > 1e-12:
+                scale = na.current_weight / na.proposed_weight
+            else:
+                scale = 0.0
+            dollar_risk = round(na.dollar_risk * scale, 2)
             result.append(Allocation(
                 strategy_id=na.strategy_id,
                 instrument=na.underlying,
@@ -514,7 +538,11 @@ class RiskEngine:
         reasons: List[ClampReason] = []
         throttle = compute_drawdown_throttle(
             state.current_drawdown_pct, dd_config,
+            was_throttled=self._was_throttled,
         )
+
+        # Update hysteresis state
+        self._was_throttled = throttle < 1.0
 
         if throttle >= 1.0:
             return normalized, reasons, 1.0

@@ -474,7 +474,7 @@ class ExperimentRunner:
                 },
                 "environment": {
                     "git_commit": git_commit,
-                    "python_version": f"{datetime.now().year}.{datetime.now().month}", # Or sys.version
+                    "python_version": __import__("sys").version,
                     "timestamp": timestamp
                 }
             }
