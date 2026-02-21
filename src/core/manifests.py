@@ -274,8 +274,16 @@ class StrategyManifest:
             )
 
     def compute_hash(self) -> str:
-        """Compute deterministic hash for manifest identity."""
-        canonical = json.dumps(self.to_dict(), sort_keys=True, separators=(",", ":"))
+        """Compute deterministic hash for manifest content identity.
+
+        Excludes lifecycle metadata (status, case_id, version) so that
+        the hash remains stable across status transitions.
+        """
+        d = self.to_dict()
+        # Exclude lifecycle/metadata fields from identity hash
+        for key in ("status", "case_id", "version"):
+            d.pop(key, None)
+        canonical = json.dumps(d, sort_keys=True, separators=(",", ":"))
         return hashlib.sha256(canonical.encode()).hexdigest()[:16]
 
     def to_dict(self) -> Dict[str, Any]:
