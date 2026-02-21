@@ -108,8 +108,11 @@ class PortfolioState:
         """
         totals: Dict[str, float] = {"delta": 0.0, "gamma": 0.0, "vega": 0.0}
         for pos in self.current_positions:
-            for key in totals:
-                totals[key] += pos.greeks.get(key, 0.0) * pos.qty
+            # Delta is sign-dependent (short = negative contribution).
+            # Gamma and vega are always positive regardless of direction.
+            totals["delta"] += pos.greeks.get("delta", 0.0) * pos.qty
+            totals["gamma"] += pos.greeks.get("gamma", 0.0) * abs(pos.qty)
+            totals["vega"] += pos.greeks.get("vega", 0.0) * abs(pos.qty)
         return totals
 
 

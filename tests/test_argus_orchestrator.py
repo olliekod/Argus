@@ -732,21 +732,25 @@ class TestTieredEscalation:
 
         await orch.chat("research a momentum strategy approach")
 
-        assert len(call_log) >= 3
-        assert call_log[0]["model"] == "qwen2.5:14b"
-        assert call_log[1]["model"] == "qwen2.5:32b"
-        assert call_log[2]["model"] == "qwen2.5:32b"
-        assert call_log[2]["escalation_justification"] is not None
+        assert len(call_log) >= 2
+        # Prometheus has escalation_priority=ESCALATION_LOCAL_32B, so the first
+        # call is already 32B (upgraded from 14B at line 634 of orchestrator).
+        assert call_log[0]["model"] == "qwen2.5:32b"
+        # After local 32B parse failure, the orchestrator escalates to API
+        # (still via 32B model but with escalation_justification set).
+        escalation_calls = [c for c in call_log if c["escalation_justification"] is not None]
+        assert len(escalation_calls) >= 1
 
     def test_ares_validation_enforcement(self):
+        """Ares must produce at least 3 findings; fewer raises ManifestValidationError."""
         critique_response = """
 <critique>
 {
   "manifest_hash": "abc123",
   "findings": [
     {
-      "category": "execution",
-      "severity": "blocker",
+      "category": "EXECUTION_RISK",
+      "severity": "BLOCKER",
       "description": "Single finding only",
       "evidence": "Not enough adversarial depth",
       "recommendation": "Provide at least three findings"
@@ -757,7 +761,7 @@ class TestTieredEscalation:
 </critique>
 """
 
-        with pytest.raises(ManifestValidationError):
+        with pytest.raises(ManifestValidationError, match="at least 3 failure vectors"):
             parse_critique_response(critique_response, manifest_hash="abc123")
 
     @pytest.mark.asyncio

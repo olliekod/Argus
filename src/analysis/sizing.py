@@ -131,8 +131,8 @@ def fractional_kelly_size(
         )
         return 0.0
 
-    # Full Kelly
-    f_star = mu / (sigma ** 2)
+    # Full Kelly: f* = (mu - cost) / sigma^2  (net edge)
+    f_star = (mu - forecast.cost) / (sigma ** 2)
 
     # Fractional Kelly
     f = kelly_fraction * f_star

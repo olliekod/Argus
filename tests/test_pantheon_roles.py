@@ -83,8 +83,16 @@ def _valid_manifest_json() -> str:
     })
 
 
-def _valid_critique_json(manifest_hash: str = "test_hash") -> str:
+def _manifest_hash_for_test() -> str:
+    """Compute the hash of the canonical test manifest so critiques match."""
+    m = parse_manifest_response(f"<manifest>{_valid_manifest_json()}</manifest>")
+    return m.compute_hash()
+
+
+def _valid_critique_json(manifest_hash: str = "") -> str:
     """A valid Ares critique as JSON."""
+    if not manifest_hash:
+        manifest_hash = _manifest_hash_for_test()
     return json.dumps({
         "manifest_hash": manifest_hash,
         "findings": [

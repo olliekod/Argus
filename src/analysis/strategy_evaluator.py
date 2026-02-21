@@ -735,12 +735,13 @@ class StrategyEvaluator:
                 }
             )
 
-        if metrics.get("mc_p95_max_drawdown", 0.0) > thresholds.get("mc_p5_drawdown_max", 2.0):
+        mc_p95_dd_threshold = thresholds.get("mc_p95_drawdown_max", thresholds.get("mc_p5_drawdown_max", 2.0))
+        if metrics.get("mc_p95_max_drawdown", 0.0) > mc_p95_dd_threshold:
             reasons.append(
                 {
-                    "reason": "mc_p5_drawdown",
+                    "reason": "mc_p95_drawdown",
                     "value": round(metrics.get("mc_p95_max_drawdown", 0.0), 6),
-                    "threshold": thresholds.get("mc_p5_drawdown_max"),
+                    "threshold": mc_p95_dd_threshold,
                 }
             )
 
@@ -765,7 +766,7 @@ class StrategyEvaluator:
         # ── Deploy gate: DSR below threshold ───────────────────────
         dsr_min = thresholds.get("dsr_min", 0.95)
         dsr_val = record.get("dsr", 0.0)
-        if dsr_min > 0 and dsr_val < dsr_min and dsr_val > 0:
+        if dsr_min > 0 and dsr_val < dsr_min:
             reasons.append(
                 {
                     "reason": "dsr_below_threshold",

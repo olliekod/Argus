@@ -400,12 +400,15 @@ class VirtualPortfolio:
                     ann_factor = math.sqrt(self.EQUITIES_ANNUAL_MINUTES)
                     sharpe = round((mean_ret / std_ret) * ann_factor, 2)
 
+        unrealized = sum(p.unrealized_pnl for p in self._positions)
+        total_equity = self._cash + unrealized
+        total_pnl = realized + unrealized
         return {
             "starting_cash": self._starting_cash,
-            "final_equity": round(self._cash, 2),
+            "final_equity": round(total_equity, 2),
             "total_realized_pnl": round(realized, 2),
             "total_return_pct": round(
-                (realized / self._starting_cash) * 100, 2
+                (total_pnl / self._starting_cash) * 100, 2
             ) if self._starting_cash > 0 else 0.0,
             "total_trades": total_trades,
             "winners": winners,

@@ -98,8 +98,7 @@ class StrategyRegistry:
         """All registered candidates, sorted by composite score descending."""
         return sorted(
             self._entries.values(),
-            key=lambda e: e.composite_score,
-            reverse=True,
+            key=lambda e: (-e.composite_score, e.strategy_id),
         )
 
     @property

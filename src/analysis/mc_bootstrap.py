@@ -37,7 +37,7 @@ def _max_drawdown_pct(equity_path: Sequence[float], starting_cash: float) -> flo
     for equity in equity_path:
         if equity > peak:
             peak = equity
-        dd_pct = (peak - equity) / starting_cash
+        dd_pct = (peak - equity) / peak if peak > 0 else 0.0
         if dd_pct > max_dd_pct:
             max_dd_pct = dd_pct
     return max_dd_pct
